@@ -88,9 +88,27 @@ plugins = ["pydantic.mypy"]
 exclude = ["^migrations/", "^evals/datasets/"]
 
 [[tool.mypy.overrides]]
+# ⚠️ 模式必须是**全限定模块名**。此前写成 ["tests.*", "test_*", ...]，
+# 其中 "test_*" 不被接受，导致 mypy **整张 override 表被拒绝**——
+# 表现为设置"静默不生效"，且命令行 --allow-untyped-defs 也压不住。
+# 正确的做法是让 tests/ 成为真正的包（已加 __init__.py），
+# 模块名形如 tests.unit.test_events，用单一模式即可覆盖。
 module = ["tests.*"]
-# 测试允许放松：Hypothesis 装饰器与 pytest fixture 的类型推断在 strict 下噪声过大
+# 测试代码只放宽**两项**，且都有明确原因（ADR-0007）：
+#
+# 1. disallow_untyped_decorators —— Hypothesis 的 @given/@settings
+#    装饰器在 strict 下类型推断噪声过大；
+# 2. disallow_untyped_defs / disallow_incomplete_defs —— pytest 按**名字**注入
+#    fixture，测试函数参数（如 make_observation）无法有意义地标注类型。
+#    注意二者是**不同**的开关：测试函数通常写了返回值标注但没写参数标注，
+#    触发的是 disallow_incomplete_defs，只关前者不解决问题。
+#
+# 其余检查一律保持开启：`check_untyped_defs` 仍然检查未标注函数的**函数体**，
+# 因此 arg-type / call-arg 等真实错误依旧会被捕获。
+# 需要故意构造非法对象的测试，请使用 tests/helpers.py 的 construct()。
 disallow_untyped_decorators = false
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
 
 [tool.pydantic-mypy]
 init_forbid_extra = true
@@ -105,6 +123,8 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = ["-q", "--strict-markers", "--strict-config"]
 markers = [
+    "unit: 纯领域层单元测试，零 IO（阶段 1 起）",
+    "property: Hypothesis 属性测试（阶段 1 起）",
     "slow: 运行较慢的测试",
     "integration: 需要数据库的集成测试（阶段 2 起）",
     "scenario: 任务书第十五节场景测试（阶段 3 起）",

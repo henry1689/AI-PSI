@@ -41,8 +41,39 @@ CI 矩阵可扩展到 3.12。
 
 配置要点：
 - `strict = true`，`warn_unreachable = true`
-- 测试模块放宽 `disallow_untyped_decorators`（Hypothesis 装饰器在 strict 下噪声过大）
 - **禁止用 `# type: ignore` 绕过错误**——需要忽略时必须写具体错误码并附原因
+
+#### 2.1 测试代码的类型检查策略（实现阶段补充）
+
+`src/` 与 `scripts/` 走完整 strict。`tests/` **只放宽三项**，其余保持开启：
+
+| 放宽项 | 原因 |
+|---|---|
+| `disallow_untyped_decorators` | Hypothesis 的 `@given` / `@settings` 装饰器类型推断噪声过大 |
+| `disallow_untyped_defs` | pytest 按**名字**注入 fixture，参数无法有意义地标注 |
+| `disallow_incomplete_defs` | 同上——测试函数通常写了返回值标注但没写参数标注 |
+
+`check_untyped_defs` **保持开启**，因此未标注函数的**函数体**仍会被检查，
+`arg-type` / `call-arg` 等真实错误依旧会被捕获。
+
+**需要"故意构造非法对象"的测试**（验证拒绝路径），一律使用
+`tests/helpers.py` 的 `rejects()`，**不得**用裸构造 + 忽略注释。
+`rejects()` 在构造**意外成功**时会主动失败——否则校验没触发时测试会静默通过。
+
+#### 2.2 两个踩过的配置陷阱
+
+**陷阱一：`module` 模式必须是全限定模块名。**
+写成 `["tests.*", "test_*"]` 时，`test_*` 不被接受，
+mypy 会**拒绝整张 override 表**——表现为设置"静默不生效"，
+连命令行 `--allow-untyped-defs` 都压不住那些错误。
+
+**陷阱二：`disallow_untyped_defs` 与 `disallow_incomplete_defs` 是两个开关。**
+错误信息 "Function is missing a type annotation for one or more parameters"
+来自**后者**。只关前者不解决问题——测试函数通常是"有返回值标注、无参数标注"，
+触发的正是 `disallow_incomplete_defs`。
+
+**前置条件**：要让 `module = ["tests.*"]` 生效，`tests/` 下必须有 `__init__.py`。
+没有它，mypy 把每个测试文件当作**顶层模块**（模块名是文件名），override 不匹配。
 
 ### 3. Lint / 格式化
 

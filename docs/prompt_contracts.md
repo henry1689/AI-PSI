@@ -94,11 +94,27 @@ class PromptContract(BaseModel):
 | 对象 | 必填字段 | 理由 |
 |---|---|---|
 | `Hypothesis` | `falsification_conditions` | 不可反驳的假设不是假设 |
-| `Belief` | `confidence_basis` | 不变量 2 |
-| `Judgment` | `strongest_counterarguments` | 不变量 3 |
+| `Belief` | `confidence_basis` | 不变量 2（**非 TENTATIVE 状态**下必填） |
+| `Judgment` | `rationale_summary`、`confidence_basis` | 结论必须说明依据 |
 | `Reflection` | `reasons` | 停止必须有理由（不变量 19） |
 | `Inquiry` | `stop_conditions`、`out_of_scope` | "可结束的问题"的定义 |
 | `Concern` | `source_event_ids` | 无依据的关切应被过滤 |
+
+### 4.3.1 关于 `strongest_counterarguments` 的例外
+
+⚠️ 该字段**允许为空**。
+
+任务书 §9.10 要求"必须生成最强反证"，但 §9.8 同时**禁止机械地"双方都有道理"**。
+两者在简单事实上冲突：对"水在标准大气压下的沸点"，强行制造反方观点
+恰恰是被禁止的行为。
+
+因此不变量 3 改由另一条可测规则承载：
+**`EpistemicAction.ANSWER`（无保留结论）要求 `unresolved_unknowns` 为空**。
+
+Prompt 侧的要求相应变为：
+**如果存在真实反证，必须列出；如果没有，不要编造。**
+
+（完整取舍见 ADR-0012 的 G3 条目。）
 
 ### 4.4 不输出思维链
 

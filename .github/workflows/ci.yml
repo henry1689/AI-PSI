@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUNBUFFERED: "1"
+  # CI 直连 Docker Hub，使用官方镜像（本地开发若不通可覆盖 AI_PSI_PG_IMAGE）
+  AI_PSI_PG_IMAGE: pgvector/pgvector:pg16
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 静态检查：跑一次即可，不需要跨版本矩阵
+  # ---------------------------------------------------------------------------
+  static-checks:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: 安装依赖
+        run: uv sync --all-groups
+
+      - name: Ruff（lint + format 检查）
+        run: make lint
+
+      - name: mypy（strict）
+        run: make typecheck
+
+  # ---------------------------------------------------------------------------
+  # 测试：跨 Python 版本矩阵
+  #
+  # 阶段 1 的测试全部是纯领域层测试，**不需要数据库**。
+  # 阶段 2 引入 PostgreSQL 与集成测试时，在此加入 service container：
+  #
+  #   services:
+  #     postgres:
+  #       image: ${{ env.AI_PSI_PG_IMAGE }}
+  #       env:
+  #         POSTGRES_USER: ai_psi
+  #         POSTGRES_PASSWORD: ai_psi_dev_pw
+  #         POSTGRES_DB: ai_psi
+  #       ports: ["55432:5432"]
+  #       options: >-
+  #         --health-cmd "pg_isready -U ai_psi -d ai_psi"
+  #         --health-interval 5s --health-timeout 5s --health-retries 12
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: 安装 Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: 安装依赖
+        run: uv sync --all-groups --python ${{ matrix.python-version }}
+
+      - name: pytest + 覆盖率采集
+        run: make test
+
+      - name: 覆盖率闸门（domain/cognition 85%、总体 75%）
+        run: make policy
+
+      - name: 上传覆盖率报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.python-version }}
+          path: coverage.xml
+          if-no-files-found: warn

@@ -238,11 +238,13 @@ cognitive_round.completed    cognitive_round.suspended   cognitive_round.failed
 `user_id` / `statement` / `belief_type`（`BeliefType`）/ `status`（`BeliefStatus`）/
 `supporting_evidence_ids` / `opposing_evidence_ids` / `assumption_ids` /
 `applicability` / `uncertainty_type` / `confidence_band` /
-**`confidence_basis`（置信度依据，必填非空）** /
+**`confidence_basis`（置信度依据）** /
 `valid_from` / `valid_until` / `revision_conditions` / `supersedes_id`
 
 > 🔴 不变量 2：**Belief 必须有依据，或明确标记为暂定。**
-> `confidence_basis` 为空 → 校验失败。
+> 实现为**析取**校验：`status` 为 `TENTATIVE` 时允许无依据，
+> **其余任何状态**（ACTIVE / DISPUTED / …）都要求 `confidence_basis` 非空。
+> 一个既没有依据、又没被标注为暂定的信念，会在后续推理中被当作可靠前提使用。
 
 **`Judgment`**（`domain/judgments.py`）——本次回合的暂定结论：
 

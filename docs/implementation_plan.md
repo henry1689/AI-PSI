@@ -28,7 +28,7 @@
 | 阶段 | 内容 | 状态 | 完成日期 |
 |---|---|---|---|
 | **0** | 架构与文档 | ✅ 完成 | 2026-09-17 |
-| **1** | 项目骨架与领域对象 | 🔄 进行中 | — |
+| **1** | 项目骨架与领域对象 | ✅ 完成 | 2026-09-17 |
 | 2 | 数据库、事件存储、认知状态机 | ⬜ 未开始 | — |
 | 3 | Mock LLM 与认知流水线 | ⬜ 未开始 | — |
 | 4 | 真实 LLM Provider | ⬜ 未开始 | — |
@@ -50,20 +50,37 @@ prompt_contracts、evaluation、security、implementation_plan、risks、12 篇 
 明确不保存完整隐藏思维链；明确 Proposal 不自动生效。
 → 见 `docs/adr/0012` 的偏差登记表。
 
-### 阶段 1：项目骨架与领域对象 🔄
+### 阶段 1：项目骨架与领域对象 ✅
 
 **交付**：Python 项目、配置系统、领域 Schema、枚举、基础异常、
-单元测试、CI、Docker Compose。
+单元测试、属性测试、CI、Docker Compose。
 
-**验收命令**：`make lint` / `make typecheck` / `make test` 全部通过。
+**验收命令**：`make lint` / `make typecheck` / `make test` / `make policy` 全部通过。
 
-**已完成**：
-- 项目骨架、`config.py`、`docker-compose.yml`（PostgreSQL 16 + pgvector）
-- `scripts/bootstrap_db.py`，实测连通（PostgreSQL 16.15 / pgvector 0.8.6）
-- `make lint` 通过
+**交付清单**：
 
-**待完成**：`domain/` 全部对象、`cognition/state_machine.py`、
-`cognition/constitution.py`、单元测试、属性测试、CI。
+| 模块 | 内容 |
+|---|---|
+| `config.py` | pydantic-settings；密钥一律 `SecretStr`；`redacted_summary()` 供安全日志 |
+| `domain/` | 19 个领域对象 + 枚举全集 + 结构化异常层次 |
+| `cognition/state_machine.py` | 14 状态权威转移表、禁止转移校验、状态超时表、元认知决策映射 |
+| `cognition/constitution.py` | 20 条不变量元数据 + 不变量断言 + 记忆写入白名单 |
+| `tests/unit/` | 16 个文件，覆盖全部领域对象与状态机 |
+| `tests/property/` | 2 个文件，Hypothesis 属性测试 |
+| `.github/workflows/ci.yml` | Python 3.12/3.13 矩阵 + 静态检查；预留阶段 2 的 PG service container |
+
+**实测验收结果**：
+
+| 检查 | 结果 |
+|---|---|
+| `make lint` | ✅ All checks passed（0 error） |
+| `make typecheck` | ✅ mypy strict，54 个文件 0 error |
+| `make test` | ✅ 全部通过 |
+| `make policy` | ✅ 总体 **99%**，`domain/` 与 `cognition/` 各模块 **94–100%**（门槛 85% / 75%） |
+| 数据库连通 | ✅ PostgreSQL 16.15 + pgvector 0.8.6 |
+
+**阶段 1 实现中发现的三个任务书缺口**：见 ADR-0012 §4.1（G1 缺失的取消事件、
+G2 未定义的 Situation、G3 "必须有反证"与"禁止虚假平衡"的冲突）。
 
 ### 阶段 2：数据库、事件存储与状态机
 
