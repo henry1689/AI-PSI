@@ -11,22 +11,28 @@
 
 UV ?= uv
 PY ?= $(UV) run python
+COV = --cov=ai_psi --cov-report=term-missing --cov-report=xml
 
-.PHONY: help install lint fmt typecheck test policy check up down logs ps bootstrap clean
+.PHONY: help install lint fmt typecheck test test-unit test-integration policy check \
+        up down logs ps bootstrap migrate migrate-new clean
 
 help:
 	@echo "AI-PSI 开发命令："
-	@echo "  install    安装依赖（含 dev 组）"
-	@echo "  lint       ruff check + ruff format --check"
-	@echo "  fmt        ruff 自动修复 + 格式化"
-	@echo "  typecheck  mypy --strict"
-	@echo "  test       pytest + 覆盖率采集"
-	@echo "  policy     覆盖率闸门（domain/cognition 85%、总体 75%）"
-	@echo "  check      lint + typecheck + test + policy（提交前跑这个）"
-	@echo "  up         启动 PostgreSQL 16 + pgvector 容器"
-	@echo "  down       停止容器（保留数据卷）"
-	@echo "  bootstrap  校验数据库连通并确保 vector 扩展就绪"
-	@echo "  clean      清理缓存与临时产物"
+	@echo "  install          安装依赖（含 dev 组）"
+	@echo "  lint             ruff check + ruff format --check"
+	@echo "  fmt              ruff 自动修复 + 格式化"
+	@echo "  typecheck        mypy --strict"
+	@echo "  test             全部测试（单元 + 属性 + 集成，**需要数据库**）"
+	@echo "  test-unit        只跑单元与属性测试（快，不需要数据库）"
+	@echo "  test-integration 只跑集成测试（需要数据库）"
+	@echo "  policy           覆盖率闸门（domain/cognition 85%、总体 75%）"
+	@echo "  check            lint + typecheck + test + policy（提交前跑这个）"
+	@echo "  up               启动 PostgreSQL 16 + pgvector 容器"
+	@echo "  down             停止容器（保留数据卷）"
+	@echo "  bootstrap        校验数据库连通并确保 vector 扩展就绪"
+	@echo "  migrate          把开发库迁移到最新版本"
+	@echo "  migrate-new      生成一条新迁移（用法：make migrate-new M='说明'）"
+	@echo "  clean            清理缓存与临时产物"
 
 install:
 	$(UV) sync --all-groups
@@ -43,7 +49,13 @@ typecheck:
 	$(UV) run mypy src tests scripts
 
 test:
-	$(UV) run pytest --cov=ai_psi --cov-report=term-missing --cov-report=xml
+	$(UV) run pytest $(COV)
+
+test-unit:
+	$(UV) run pytest tests/unit tests/property $(COV)
+
+test-integration:
+	$(UV) run pytest tests/integration -m integration
 
 policy:
 	$(UV) run coverage report --fail-under=75
@@ -67,6 +79,17 @@ ps:
 
 bootstrap:
 	$(PY) scripts/bootstrap_db.py
+
+migrate:
+	$(UV) run alembic upgrade head
+
+# 生成新迁移。M 为必填说明，例如：
+#   make migrate-new M="add memory table"
+migrate-new:
+ifndef M
+	$(error 必须提供迁移说明，例如：make migrate-new M="add memory table")
+endif
+	$(UV) run alembic revision --autogenerate -m "$(M)"
 
 clean:
 	rm -rf .pytest_cache .mypy_cache .ruff_cache .hypothesis htmlcov .coverage coverage.xml

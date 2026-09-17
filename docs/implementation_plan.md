@@ -29,7 +29,7 @@
 |---|---|---|---|
 | **0** | 架构与文档 | ✅ 完成 | 2026-09-17 |
 | **1** | 项目骨架与领域对象 | ✅ 完成 | 2026-09-17 |
-| 2 | 数据库、事件存储、认知状态机 | ⬜ 未开始 | — |
+| **2** | 数据库、事件存储、认知状态机 | ✅ 完成 | 2026-09-17 |
 | 3 | Mock LLM 与认知流水线 | ⬜ 未开始 | — |
 | 4 | 真实 LLM Provider | ⬜ 未开始 | — |
 | 5 | 长期记忆（pgvector） | ⬜ 未开始 | — |
@@ -82,15 +82,55 @@ prompt_contracts、evaluation、security、implementation_plan、risks、12 篇 
 **阶段 1 实现中发现的三个任务书缺口**：见 ADR-0012 §4.1（G1 缺失的取消事件、
 G2 未定义的 Situation、G3 "必须有反证"与"禁止虚假平衡"的冲突）。
 
-### 阶段 2：数据库、事件存储与状态机
+### 阶段 2：数据库、事件存储与状态机 ✅
 
 **交付**：PostgreSQL 模型、Alembic 迁移、Repository、Unit of Work、
-Event Store、状态机（接仓储）、幂等支持、属性测试。
-**本阶段引入依赖**：`sqlalchemy`、`alembic`、`structlog`；创建 `infrastructure/`。
+Event Store、状态机（接仓储）、幂等支持、集成测试。
+**引入依赖**：`sqlalchemy 2.0.54`、`alembic 1.20.0`、`structlog 26.1.0`。
 
-**验收**：可创建与回放事件；非法状态转换全部拒绝；事务失败不留半成品数据。
+**验收条件与结果**：
 
-**重点**（ADR-0002）：事件不可静默覆盖；乐观锁；事务性写入；幂等键。
+| 任务书 §18 验收条件 | 结果 |
+|---|---|
+| 可以创建和回放事件 | ✅ 集成测试覆盖；回放还额外**审计**转移合法性 |
+| 非法状态转换全部拒绝 | ✅ 且拒绝发生在**任何写入之前**（有测试断言不留事件、不推进版本） |
+| 事务失败不留下半成品数据 | ✅ 未提交即回滚；异常路径、提前 return、忘记提交全覆盖 |
+
+**交付清单**：
+
+| 模块 | 内容 |
+|---|---|
+| `infrastructure/db/models.py` | 三张表 + 10 条 CHECK 约束（含不变量 19/20 的 DB 级强制） |
+| `infrastructure/db/mappers.py` | 领域对象 ↔ ORM 的**显式**映射（ADR-0006） |
+| `infrastructure/db/repositories.py` | 回合仓储（乐观锁）+ 幂等键存储（唯一约束仲裁） |
+| `infrastructure/db/unit_of_work.py` | 事务边界；未提交即回滚 |
+| `infrastructure/event_store.py` | 只追加事件存储；按 `sequence` 排序 |
+| `infrastructure/asyncio_compat.py` | Windows 事件循环兼容（ADR-0014） |
+| `infrastructure/logging.py` | structlog + 递归脱敏 |
+| `application/ports.py` | 存储相关 Port（Protocol） |
+| `application/round_service.py` | 回合创建与状态转移（状态机+事件+投影，同一事务） |
+| `application/replay_service.py` | 历史回放（只读） |
+| `cognition/projection.py` | 事件流 → 回放结果（纯函数，兼作一致性审计） |
+| `migrations/` | Alembic 迁移（连接串从环境变量注入，不进版本库） |
+
+**实测验收结果**：
+
+| 检查 | 结果 |
+|---|---|
+| `make lint` | ✅ 0 error |
+| `make typecheck` | ✅ mypy strict，76 个文件 0 error |
+| `make test` | ✅ **543 passed**（单元 + 属性 + 集成） |
+| `make policy` | ✅ 总体 **97%**；`domain/`+`cognition/` **99%** |
+| 迁移 | ✅ `alembic upgrade head` 通过；10 条 CHECK 约束就位 |
+| 幂等 / 乐观锁 | ✅ 集成测试覆盖（含并发语义：不同请求体报冲突而非静默返回） |
+
+**测试期间发现并修复的真实缺陷**：
+1. **日志脱敏漏掉嵌套结构** —— 嵌套层只递归、不判键名，
+   `{"request": {"headers": {"authorization": ...}}}` 里的密钥原样入日志。
+   已修，并有回归测试钉死。同时补上连字符键名（`X-Api-Key`）的归一化。
+2. **映射器漏了两个枚举转换** —— mypy 在 `row_to_event` / `row_to_round` 抓到。
+3. **生成的迁移缺少 `postgresql` 导入** —— 用了 `postgresql.JSONB` 却没 import，
+   会在 `alembic upgrade head` 时 NameError。已在模板中修好，避免后续迁移重犯。
 
 ### 阶段 3：Mock LLM 与认知流水线
 

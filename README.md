@@ -69,7 +69,7 @@ V0.1 要验证的不是"回答看起来多深刻"，而是下面五件事在代�
 |---|---|---|
 | 阶段 0 | 架构与文档（ADR、领域模型、状态机、认知宪法） | ✅ 已完成 |
 | 阶段 1 | 项目骨架与领域对象 | ✅ 已完成 |
-| 阶段 2 | 数据库、事件存储、认知状态机 | ⬜ 未开始 |
+| 阶段 2 | 数据库、事件存储、认知状态机 | ✅ 已完成 |
 | 阶段 3 | Mock LLM 与认知流水线（场景 A–J） | ⬜ 未开始 |
 | 阶段 4 | 真实 LLM Provider | ⬜ 未开始 |
 | 阶段 5 | 长期记忆（pgvector） | ⬜ 未开始 |
@@ -80,14 +80,15 @@ V0.1 要验证的不是"回答看起来多深刻"，而是下面五件事在代�
 > 大型自主编码任务最常见的失败，不是写得慢，而是接口尚未稳定就盖到第八层。
 > 因此本项目**严格按阶段推进，每个阶段结束时仓库都处于可运行状态**。
 
-### 当前质量指标（阶段 1 实测）
+### 当前质量指标（阶段 2 实测）
 
 | 检查 | 结果 |
 |---|---|
 | `make lint`（ruff） | 0 error |
-| `make typecheck`（mypy strict，54 个文件） | 0 error |
-| `make test` | 全部通过 |
-| 测试覆盖率 | 总体 **99%**；`domain/` 与 `cognition/` 各模块 94–100%（门槛 85% / 75%） |
+| `make typecheck`（mypy strict，76 个文件） | 0 error |
+| `make test` | **543 passed**（单元 + 属性 + 集成） |
+| 测试覆盖率 | 总体 **97%**；`domain/` 与 `cognition/` **99%**（门槛 85% / 75%） |
+| 数据库迁移 | `alembic upgrade head` 通过；10 条 CHECK 约束（含不变量 19/20 的 DB 级强制） |
 | 开发数据库 | PostgreSQL 16.15 + pgvector 0.8.6 |
 
 ---
@@ -121,12 +122,25 @@ uv run pytest --cov=ai_psi --cov-report=term-missing
 ### 启动开发数据库
 
 ```bash
-docker compose up -d          # PostgreSQL 16 + pgvector，端口 55432
+docker compose up -d                    # PostgreSQL 16 + pgvector，端口 55432
 uv run python scripts/bootstrap_db.py   # 校验连通并确保 vector 扩展就绪
-docker compose down           # 停止（保留数据卷）
+uv run alembic upgrade head             # 应用数据库迁移（等价于 make migrate）
+docker compose down                     # 停止（保留数据卷）
 ```
 
 环境变量见 `.env.example`；复制为 `.env` 后填入本地值，`.env` 已被 git 忽略。
+
+### 运行测试
+
+```bash
+make test              # 全部测试（单元 + 属性 + 集成）——**需要数据库**
+make test-unit         # 只跑单元与属性测试（快，不需要数据库）
+make test-integration  # 只跑集成测试
+```
+
+集成测试使用**独立派生**的测试库（开发库名 + `_test`），
+并在每个用例前清空数据表。配置层会拒绝测试库与开发库相同的情形——
+集成测试会 `TRUNCATE`，指错库就是数据丢失（ADR-0014）。
 
 ---
 
@@ -136,19 +150,36 @@ docker compose down           # 停止（保留数据卷）
 ai-psi/
 ├── docs/               架构、领域模型、状态机、认知宪法、ADR
 ├── src/ai_psi/
-│   ├── config.py       配置系统（环境变量注入，密钥不落日志）
-│   ├── domain/         领域对象、枚举、基础异常（纯类型，无 IO）
-│   └── cognition/      认知状态机、认知宪法不变量
+│   ├── config.py            配置系统（环境变量注入，密钥不落日志）
+│   ├── domain/              领域对象、枚举、基础异常（纯类型，零 IO）
+│   ├── cognition/           认知状态机、认知宪法、事件流投影
+│   ├── application/         应用服务（唯一允许发起写入的层）+ 存储 Port
+│   └── infrastructure/      数据库、事件存储、日志（Ports 的实现）
+├── migrations/              Alembic 迁移
 ├── tests/
-│   ├── unit/           单元测试
-│   └── property/       Hypothesis 属性测试
-├── scripts/            运维与开发脚本
-└── evals/              评测数据集与运行器（阶段 7）
+│   ├── unit/                单元测试（零 IO）
+│   ├── property/            Hypothesis 属性测试
+│   └── integration/         集成测试（需要 PostgreSQL）
+├── scripts/                 运维与开发脚本
+└── evals/                   评测数据集与运行器（阶段 7）
 ```
 
-> 阶段 1 **只创建有实际内容的包**。`application/` `memory/` `learning/`
-> `reliability/` `api/` `infrastructure/` `providers/` 在各自阶段引入，
-> 不预留空壳（`docs/adr/0012-v0-1-scope-boundaries.md`）。
+> **只创建有实际内容的包。** `memory/` `learning/` `reliability/`
+> `providers/` `api/` 在各自阶段引入，不预留空壳
+> （`docs/adr/0012-v0-1-scope-boundaries.md`）。
+
+### 分层与依赖方向
+
+```
+api/  →  application/  →  cognition/ memory/ learning/ reliability/  →  domain/
+                          ↑                                              ↑
+                    providers/ infrastructure/  ────────────────────────────
+```
+
+- `domain/` **零依赖**（只依赖 pydantic）；
+- `cognition/` 等通过 **Protocol（Port）** 访问外部，不 import 实现；
+- **只有 `application/` 能发起持久化写入**；
+- 依赖方向永远向内（`docs/adr/0001-architecture-style.md`）。
 
 ---
 

@@ -164,6 +164,32 @@ class TestDerivedBudgetConfig:
             settings(llm_max_retries=-1)
 
 
+class TestTestDatabaseResolution:
+    """🔴 集成测试会清空数据表——测试库与开发库**必须**不同。"""
+
+    def test_derives_test_database_by_suffix(self) -> None:
+        s = settings(database_url="postgresql+psycopg://u:p@h:5432/ai_psi")
+        assert s.resolved_test_database_url().endswith("/ai_psi_test")
+
+    def test_explicit_url_wins(self) -> None:
+        s = settings(test_database_url="postgresql+psycopg://u:p@h:5432/custom_test")
+        assert s.resolved_test_database_url().endswith("/custom_test")
+
+    def test_identical_urls_are_rejected(self) -> None:
+        """派生结果与开发库相同 → 主动报错，而不是让测试去清空开发数据。"""
+        from ai_psi.domain.exceptions import ConfigurationError
+
+        same = "postgresql+psycopg://u:p@h:5432/ai_psi"
+        with pytest.raises(ConfigurationError, match="必须指向不同的数据库"):
+            settings(database_url=same, test_database_url=same).resolved_test_database_url()
+
+    def test_names_are_exposed_without_credentials(self) -> None:
+        s = settings(database_url="postgresql+psycopg://u:secret@h:5432/ai_psi")
+        assert s.database_name() == "ai_psi"
+        assert s.test_database_name() == "ai_psi_test"
+        assert "secret" not in s.database_name()
+
+
 class TestCaching:
     def test_get_settings_is_cached(self) -> None:
         from ai_psi.config import get_settings, reset_settings_cache

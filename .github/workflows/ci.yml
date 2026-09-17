@@ -12,8 +12,6 @@ concurrency:
 
 env:
   PYTHONUNBUFFERED: "1"
-  # CI 直连 Docker Hub，使用官方镜像（本地开发若不通可覆盖 AI_PSI_PG_IMAGE）
-  AI_PSI_PG_IMAGE: pgvector/pgvector:pg16
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -43,28 +41,37 @@ jobs:
   # ---------------------------------------------------------------------------
   # 测试：跨 Python 版本矩阵
   #
-  # 阶段 1 的测试全部是纯领域层测试，**不需要数据库**。
-  # 阶段 2 引入 PostgreSQL 与集成测试时，在此加入 service container：
-  #
-  #   services:
-  #     postgres:
-  #       image: ${{ env.AI_PSI_PG_IMAGE }}
-  #       env:
-  #         POSTGRES_USER: ai_psi
-  #         POSTGRES_PASSWORD: ai_psi_dev_pw
-  #         POSTGRES_DB: ai_psi
-  #       ports: ["55432:5432"]
-  #       options: >-
-  #         --health-cmd "pg_isready -U ai_psi -d ai_psi"
-  #         --health-interval 5s --health-timeout 5s --health-retries 12
+  # 集成测试需要 PostgreSQL（任务书要求开发/测试库必须是 PostgreSQL 容器，
+  # 禁用 SQLite——避免行为差异）。测试夹具会自动建库并跑 alembic 迁移。
   # ---------------------------------------------------------------------------
   test:
     name: Test (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: ai_psi
+          POSTGRES_PASSWORD: ai_psi_dev_pw
+          POSTGRES_DB: ai_psi
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U ai_psi -d ai_psi"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.12", "3.13"]
+
+    env:
+      AI_PSI_DATABASE_URL: postgresql+psycopg://ai_psi:ai_psi_dev_pw@localhost:55432/ai_psi
+      AI_PSI_ENV: testing
+
     steps:
       - uses: actions/checkout@v4
 
@@ -80,7 +87,10 @@ jobs:
       - name: 安装依赖
         run: uv sync --all-groups --python ${{ matrix.python-version }}
 
-      - name: pytest + 覆盖率采集
+      - name: 校验数据库连通与 pgvector 扩展
+        run: make bootstrap
+
+      - name: pytest + 覆盖率采集（含集成测试）
         run: make test
 
       - name: 覆盖率闸门（domain/cognition 85%、总体 75%）

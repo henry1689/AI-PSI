@@ -36,6 +36,13 @@
 | [0011](0011-constitution-as-code.md) | 认知宪法即代码 | 缺口：Markdown 不可测试、不可强制 |
 | [0012](0012-v0-1-scope-boundaries.md) | 范围边界与目录偏差 | **C13** + 全量目录偏差登记 + 8 项缺口默认值 |
 
+### 阶段 2 实现决策（2 篇）
+
+| # | 标题 | 要点 |
+|---|---|---|
+| [0013](0013-persistence-layer.md) | 持久化层设计 | 异步 SQLAlchemy + psycopg3；事件按 `sequence` 排序；不变量下沉到 DB CHECK；幂等靠唯一约束仲裁；乐观锁用显式 UPDATE |
+| [0014](0014-cross-platform-and-test-database.md) | 跨平台陷阱与测试库隔离 | Windows 事件循环；`.ini` 必须 ASCII；测试库独立派生 + 拒绝与开发库相同；`NullPool`；集成测试分层 |
+
 ---
 
 ## 任务书内部矛盾总览

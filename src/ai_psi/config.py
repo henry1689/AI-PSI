@@ -19,6 +19,8 @@ from typing import Any
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from ai_psi.domain.exceptions import ConfigurationError
+
 __all__ = ["Environment", "Settings", "get_settings", "reset_settings_cache"]
 
 
@@ -58,10 +60,20 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # 数据库
     # ------------------------------------------------------------------
-    #: SQLAlchemy 风格的连接串。阶段 1 仅用于连通性校验，ORM 在阶段 2 引入。
+    #: SQLAlchemy 风格的连接串。
     database_url: str = Field(
         default="postgresql+psycopg://ai_psi:ai_psi_dev_pw@localhost:55432/ai_psi",
         description="PostgreSQL 连接串（含凭证，禁止写入日志）",
+    )
+
+    #: 集成测试专用连接串。
+    #:
+    #: 🔴 **集成测试绝不复用开发库。** 测试会 TRUNCATE 表，
+    #: 指错一次就是开发数据的静默丢失。未显式配置时，
+    #: 由 :meth:`resolved_test_database_url` 从开发库名派生（追加 ``_test``）。
+    test_database_url: str | None = Field(
+        default=None,
+        description="集成测试专用数据库连接串；None 表示按开发库名派生",
     )
 
     # ------------------------------------------------------------------
@@ -118,6 +130,38 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.env is Environment.PRODUCTION
+
+    def resolved_test_database_url(self) -> str:
+        """返回集成测试要用的连接串。
+
+        未显式配置 ``test_database_url`` 时，在开发库名后追加 ``_test`` 派生。
+        派生的结果**必须与开发库不同**——相同则说明派生逻辑有误，
+        这里主动报错而不是让测试去清空开发数据。
+
+        Returns:
+            测试库连接串。
+
+        Raises:
+            ConfigurationError: 派生结果与开发库相同。
+        """
+        if self.test_database_url:
+            resolved = self.test_database_url
+        else:
+            base, separator, name = self.database_url.rpartition("/")
+            resolved = f"{base}/{name}_test" if separator else f"{self.database_url}_test"
+
+        if resolved == self.database_url:
+            msg = "测试库连接串与开发库相同。集成测试会清空数据表，因此两者必须指向不同的数据库"
+            raise ConfigurationError(msg)
+        return resolved
+
+    def database_name(self) -> str:
+        """返回开发库的库名（用于诊断输出，不含凭证）。"""
+        return self.database_url.rpartition("/")[2]
+
+    def test_database_name(self) -> str:
+        """返回测试库的库名（用于诊断输出，不含凭证）。"""
+        return self.resolved_test_database_url().rpartition("/")[2]
 
     def redacted_summary(self) -> dict[str, Any]:
         """返回可安全写入日志的配置摘要。

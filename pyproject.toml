@@ -11,12 +11,16 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
 ]
 
-# 阶段 1 只声明真正被代码使用的依赖（ADR-0007 / ADR-0012）。
-# FastAPI / SQLAlchemy / Alembic / structlog 在对应阶段（2、3）引入，此处不预留。
+# 只声明真正被代码使用的依赖（ADR-0007 / ADR-0012）。
+# FastAPI 在阶段 3 引入，此处不预留。
 dependencies = [
     "pydantic>=2.9",
     "pydantic-settings>=2.5",
     "psycopg[binary]>=3.2",
+    # 阶段 2：数据库、事件存储与结构化日志
+    "sqlalchemy>=2.0.36",
+    "alembic>=1.14",
+    "structlog>=24.4",
 ]
 
 [dependency-groups]
@@ -46,7 +50,9 @@ src = ["src", "tests", "scripts"]
 # *.md 必须排除：ruff 0.14+ 会格式化 Markdown 中的 Python 代码块，
 # 而 docs/ 下的文档（尤其任务书）含有大量作为**示例**的代码片段，
 # 其中不乏伪代码与省略号占位，格式化它们会破坏需求文档的可读性与原意。
-extend-exclude = ["migrations", "evals/datasets", "**/*.md"]
+#
+# migrations/ **不排除**——生成的迁移也是代码，同样要过 lint。
+extend-exclude = ["evals/datasets", "**/*.md"]
 
 [tool.ruff.lint]
 select = [
@@ -70,7 +76,10 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["B011"]
-"scripts/**" = []
+# 生成的迁移文件：
+# * E501 —— CHECK 约束表达式是机器生成的长字符串，换行会破坏可读性且下次生成又被覆盖；
+# * F401 —— 模板统一导入 `postgresql`，但并非每条迁移都用得到 PG 专有类型。
+"migrations/versions/*" = ["E501", "F401"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["ai_psi"]
@@ -145,6 +154,11 @@ exclude_lines = [
     "pragma: no cover",
     "if TYPE_CHECKING:",
     "raise NotImplementedError",
+    # Protocol 的方法体是 `...` 占位——它们**永远不会被执行**，
+    # 统计它们会把"接口定义完整度"误报成"测试没覆盖"。
+    '^\s*\.\.\.$',
+    # @overload / @abstractmethod 声明同理
+    '^\s*@(overload|abstractmethod)$',
 ]
 
 [tool.coverage.html]
