@@ -71,7 +71,7 @@ V0.1 要验证的不是"回答看起来多深刻"，而是下面五件事在代�
 | 阶段 1 | 项目骨架与领域对象 | ✅ 已完成 |
 | 阶段 2 | 数据库、事件存储、认知状态机 | ✅ 已完成 |
 | 阶段 3 | Mock LLM 与认知流水线（场景 A–J） | ✅ 已完成 |
-| 阶段 4 | 真实 LLM Provider | ⬜ 未开始 |
+| 阶段 4 | 真实 LLM Provider（DeepSeek） | ✅ 已完成 |
 | 阶段 5 | 长期记忆（pgvector） | ⬜ 未开始 |
 | 阶段 6 | 反馈、经验与改进提案 | ⬜ 未开始 |
 | 阶段 7 | 评测与回放 | ⬜ 未开始 |
@@ -80,23 +80,25 @@ V0.1 要验证的不是"回答看起来多深刻"，而是下面五件事在代�
 > 大型自主编码任务最常见的失败，不是写得慢，而是接口尚未稳定就盖到第八层。
 > 因此本项目**严格按阶段推进，每个阶段结束时仓库都处于可运行状态**。
 
-### 当前质量指标（阶段 3 实测）
+### 当前质量指标（阶段 4 实测）
 
 | 检查 | 结果 |
 |---|---|
 | `make lint`（ruff） | 0 error |
-| `make typecheck`（mypy strict，142 个文件） | 0 error |
-| `make test` | **869 passed, 11 skipped**（单元 + 属性 + 契约 + 场景 + API + 集成） |
+| `make typecheck`（mypy strict，164 个文件） | 0 error |
+| `make test` | **968 passed, 16 skipped**（单元 + 属性 + 契约 + 场景 + API + 集成） |
 | 测试覆盖率 | 总体 **95%**；`domain/` 与 `cognition/` **98%**（门槛 85% / 75%） |
 | 契约测试 | 事件存储 / 回合仓储 / 幂等键：同一组断言跑**内存与 PostgreSQL 两个实现** |
-| 场景 A–J | **全部通过**（任务书 §15.4，阶段 3 的硬性验收条件） |
+| 场景 A–J | **全部通过**（任务书 §15.4） |
+| **真实模型端到端** | ✅ `make test-live`：**5 passed**（真实 DeepSeek；D0/D2/D4 三类回合全部跑通） |
 | 预算 | **无超预算回合**：调用前扣减 + 可选模块跳过 + 强制尾部保留 |
 | 数据库迁移 | `alembic upgrade head` 通过；10 条 CHECK 约束（含不变量 19/20 的 DB 级强制） |
 | 开发数据库 | PostgreSQL 16.15 + pgvector 0.8.6 |
 
-> **阶段 3 的验收是"不使用外部 API 也能完整运行"。**
+> **零依赖与真实模型两条路都通。**
 > 默认配置（`AI_PSI_LLM_PROVIDER=mock` + `AI_PSI_STORAGE_BACKEND=memory`）
-> 下，整套认知闭环零外部依赖——没有 API Key、没有数据库也能跑完一次完整回合。
+> 下整套认知闭环零外部依赖；把 `AI_PSI_LLM_PROVIDER` 改成 `deepseek`
+> 并在环境里配好密钥，同一套代码就跑在真实推理模型上。
 
 ---
 
@@ -124,6 +126,35 @@ make lint && make typecheck && make test
 uv run ruff check . && uv run ruff format --check .
 uv run mypy src tests scripts
 uv run pytest --cov=ai_psi --cov-report=term-missing
+```
+
+### 接入真实模型
+
+```bash
+# 密钥只从环境变量来（也接受业界通用名 DEEPSEEK_API_KEY / OPENAI_API_KEY）
+export AI_PSI_DEEPSEEK_API_KEY=...
+export AI_PSI_LLM_PROVIDER=deepseek        # 默认模型 deepseek-v4-flash
+uv run python -m ai_psi.main
+```
+
+| 变量 | 说明 |
+|---|---|
+| `AI_PSI_LLM_PROVIDER` | `mock`（默认）/ `deepseek` / `openai_compatible` |
+| `AI_PSI_LLM_MODEL` | 留空 = 按 Provider 取默认值 |
+| `AI_PSI_LLM_JSON_MODE` | 不支持 `response_format` 的兼容服务器请置 `false` |
+| `AI_PSI_LLM_REASONING_HEADROOM_TOKENS` | 推理模型的输出预留；留空 = 用 Provider 默认值 |
+| `AI_PSI_LLM_CIRCUIT_*` | 熔断阈值与冷却时间 |
+
+> ⚠️ **缺 API Key 时会明确失败，不会静默回落到 Mock。**
+> 静默回落会让你以为在跟真实模型对话，实际拿到的是规则引擎的输出
+> （ADR-0016 §6）。想用规则引擎，就显式配 `AI_PSI_LLM_PROVIDER=mock`。
+>
+> ⚠️ **Anthropic Provider 尚未实现**（ADR-0016 §1）；配置它同样会明确报错。
+
+真实模型端到端测试会**花钱、会联网**，因此需要两道开关：
+
+```bash
+make test-live        # 需要 AI_PSI_DEEPSEEK_API_KEY 已配置
 ```
 
 ### 启动认知服务
@@ -186,8 +217,8 @@ ai-psi/
 │   ├── domain/              领域对象、枚举、基础异常（纯类型，零 IO）
 │   ├── cognition/           状态机、宪法、投影、深度路由、编排表、15 个认知模块
 │   ├── prompts/             契约、版本、Schema、模板、结构化输入的编解码
-│   ├── providers/           Provider 协议、Mock 实现、调用网关、工厂
-│   ├── reliability/         预算记账、反刍信号、置信度上限
+│   ├── providers/           协议、Mock、网关、解析修复、HTTP 错误映射、熔断装饰器、OpenAI 兼容实现
+│   ├── reliability/         预算记账、反刍信号、置信度上限、熔断状态机
 │   ├── memory/              记忆写入策略（默认拒绝）
 │   ├── application/         应用服务（唯一允许发起写入的层）+ 全部 Port
 │   ├── infrastructure/      PostgreSQL、内存适配器、事件存储、日志
@@ -199,7 +230,7 @@ ai-psi/
 │   ├── contract/            **存储契约测试**（同一组断言跑两个实现）
 │   ├── scenarios/           任务书 §15.4 的场景 A–J（阶段 3 验收条件）
 │   ├── api/                 HTTP 接口测试（内存后端）
-│   └── integration/         集成测试（需要 PostgreSQL）
+│   └── integration/         集成测试（需要 PostgreSQL）+ 真实模型测试（`live`，默认跳过）
 ├── scripts/                 运维与开发脚本
 └── evals/                   评测数据集与运行器（阶段 7）
 ```

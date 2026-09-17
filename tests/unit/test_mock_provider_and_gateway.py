@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -28,6 +29,7 @@ from ai_psi.prompts.versions import CONTRACTS, build_default_registry
 from ai_psi.providers.base import InvocationContext, LLMMessage, ModelConfig
 from ai_psi.providers.gateway import ModelGateway
 from ai_psi.providers.mock import MockFault, MockProvider
+from ai_psi.providers.response import ProviderResponse, TokenUsage
 from ai_psi.reliability.budgets import BudgetTracker
 
 pytestmark = pytest.mark.unit
@@ -49,7 +51,7 @@ async def _call(
     *,
     response_model: type[ConcernDetectorOutput] = ConcernDetectorOutput,
     messages: list[LLMMessage] | None = None,
-) -> ConcernDetectorOutput:
+) -> ProviderResponse[ConcernDetectorOutput]:
     return await provider.generate_structured(
         task_name=TASK,
         messages=messages if messages is not None else _messages(),
@@ -63,13 +65,13 @@ class TestMockProvider:
     async def test_default_engine_produces_valid_output(self) -> None:
         provider = MockProvider()
         result = await _call(provider)
-        assert isinstance(result, ConcernDetectorOutput)
-        assert result.concerns
+        assert isinstance(result.value, ConcernDetectorOutput)
+        assert result.value.concerns
 
     async def test_scripted_response_wins(self) -> None:
         provider = MockProvider(responses={TASK: [{"concerns": []}]})
         result = await _call(provider)
-        assert result.concerns == []
+        assert result.value.concerns == []
 
     async def test_scripted_responses_are_consumed_in_order(self) -> None:
         provider = MockProvider(
@@ -148,7 +150,7 @@ async def _call_task[T: BaseModel](
     task_name: str,
     payload: dict[str, object],
     response_model: type[T],
-) -> T:
+) -> ProviderResponse[T]:
     """按任意任务发起一次结构化调用。"""
     registry = build_default_registry()
     return await provider.generate_structured(
@@ -208,10 +210,8 @@ class TestMockFaults:
         with pytest.raises(StructuredOutputError):
             await _call_task(provider, "inquiry_framer", payload, InquiryFramerOutput)
         # 第二次尝试故障已过期
-        assert isinstance(
-            await _call_task(provider, "inquiry_framer", payload, InquiryFramerOutput),
-            InquiryFramerOutput,
-        )
+        recovered = await _call_task(provider, "inquiry_framer", payload, InquiryFramerOutput)
+        assert isinstance(recovered.value, InquiryFramerOutput)
 
     async def test_forbidden_extra_field(self) -> None:
         """``extra="forbid"`` 让模型多返回的字段无法通过——红线一的第一道防线。"""
@@ -292,7 +292,11 @@ class _FlakyProvider:
             await asyncio.sleep(self._delay)
         if self.calls <= self._failures:
             raise self._error
-        return ConcernDetectorOutput(concerns=[])
+        return ProviderResponse(
+            value=ConcernDetectorOutput(concerns=[]),
+            usage=TokenUsage(input_tokens=11, output_tokens=7),
+            finish_reason="stop",
+        )
 
     async def generate_text(
         self,
@@ -307,7 +311,11 @@ class _FlakyProvider:
             await asyncio.sleep(self._delay)
         if self.calls <= self._failures:
             raise self._error
-        return "文本"
+        return ProviderResponse(
+            value="文本",
+            usage=TokenUsage(input_tokens=11, output_tokens=2),
+            finish_reason="stop",
+        )
 
 
 def _gateway(
@@ -502,3 +510,61 @@ class TestProviderEvents:
     def test_event_type_for_analysis_is_available(self) -> None:
         """阶段 3 补齐的事件类型必须真的存在于枚举里。"""
         assert EventType.COGNITION_ANALYSIS_COMPLETED.value == "cognition.analysis.completed"
+
+
+class _TruncatingProvider:
+    """一个**违反协议**的 Provider：截断了却仍然返回结果。
+
+    Protocol 明确要求 Provider 自己拒绝被截断的响应（见
+    :meth:`OpenAICompatibleProvider._reject_truncation`），
+    但第三方实现未必遵守。网关这道检查就是为它们准备的。
+    """
+
+    @property
+    def name(self) -> str:
+        return "truncating"
+
+    async def generate_structured(
+        self, *, task_name, messages, response_model, model_config, invocation_context
+    ) -> ProviderResponse[Any]:
+        return ProviderResponse(
+            value=response_model.model_validate({"concerns": []}),
+            usage=TokenUsage(input_tokens=1, output_tokens=1),
+            finish_reason="length",
+        )
+
+    async def generate_text(
+        self, *, task_name, messages, model_config, invocation_context
+    ) -> ProviderResponse[str]:
+        return ProviderResponse(
+            value="半截", usage=TokenUsage(input_tokens=1, output_tokens=1), finish_reason="length"
+        )
+
+
+class TestGatewayTruncationBackstop:
+    """网关对"截断却返回结果"的兜底检查。
+
+    🔴 与 Provider 内的检查是**两道**，不是重复：
+    Provider 内那道给出更好的诊断并避免无谓的解析；
+    网关这道防的是不遵守协议的第三方实现。
+    """
+
+    async def test_structured_truncation_is_rejected(self) -> None:
+        gateway = _gateway(_TruncatingProvider())
+        with pytest.raises(StructuredOutputError) as excinfo:
+            await gateway.structured(
+                task_name=TASK,
+                payload=ConcernDetectorInput(user_message="你好"),
+                response_model=ConcernDetectorOutput,
+                context=_context(),
+            )
+        assert excinfo.value.retryable is False
+
+    async def test_text_truncation_is_rejected(self) -> None:
+        gateway = _gateway(_TruncatingProvider())
+        with pytest.raises(StructuredOutputError):
+            await gateway.text(
+                task_name="response_renderer",
+                payload={"plan": {}, "conclusion": "x"},
+                context=_context(),
+            )

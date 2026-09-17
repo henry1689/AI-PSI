@@ -27,6 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from ai_psi.domain.exceptions import StructuredOutputError
 from ai_psi.prompts.payload import extract_payload
 from ai_psi.providers.base import InvocationContext, LLMMessage, ModelConfig
+from ai_psi.providers.response import ProviderResponse, TokenUsage
 
 __all__ = ["MockFault", "MockProvider", "MockResponder"]
 
@@ -148,8 +149,12 @@ class MockProvider:
         response_model: type[T],
         model_config: ModelConfig,
         invocation_context: InvocationContext,
-    ) -> T:
+    ) -> ProviderResponse[T]:
         """返回经 Schema 校验的结构化对象。
+
+        ⚠️ token 用量是**估算值**（按字符数除以 4）。
+        真实 Provider 必须报告真实用量——把估算和实测混在一起
+        会让成本核算失去意义，因此 :meth:`TokenUsage.estimated` 只在这里用。
 
         Raises:
             StructuredOutputError: 输入块缺失、响应不是对象，或校验失败。
@@ -170,7 +175,7 @@ class MockProvider:
             raise StructuredOutputError(msg, task_name=task_name, provider=self._name)
 
         try:
-            return response_model.model_validate(raw)
+            value = response_model.model_validate(raw)
         except ValidationError as exc:
             # 🔴 只记录**字段路径与原因**，绝不记录模型原始输出——
             # 原始输出可能包含用户正文或注入内容（§17.1）。
@@ -186,6 +191,17 @@ class MockProvider:
                 provider=self._name,
             ) from exc
 
+        usage = TokenUsage.estimated(
+            text=value.model_dump_json(),
+            prompt_chars=sum(len(message.content) for message in messages),
+        )
+        return ProviderResponse(
+            value=value,
+            usage=usage,
+            finish_reason="stop",
+            raw_hash=_hash(value.model_dump_json()),
+        )
+
     async def generate_text(
         self,
         *,
@@ -193,7 +209,7 @@ class MockProvider:
         messages: list[LLMMessage],
         model_config: ModelConfig,
         invocation_context: InvocationContext,
-    ) -> str:
+    ) -> ProviderResponse[str]:
         """返回纯文本响应。
 
         Raises:
@@ -214,7 +230,15 @@ class MockProvider:
         if not text.strip():
             msg = f"任务 {task_name!r} 的 Mock 文本响应为空"
             raise StructuredOutputError(msg, task_name=task_name, provider=self._name)
-        return text
+        return ProviderResponse(
+            value=text,
+            usage=TokenUsage.estimated(
+                text=text,
+                prompt_chars=sum(len(message.content) for message in messages),
+            ),
+            finish_reason="stop",
+            raw_hash=_hash(text),
+        )
 
     # ------------------------------------------------------------------
     # 内部
@@ -275,6 +299,13 @@ class MockProvider:
                 raise StructuredOutputError(msg, task_name=task_name, provider=self._name)
             current = _mutate(current, fault)
         return current
+
+
+def _hash(text: str) -> str:
+    """返回内容的 SHA-256（只存哈希，不存内容）。"""
+    import hashlib
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _mutate(raw: dict[str, Any], fault: MockFault) -> dict[str, Any]:

@@ -312,3 +312,36 @@ def utc_now_fixed() -> datetime:
 @pytest.fixture
 def one_hour_later(utc_now_fixed: datetime) -> datetime:
     return utc_now_fixed + timedelta(hours=1)
+
+
+#: 会被开发机环境**真实设置**的供应商密钥变量名。
+#:
+#: 配置层刻意同时接受业界通用名（``DEEPSEEK_API_KEY``）与本项目的
+#: ``AI_PSI_`` 前缀名，于是这些变量在开发机上通常是真的存在的。
+_AMBIENT_CREDENTIAL_VARS = (
+    "AI_PSI_DEEPSEEK_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "AI_PSI_OPENAI_API_KEY",
+    "OPENAI_API_KEY",
+    "AI_PSI_ANTHROPIC_API_KEY",
+    "ANTHROPIC_API_KEY",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_provider_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    """把供应商密钥从测试环境里摘掉。
+
+    🔴 开发机上往往**真的**配着 ``DEEPSEEK_API_KEY``。如果测试依赖
+    "环境里恰好没有密钥"，它们就会在开发机上失败、在 CI 上通过——
+    那是最难解释的一类测试失败，而且会诱使人把断言改松。
+
+    标记为 ``live`` 的用例是例外：它们要的就是真实密钥。
+    """
+    if request.node.get_closest_marker("live") is not None:
+        return
+    for name in _AMBIENT_CREDENTIAL_VARS:
+        monkeypatch.delenv(name, raising=False)

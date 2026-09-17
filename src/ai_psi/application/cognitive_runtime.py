@@ -90,6 +90,7 @@ from ai_psi.prompts.registry import PromptRegistry
 from ai_psi.prompts.schemas import ResponsePlan
 from ai_psi.providers.base import LLMProvider
 from ai_psi.providers.gateway import ModelGateway
+from ai_psi.providers.registry import resolve_model
 from ai_psi.reliability.budgets import BudgetTracker
 
 __all__ = ["CognitiveRuntime", "RoundOutcome", "RoundRequest"]
@@ -187,6 +188,13 @@ class CognitiveRuntime:
         self._prompts = prompts
         self._memory = memory
         self._settings = settings
+        # 🔴 模型标识**在这里解析一次**。
+        #
+        # 阶段 3 曾在 `_make_gateway` 里写成 `settings.llm_model or "mock-model-v1"`，
+        # 结果只要没显式配 `llm_model`，网关就会把 "mock-model-v1" 发给
+        # **真实供应商**——DeepSeek 直接返回 400。这个缺陷 Mock 永远测不出来，
+        # 是阶段 4 的 live 测试第一次跑真实回合时抓到的。
+        self._model = resolve_model(settings)
         self._rounds = round_service or CognitiveRoundService(uow_factory)
         self._artifacts = artifacts or ArtifactService(uow_factory)
 
@@ -213,6 +221,11 @@ class CognitiveRuntime:
     def settings(self) -> Settings:
         """运行时配置。"""
         return self._settings
+
+    @property
+    def model(self) -> str:
+        """本次运行使用的模型标识（已按 Provider 解析过默认值）。"""
+        return self._model
 
     @property
     def round_service(self) -> CognitiveRoundService:
@@ -614,7 +627,21 @@ class _RoundExecution:
     # ------------------------------------------------------------------
 
     async def _analyze(self) -> None:
-        """认知分析模块。"""
+        """认知分析模块。
+
+        🔴 **保留额度必须在进入时就抬高，而不是在结束时。**
+
+        阶段 4 跑真实回合时发现：元认知裁定 ``CHANGE_METHOD`` 会**再次**进入
+        本方法，而此时上一次判断已经把保留额度降到了"只剩渲染"（1）。
+        于是一轮可选分析刚好把额度花到 0，接下来的判断合成与回答渲染
+        就都没有额度了——回合以 ``BudgetExhaustedError`` 失败，
+        用户拿不到任何回答。
+
+        正确做法是：只要还在分析阶段，就按"判断 + 元认知 + 渲染"三重保留。
+        宁可少跑一个可选分析（跳过会被记录），也不能拿不出结论。
+        """
+        self._budget.set_tail_reserve(_initial_tail_reserve(self._state.depth))
+
         inquiry = self._require_inquiry()
         bundle = self._require_bundle()
 
@@ -637,19 +664,44 @@ class _RoundExecution:
             f"{key}:{hashlib.sha256(value.model_dump_json().encode('utf-8')).hexdigest()[:16]}"
             for key, value in self._state.analysis_payloads.items()
         )
-        # 分析阶段结束：尾部只需要留出判断合成 + 元认知 + 回答渲染
-        self._budget.set_tail_reserve(_initial_tail_reserve(self._state.depth))
+        # 分析阶段结束，保留额度不变（判断合成是下一步，仍需为元认知与渲染留出）。
 
     async def _run_analysis_step(self, spec: StepSpec, inquiry: Inquiry) -> None:
-        """执行一个 ANALYZING 阶段的可选模块。
+        """执行一个 ANALYZING 阶段的**可选**模块。
 
-        预算不足时**跳过并记录**——被跳过的步骤会出现在
-        :attr:`RoundOutcome.skipped_steps` 里，不会静默消失。
+        🔴 **可选模块失败不拖垮整个回合。**
+
+        它们本来就是"预算不够就跳过"的步骤（见 MODULE_MATRIX），
+        因此当模型调用失败——输出被截断、格式修不好、供应商抖动——
+        正确的处理与预算不足一样：**跳过并记录**。
+
+        任务书 §13.2 明确写了"真实 LLM 不可用时……可返回当前认知服务降级"，
+        阶段 4 的验收条件也写着"解析异常不会污染状态"。
+        丢掉整个回合（用户什么都拿不到）才是更糟的选择。
+
+        ⚠️ **降级必须留痕。** 被跳过的步骤进入 ``skipped_steps``、
+        并随终态事件落库；否则事后无法分辨"少做了一个分析"
+        与"分析跑了但没产出"。
+
+        ⚠️ 强制模块（判断合成、回答渲染）**不在此列**——
+        它们失败就是回合失败，因为跳过它们的"降级"等于没有回答。
         """
         if not self._can_run_optional():
             self._state.skipped.append(f"{spec.step.value}（预算不足）")
             return
 
+        try:
+            await self._run_optional_module(spec, inquiry)
+        except ProviderError as exc:
+            # ProviderError 覆盖了"模型侧出了任何问题"：
+            # 结构化输出失败、超时、限流、供应商不可用（含熔断）。
+            self._state.skipped.append(f"{spec.step.value}（模型调用失败：{exc.code}）")
+            self._state.adjustments.append(
+                f"分析步骤 {spec.step.value} 因模型调用失败被跳过（{exc.code}）"
+            )
+
+    async def _run_optional_module(self, spec: StepSpec, inquiry: Inquiry) -> None:
+        """执行一次可选分析模块（失败由调用方降级处理）。"""
         bundle = self._require_bundle()
 
         if spec.step is CognitiveStep.HYPOTHESIS_GENERATION:
@@ -1018,6 +1070,7 @@ class _RoundExecution:
             RoundState.COMPLETED,
             f"回答已生成（{stop_reason}）",
             stop_reason=stop_reason,
+            diagnostics=self._diagnostics(),
         )
         await self._close_round()
 
@@ -1087,6 +1140,7 @@ class _RoundExecution:
         reason: str,
         *,
         stop_reason: str | None = None,
+        diagnostics: dict[str, object] | None = None,
     ) -> None:
         """推进状态机，并把最新的预算计数一并落库。
 
@@ -1104,6 +1158,7 @@ class _RoundExecution:
             metacognitive_loops=self._budget.metacognitive_loops_used,
             budget=self._budget.budget,
             depth_level=self._state.depth,
+            diagnostics=diagnostics,
         )
         self._state.round_ = result.round
 
@@ -1155,13 +1210,25 @@ class _RoundExecution:
             payload={"analysis_kind": kind, "analysis": outcome.value.model_dump(mode="json")},
         )
 
+    def _diagnostics(self) -> dict[str, object]:
+        """回合结束时随终态事件一起落库的诊断信息。
+
+        🔴 **降级必须留痕。** 跳过的步骤与对模型输出的改写
+        如果只活在内存里的 ``RoundOutcome`` 上，
+        回放与事后审计都看不到它们——那等于"降级发生了但没人知道"。
+        """
+        return {
+            "skipped_steps": list(self._state.skipped),
+            "adjustments": list(self._state.adjustments),
+        }
+
     def _make_gateway(self) -> ModelGateway:
         """按当前预算构造模型网关。"""
         return ModelGateway(
             provider=self._runtime.provider,
             prompts=self._runtime.prompts,
             budget=self._budget,
-            model=self._runtime.settings.llm_model or "mock-model-v1",
+            model=self._runtime.model,
             max_retries=self._runtime.settings.llm_max_retries,
             timeout_seconds=self._runtime.settings.llm_timeout_seconds,
         )

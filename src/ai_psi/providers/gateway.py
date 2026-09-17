@@ -29,9 +29,14 @@ from uuid import uuid4
 from pydantic import BaseModel
 
 from ai_psi.domain.events import ModelInvocationInfo
-from ai_psi.domain.exceptions import ProviderError, ProviderTimeoutError
+from ai_psi.domain.exceptions import (
+    ProviderError,
+    ProviderTimeoutError,
+    StructuredOutputError,
+)
 from ai_psi.prompts.registry import PromptRegistry
 from ai_psi.providers.base import InvocationContext, LLMProvider
+from ai_psi.providers.response import ProviderResponse, TokenUsage
 from ai_psi.reliability.budgets import BudgetTracker
 
 __all__ = ["ModelGateway", "StructuredCall", "TextCall"]
@@ -136,7 +141,7 @@ class ModelGateway:
             monotonic_start = time.perf_counter()
 
             try:
-                value = await self._await_with_timeout(
+                response = await self._await_with_timeout(
                     self._provider.generate_structured(
                         task_name=task_name,
                         messages=messages,
@@ -146,6 +151,9 @@ class ModelGateway:
                     ),
                     task_name=task_name,
                 )
+                # 🔴 截断不算成功：半个 JSON 不是结果。判断放在这里，
+                # 对所有 Provider 一致生效（见 _ensure_not_truncated）。
+                self._ensure_not_truncated(response, task_name=task_name)
             except ProviderError as exc:
                 last_error = exc
                 if not exc.retryable:
@@ -153,15 +161,16 @@ class ModelGateway:
                 continue
 
             return StructuredCall(
-                value=value,
+                value=response.value,
                 invocation=self._build_info(
                     task_name=task_name,
                     prompt_version=contract.version,
                     started_at=started_at,
                     monotonic_start=monotonic_start,
                     retry_count=attempt,
-                    result_status="success",
-                    response_hash=_hash_text(value.model_dump_json()),
+                    result_status=_status_for(response),
+                    response_hash=response.raw_hash or _hash_text(response.value.model_dump_json()),
+                    usage=response.usage,
                 ),
             )
 
@@ -199,7 +208,7 @@ class ModelGateway:
             monotonic_start = time.perf_counter()
 
             try:
-                value = await self._await_with_timeout(
+                response = await self._await_with_timeout(
                     self._provider.generate_text(
                         task_name=task_name,
                         messages=messages,
@@ -208,6 +217,7 @@ class ModelGateway:
                     ),
                     task_name=task_name,
                 )
+                self._ensure_not_truncated(response, task_name=task_name)
             except ProviderError as exc:
                 last_error = exc
                 if not exc.retryable:
@@ -215,7 +225,7 @@ class ModelGateway:
                 continue
 
             return TextCall(
-                text=value,
+                text=response.value,
                 invocation=self._build_info(
                     task_name=task_name,
                     prompt_version=contract.version,
@@ -223,7 +233,8 @@ class ModelGateway:
                     monotonic_start=monotonic_start,
                     retry_count=attempt,
                     result_status="success",
-                    response_hash=_hash_text(value),
+                    response_hash=response.raw_hash or _hash_text(response.value),
+                    usage=response.usage,
                 ),
             )
 
@@ -258,6 +269,37 @@ class ModelGateway:
                 task_name=task_name,
             ) from exc
 
+    @staticmethod
+    def _ensure_not_truncated(
+        response: ProviderResponse[Any],
+        *,
+        task_name: str,
+    ) -> None:
+        """输出被长度上限截断时判为失败。
+
+        🔴 **刻意标为不可重试。** 同样的提示词 + 同样的上限
+        会得到同样的截断——重试只是把预算烧掉，却让真正的问题
+        （`max_output_tokens` 对这个模型太小，或推理 token 吃掉了预算）
+        继续隐藏。
+
+        Raises:
+            StructuredOutputError: ``finish_reason`` 表明输出被截断。
+        """
+        if not response.was_truncated:
+            return
+        msg = (
+            f"任务 {task_name!r} 的输出被长度上限截断"
+            f"（finish_reason={response.finish_reason!r}）。"
+            "这通常意味着提示词契约的 max_output_tokens 对该模型偏小，"
+            "或推理模型把预算耗在了内部推理上"
+        )
+        raise StructuredOutputError(
+            msg,
+            validation_errors=(f"finish_reason={response.finish_reason}",),
+            task_name=task_name,
+            retryable=False,
+        )
+
     def _build_info(
         self,
         *,
@@ -268,8 +310,10 @@ class ModelGateway:
         retry_count: int,
         result_status: str,
         response_hash: str | None,
+        usage: TokenUsage | None = None,
     ) -> ModelInvocationInfo:
-        """构造调用审计记录。"""
+        """构造调用审计记录（含 token 用量，任务书 §8.2）。"""
+        resolved = usage or TokenUsage()
         return ModelInvocationInfo(
             invocation_id=uuid4(),
             provider=self.provider_name,
@@ -279,6 +323,9 @@ class ModelGateway:
             started_at=started_at,
             completed_at=datetime.now(UTC),
             latency_ms=max(0, int((time.perf_counter() - monotonic_start) * 1000)),
+            input_token_count=resolved.input_tokens,
+            output_token_count=resolved.output_tokens,
+            reasoning_token_count=resolved.reasoning_tokens,
             retry_count=retry_count,
             result_status=result_status,
             response_hash=response_hash,
@@ -288,3 +335,12 @@ class ModelGateway:
 def _hash_text(text: str) -> str:
     """返回响应内容的 SHA-256（只存哈希，不存内容）。"""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _status_for(response: ProviderResponse[Any]) -> str:
+    """把"是否需要修复"写进调用状态。
+
+    🔴 **修复发生是要被看见的。** 需要提取修复说明模型没有按约定格式作答；
+    把它记成普通的 ``success`` 会让这个信号在评测里彻底消失。
+    """
+    return "success_after_repair" if response.output_repair else "success"

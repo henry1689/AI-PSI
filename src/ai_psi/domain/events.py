@@ -57,6 +57,15 @@ class ModelInvocationInfo(BaseModel):
 
     input_token_count: int | None = Field(default=None, ge=0)
     output_token_count: int | None = Field(default=None, ge=0)
+    reasoning_token_count: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "其中用于**内部推理**的 token 数。"
+            "🔴 **只记录数量，不记录内容**（红线一）。"
+            "推理模型的成本主要由它决定，缺了它就无法解释成本波动"
+        ),
+    )
 
     retry_count: int = Field(default=0, ge=0)
     result_status: str = Field(

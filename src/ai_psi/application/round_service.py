@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID, uuid4
@@ -199,6 +200,7 @@ class CognitiveRoundService:
         metacognitive_loops: int | None = None,
         budget: CognitiveBudget | None = None,
         depth_level: CognitiveDepth | None = None,
+        diagnostics: Mapping[str, Any] | None = None,
     ) -> RoundTransitionResult:
         """把回合推进到新状态。
 
@@ -217,6 +219,10 @@ class CognitiveRoundService:
                 若已消耗的调用数超过新预算，模型校验器会拒绝这次转移——
                 宁可保留较宽的预算，也不能出现"预算比已花费还小"的回合。
             depth_level: 覆盖认知深度（深度路由的最终结果）。
+            diagnostics: 附加诊断信息，合并进事件负载。
+                用于记录"这一步为什么没做"这类**降级事实**——
+                降级本身可以接受，但必须留下痕迹，否则事后无从分辨
+                "系统少做了一个分析"与"分析跑了但没产出"。
 
         Returns:
             转移结果。
@@ -282,6 +288,7 @@ class CognitiveRoundService:
                         "max_metacognitive_loops": updated.budget.max_metacognitive_loops,
                         "depth_level": updated.depth_level.value,
                     },
+                    **dict(diagnostics or {}),
                 },
             )
 
@@ -314,6 +321,9 @@ class CognitiveRoundService:
                                 if updated.error_category is not None
                                 else None
                             ),
+                            # 🔴 诊断信息也要进**终态**事件：读摘要的人
+                            # 只关心终态那一条，不会去翻中间转移。
+                            **dict(diagnostics or {}),
                         },
                     )
                 )

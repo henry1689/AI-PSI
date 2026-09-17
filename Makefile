@@ -14,7 +14,7 @@ PY ?= $(UV) run python
 COV = --cov=ai_psi --cov-report=term-missing --cov-report=xml
 
 .PHONY: help install lint fmt typecheck test test-unit test-integration policy check \
-        up down logs ps bootstrap migrate migrate-new clean
+        up down logs ps bootstrap migrate migrate-new clean test-live
 
 help:
 	@echo "AI-PSI 开发命令："
@@ -25,6 +25,7 @@ help:
 	@echo "  test             全部测试（单元 + 属性 + 契约 + 场景 + API + 集成，**需要数据库**）"
 	@echo "  test-unit        单元/属性/契约/场景/API（快，不需要数据库）"
 	@echo "  test-integration 只跑集成测试（需要数据库）"
+	@echo "  test-live        真实模型端到端（**会花钱**，需 AI_PSI_RUN_LIVE_TESTS=1）"
 	@echo "  policy           覆盖率闸门（domain/cognition 85%、总体 75%）"
 	@echo "  check            lint + typecheck + test + policy（提交前跑这个）"
 	@echo "  up               启动 PostgreSQL 16 + pgvector 容器"
@@ -58,6 +59,11 @@ test-unit:
 
 test-integration:
 	$(UV) run pytest tests/integration -m integration
+
+# 真实模型测试：**会花钱、会联网**，因此需要显式开关。
+# 只跑 live 用例，且需要 AI_PSI_DEEPSEEK_API_KEY 已配置。
+test-live:
+	AI_PSI_RUN_LIVE_TESTS=1 $(UV) run pytest tests/integration -m live -v
 
 policy:
 	$(UV) run coverage report --fail-under=75

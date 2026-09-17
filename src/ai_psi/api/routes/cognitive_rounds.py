@@ -105,6 +105,17 @@ async def get_round_summary(
     for record in judgments:
         adjustments.extend(str(item) for item in record.payload.get("adjustments", []))
 
+    # 终态事件带着诊断信息（跳过的步骤、改写记录）——
+    # 它们是在回合收尾时才确定的，因此只能从那里读
+    skipped: list[str] = []
+    for record in view.of_type(
+        EventType.COGNITIVE_ROUND_COMPLETED, EventType.COGNITIVE_ROUND_FAILED
+    ):
+        skipped.extend(str(item) for item in record.payload.get("skipped_steps", []))
+        adjustments.extend(str(item) for item in record.payload.get("adjustments", []))
+    adjustments = list(dict.fromkeys(adjustments))
+    skipped = list(dict.fromkeys(skipped))
+
     # 分析结果来自各自的 ``cognition.analysis.completed`` 事件——
     # 这样每次分析调用的模型与 Prompt 版本才有地方可查（不变量 18）
     analyses: dict[str, Any] = {
@@ -137,6 +148,7 @@ async def get_round_summary(
         analyses=analyses,
         response_text=view.response_text,
         adjustments=adjustments,
+        skipped_steps=skipped,
         model_invocations=[model_invocation_view(item) for item in view.model_invocations],
     )
 

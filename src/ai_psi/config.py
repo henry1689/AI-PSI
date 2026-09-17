@@ -16,7 +16,7 @@ from enum import StrEnum
 from functools import lru_cache
 from typing import Any
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ai_psi.domain.exceptions import ConfigurationError
@@ -45,6 +45,9 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        # 允许用字段名构造（测试与代码里写 `Settings(deepseek_api_key=...)`），
+        # 而不只是走环境变量别名。
+        populate_by_name=True,
     )
 
     # ------------------------------------------------------------------
@@ -101,16 +104,69 @@ class Settings(BaseSettings):
     repetition_threshold: float = Field(default=0.85, ge=0.0, le=1.0)
 
     # ------------------------------------------------------------------
-    # LLM Provider（阶段 4 才实现真实 Provider，此处仅保留配置位）
+    # LLM Provider（阶段 4：真实 Provider 已接入）
     # ------------------------------------------------------------------
+    #: Provider 名称：``mock`` / ``deepseek`` / ``openai_compatible``。
     llm_provider: str = "mock"
-    llm_timeout_seconds: float = Field(default=60.0, gt=0)
-    llm_max_retries: int = Field(default=2, ge=0)
+
+    #: 模型标识；``None`` 时按 Provider 取默认值（见 providers/registry.py）。
     llm_model: str | None = None
 
+    llm_timeout_seconds: float = Field(default=60.0, gt=0)
+    llm_max_retries: int = Field(default=2, ge=0)
+
+    #: 是否启用供应商的 JSON 输出模式。
+    #: 不支持 ``response_format`` 的兼容服务器应置为 ``False``——
+    #: 那会退化为"只靠提示词约束 + 提取修复"，成功率低一些但仍可用。
+    llm_json_mode: bool = True
+
+    #: 给**推理模型**的额外输出预留（token）。
+    #:
+    #: 推理模型把输出预算的一部分花在内部推理上（DeepSeek 实测：
+    #: 只要求回一个词的请求也会烧掉约 50 个推理 token，
+    #: 而 ``logical_analyzer`` 单次常达 5–8k）。
+    #: 契约里的 ``max_output_tokens`` 描述的是**答案**的长度，
+    #: 因此这里额外加上这段预留，否则答案会被推理挤掉后截断。
+    #:
+    #: 🔴 ``None`` 表示**用 Provider 自己的默认值**
+    #: （``providers/openai_compatible.py`` 的 ``DEFAULT_REASONING_HEADROOM``）。
+    #: 刻意不给一个具体数字：那样就会出现两个都"看起来权威"的默认值，
+    #: 而配置层那个会**静默覆盖** Provider 层——阶段 4 就踩过这个坑，
+    #: 表现为"改了 Provider 的默认值却毫无效果"。
+    llm_reasoning_headroom_tokens: int | None = Field(default=None, ge=0)
+
+    #: 熔断：连续多少次"供应商不可用"类失败后打开（任务书 §8.1）。
+    llm_circuit_failure_threshold: int = Field(default=5, ge=1)
+
+    #: 熔断打开后的冷却秒数；冷却结束后放一个探针请求。
+    llm_circuit_recovery_seconds: float = Field(default=30.0, gt=0)
+
+    # 密钥一律只从环境变量注入（任务书 §17.1）。
+    #
+    # ⚠️ 同时接受**业界通用名**（``DEEPSEEK_API_KEY``）与本项目的
+    # ``AI_PSI_`` 前缀名。要求用户为同一个密钥再配一份不必要，
+    # 而"密钥只从环境变量来"这条约束并没有因此放松。
+    deepseek_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AI_PSI_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"),
+    )
+    deepseek_base_url: str = Field(
+        default="https://api.deepseek.com/v1",
+        validation_alias=AliasChoices("AI_PSI_DEEPSEEK_BASE_URL", "DEEPSEEK_BASE_URL"),
+    )
+
+    openai_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AI_PSI_OPENAI_API_KEY", "OPENAI_API_KEY"),
+    )
+    openai_base_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AI_PSI_OPENAI_BASE_URL", "OPENAI_BASE_URL"),
+    )
+
+    #: ⚠️ Anthropic Provider 在阶段 4 **未实现**（ADR-0016）。
+    #: 配置它会在装配时明确报错，而不是静默回落到 Mock。
     anthropic_api_key: SecretStr | None = None
-    openai_api_key: SecretStr | None = None
-    openai_base_url: str | None = None
 
     # ------------------------------------------------------------------
     # 校验
@@ -203,6 +259,13 @@ class Settings(BaseSettings):
             "database_url": "***" if self.database_url else None,
             "llm_provider": self.llm_provider,
             "llm_model": self.llm_model,
+            "llm_json_mode": self.llm_json_mode,
+            "llm_max_retries": self.llm_max_retries,
+            "llm_reasoning_headroom_tokens": self.llm_reasoning_headroom_tokens,
+            "llm_circuit_failure_threshold": self.llm_circuit_failure_threshold,
+            # 密钥永远只暴露"有没有配"，不暴露值
+            "deepseek_api_key": "***" if self.deepseek_api_key else None,
+            "deepseek_base_url": self.deepseek_base_url,
             "anthropic_api_key": "***" if self.anthropic_api_key else None,
             "openai_api_key": "***" if self.openai_api_key else None,
             "openai_base_url": self.openai_base_url,

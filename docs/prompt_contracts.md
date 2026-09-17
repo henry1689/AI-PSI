@@ -83,6 +83,19 @@ class PromptContract(BaseModel):
 
 同理，`hypothesis_evaluator`（依据证据关系给假设定状态）也是确定性代码。
 
+### 3.1.1 版本号跟踪什么（阶段 4 明确）
+
+版本号跟踪的是**模板正文**。改动 `templates/` 下文件的内容**必须**递增版本号。
+
+**传输参数不算**：`max_output_tokens` 是发给供应商的**上限**，
+它不改变提示词说了什么，也就不改变模型的行为（除非小到把输出截断，
+那时是配置错误而非语义变化）。阶段 4 按实测重标定过五个任务的
+`max_output_tokens`，模板正文一字未改，因此版本号未动——
+改动与依据记录在 ADR-0016 §7。
+
+> 现状：`concern_detector` 为 **1.1.0**（阶段 4 修正"用户提问时必须给出关切"），
+> 其余任务仍为 1.0.0。各任务独立演进。
+
 ### 3.2 结构化输入的携带方式
 
 提示词中的结构化输入放在一个**带专用标识的围栏块**里：
@@ -100,6 +113,20 @@ class PromptContract(BaseModel):
 （JSON 中还原为反引号本身）之后，用户内容**不可能**拼出一个闭合标记。
 
 完整的攻击复现见 `tests/unit/test_prompt_registry.py::TestPayloadEncoding`。
+
+### 3.3 真实模型不按 Schema 说话时（阶段 4）
+
+真实 Provider 的 `generate_structured` 会做三层处理：
+
+1. **JSON 模式**（可用时）：`response_format={"type":"json_object"}`，
+   从源头减少格式问题；
+2. **提取修复**：去 Markdown 代码块 → 括号配平扫描。**只做提取，不做猜测**
+   ——不补字段、不改枚举值；
+3. **截断判定**：`finish_reason=length` 时**在解析之前**判失败且**不可重试**
+   （截断的 JSON 当然解析不了，先解析会报出一个指向不存在问题的诊断）。
+
+修复方式会记进调用状态（`success_after_repair`）——
+需要修复说明模型没按约定作答，这个信号不该被静默吞掉。
 
 ---
 

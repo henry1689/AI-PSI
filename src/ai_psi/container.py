@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import httpx
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from ai_psi.application.artifact_service import ArtifactService
@@ -37,7 +38,7 @@ from ai_psi.infrastructure.in_memory.unit_of_work import make_in_memory_unit_of_
 from ai_psi.prompts.registry import PromptRegistry
 from ai_psi.prompts.versions import build_default_registry
 from ai_psi.providers.base import LLMProvider
-from ai_psi.providers.registry import build_provider
+from ai_psi.providers.registry import build_provider_with_client, provider_health
 
 __all__ = ["Container", "build_container"]
 
@@ -57,6 +58,7 @@ class Container:
         memory_service: 记忆服务。
         runtime: 认知运行时。
         engine: PostgreSQL 引擎（``storage_backend=memory`` 时为 ``None``）。
+        http_client: 共享的 HTTP 客户端（真实 Provider 用；Mock 下也存在但不用）。
     """
 
     settings: Settings
@@ -69,12 +71,23 @@ class Container:
     memory_service: MemoryService
     runtime: CognitiveRuntime
     engine: AsyncEngine | None = field(default=None)
+    http_client: httpx.AsyncClient | None = field(default=None)
+
+    def provider_status(self) -> tuple[str, str]:
+        """返回 Provider 的运行健康状况（任务书 §13.2）。
+
+        Returns:
+            ``(状态, 说明)``；状态取 ``ok`` 或 ``degraded``。
+        """
+        return provider_health(self.provider)
 
     async def aclose(self) -> None:
         """释放资源。
 
         🔴 必须由应用生命周期调用——连接池不关闭会让进程无法干净退出。
         """
+        if self.http_client is not None:
+            await self.http_client.aclose()
         if self.engine is not None:
             await self.engine.dispose()
 
@@ -90,7 +103,10 @@ def build_container(settings: Settings | None = None) -> Container:
     """
     resolved = settings if settings is not None else get_settings()
     prompts = build_default_registry()
-    provider = build_provider(resolved)
+    # 一个进程一个 HTTP 客户端：连接复用、生命周期可控。
+    # 每次调用新建客户端会丢掉连接池，也会让超时配置失去统一入口。
+    http_client = httpx.AsyncClient()
+    provider = build_provider_with_client(resolved, http_client)
     memory = InMemoryMemoryRepository()
 
     engine: AsyncEngine | None = None
@@ -130,4 +146,5 @@ def build_container(settings: Settings | None = None) -> Container:
         memory_service=memory_service,
         runtime=runtime,
         engine=engine,
+        http_client=http_client,
     )

@@ -21,6 +21,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ai_psi.providers.response import ProviderResponse
+
 __all__ = [
     "InvocationContext",
     "LLMMessage",
@@ -87,12 +89,18 @@ class LLMProvider(Protocol):
         response_model: type[T],
         model_config: ModelConfig,
         invocation_context: InvocationContext,
-    ) -> T:
+    ) -> ProviderResponse[T]:
         """调用模型并返回**经过 Schema 校验**的结构化对象。
 
         🔴 校验失败必须抛 :class:`~ai_psi.domain.exceptions.StructuredOutputError`，
         而不是返回部分构造的对象——不变量 16 要求"模型格式错误不得导致
         部分非法状态写入"。
+
+        ⚠️ **返回值是 :class:`~ai_psi.providers.response.ProviderResponse`
+        而不是裸的 ``T``。** 任务书 §8.1 的签名写的是 ``-> T``；
+        阶段 4 为了把 token 用量随返回值一起带回来而改了它
+        （只有 Provider 知道用量，用 "last_usage" 之类的状态会在并发下串号）。
+        这是有意偏离，登记在 ADR-0016。
 
         Raises:
             StructuredOutputError: 返回内容不符合 ``response_model``。
@@ -109,6 +117,6 @@ class LLMProvider(Protocol):
         messages: list[LLMMessage],
         model_config: ModelConfig,
         invocation_context: InvocationContext,
-    ) -> str:
-        """调用模型并返回纯文本。"""
+    ) -> ProviderResponse[str]:
+        """调用模型并返回纯文本（同样带用量与结束原因）。"""
         ...

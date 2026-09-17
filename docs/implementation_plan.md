@@ -31,6 +31,7 @@
 | **1** | 项目骨架与领域对象 | ✅ 完成 | 2026-09-17 |
 | **2** | 数据库、事件存储、认知状态机 | ✅ 完成 | 2026-09-17 |
 | **3** | Mock LLM 与认知流水线（场景 A–J） | ✅ 完成 | 2026-09-18 |
+| **4** | 真实 LLM Provider（DeepSeek） | ✅ 完成 | 2026-09-18 |
 | 4 | 真实 LLM Provider | ⬜ 未开始 | — |
 | 5 | 长期记忆（pgvector） | ⬜ 未开始 | — |
 | 6 | 反馈、经验与改进提案 | ⬜ 未开始 | — |
@@ -209,13 +210,74 @@ Event Store、状态机（接仓储）、幂等支持、集成测试。
 （`response_planner` 改为确定性代码）；预算表按实测重标定；
 `epistemic_analyzer` 与 `hypothesis_evaluator` 改为确定性模块。
 
-### 阶段 4：真实 LLM Provider
+### 阶段 4：真实 LLM Provider ✅
 
-**交付**：Anthropic Provider、OpenAI-compatible Provider、
-超时/重试/熔断、结构化输出修复、模型调用统计、Prompt 版本记录。
+**交付**：OpenAI 兼容 Provider（覆盖 DeepSeek）、Provider 级熔断、
+结构化输出修复、token 用量统计、真实模型端到端测试。
+**新增依赖**：`httpx` 提为主依赖。
+**本阶段创建**：`providers/{response,parsing,http,resilience,openai_compatible}.py`、
+`reliability/circuit_breaker.py`。
 
-**验收**：Provider 可配置切换；真实 Provider 不影响领域层；
-无 API Key 时自动使用 Mock 或明确失败；解析异常不污染状态。
+⚠️ **Anthropic Provider 未实现**（用户指定用 DeepSeek；一个无法测试也无法
+跑通的实现只是空壳，ADR-0016 §1）。
+
+**验收条件与结果**：
+
+| 任务书 §18 验收条件 | 结果 |
+|---|---|
+| Provider 可配置切换 | ✅ `AI_PSI_LLM_PROVIDER`：`mock` / `deepseek` / `openai_compatible` |
+| 真实 Provider 不影响领域层 | ✅ 领域层零改动；提供方只出现在 `providers/` 与组合根 |
+| 无 API Key 时自动使用 Mock 或明确失败 | ✅ **明确失败**（选后者，ADR-0016 §6） |
+| 解析异常不会污染状态 | ✅ 可选模块降级 + 留痕；强制模块失败时可诊断（不变量 16、20） |
+| **真实模型端到端** | ✅ **D0/D2/D4 三类问题均跑通真实回合并给出真实回答** |
+
+**交付清单**：
+
+| 模块 | 内容 |
+|---|---|
+| `providers/response.py` | `ProviderResponse[T]` / `TokenUsage`（含推理 token 计数） |
+| `providers/parsing.py` | 从模型文本里提取 JSON：去代码块 → 括号配平扫描；报告修复方式 |
+| `providers/http.py` | HTTP 错误 → 领域异常的映射（429 / 5xx / 4xx / 超时 / 连接） |
+| `providers/openai_compatible.py` | `/chat/completions` 调用、JSON 模式、截断判定、用量读取 |
+| `providers/resilience.py` | 熔断装饰器（只把"供应商不健康"类失败计入） |
+| `providers/registry.py` | Provider 工厂与预置（DeepSeek 的 base_url 与默认模型） |
+| `reliability/circuit_breaker.py` | 纯状态机熔断器（时钟可注入） |
+| `tests/integration/test_live_provider.py` | 真实模型端到端（`live` 标记，默认跳过） |
+
+**实测验收结果**：
+
+| 检查 | 结果 |
+|---|---|
+| `make lint` | ✅ 0 error |
+| `make typecheck` | ✅ mypy strict，**164 个文件** 0 error |
+| `make test` | ✅ **968 passed, 16 skipped** |
+| `make policy` | ✅ 总体 **95%**；`domain/`+`cognition/` **98%** |
+| `make test-live` | ✅ **5 passed**（真实 DeepSeek，34 秒） |
+| 真实回合（D0 / D2 / D4） | ✅ 全部完成并给出真实回答 |
+
+**真实模型暴露的 6 个缺陷**（**没有一个能靠 Mock 发现**，详见 ADR-0016 §9）：
+
+1. 🔴 **模型名写死** —— 未显式配置时网关把 `"mock-model-v1"` 发给真实供应商，
+   DeepSeek 直接 400，回合在建关切阶段就失败。
+2. 🔴 **关切检测对直接提问返回空列表** —— 用户提问却得到 `NO_CONCERN_DETECTED`，
+   拿不到任何回答。提示词升至 v1.1.0。
+3. 🔴 **截断被误报成 JSON 语法错误** —— 诊断指向不存在的问题，而且可重试，
+   于是同样的上限被反复撞上、预算被烧掉。
+4. 🔴 **可选分析模块失败拖垮整个回合** —— 用户只差最后一步就能拿到回答。
+5. 🔴 **`CHANGE_METHOD` 路径耗尽强制尾部额度** —— 回合以 `BudgetExhaustedError` 失败。
+6. 🔴 **推理预留有两个默认值** —— 配置层静默覆盖 Provider 层，
+   表现为"改了默认值却毫无效果"。
+
+**实测成本**（`deepseek-v4-flash`，一次完整回合）：
+
+| 深度 | 调用数 | 输入 token | 输出 token | 其中推理 |
+|---|---|---|---|---|
+| D0 | 4 | ~3 700 | ~1 800–2 200 | ~600–1 000 |
+| D2 | 8–10 | ~6 000–13 500 | ~6 400–18 000 | ~3 700–12 600 |
+| D4 | 13 | ~21 400 | ~33 100 | **~21 800** |
+
+⚠️ **推理 token 占输出的大头。** 后续项：提示词没有约束输出规模
+（`logical_analyzer` 要求八项检查却不限长度），瘦身需评测支撑，列为阶段 7。
 
 ### 阶段 5：长期记忆
 
@@ -251,6 +313,18 @@ Markdown/JSON 报告、Baseline 对照接口。
 
 **验收**：可比较两个 Prompt 版本；可统计认知质量与成本；
 回放不覆盖原始事件；评测结果具有运行版本信息。
+
+⚠️ **阶段 4 交接下来两件明确属于本阶段的工作**（都有实测数据支撑）：
+
+1. **提示词输出规模瘦身**（ADR-0016 §10、`risks.md` R38）。
+   一次 D4 回合实测输出 33k token，其中推理占 22k——因为模板要求
+   `logical_analyzer` 做八项检查却不限定每项多长，模型在自由发挥。
+   在模板里限定列表长度与条数能显著降低成本，但**会改变认知输出质量**，
+   必须先有评测数据回答"有多少反例是被'简洁'砍掉的"。
+2. **反刍阈值的重新标定**（`risks.md` R32）。
+   当前 0.85 的词面阈值接上真实模型后只能捕捉逐字重复；
+   真实模型的两次判断会改写措辞。需要评测数据决定阈值，
+   或改用阶段 5 的向量检索做语义相似度。
 
 ### 阶段 8：完整验收与交付
 

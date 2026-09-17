@@ -37,6 +37,7 @@ from tests.scenarios.conftest import (
     hypothesis,
     inquiry_response,
     judgment_response,
+    metacognition_response,
     signals_for_depth,
 )
 
@@ -550,3 +551,125 @@ async def test_signals_for_depth_helper_covers_all_levels() -> None:
             "user_explicitly_philosophical",
             "value_conflict",
         }
+
+
+# ---------------------------------------------------------------------------
+# 阶段 4 回归：元认知裁定"换方法"时的预算保留
+# ---------------------------------------------------------------------------
+
+
+async def test_change_method_keeps_the_mandatory_tail(harness_factory) -> None:
+    """元认知裁定 ``CHANGE_METHOD`` 时，回合**仍然必须拿得出结论**。
+
+    🔴 这条用例来自阶段 4 跑真实回合时发现的缺陷：
+
+    换方法会**再次**进入 ANALYZING，而那时上一次判断已经把保留额度
+    降到了"只剩渲染"。于是一轮可选分析刚好把额度花到 0，
+    接下来的判断合成与回答渲染都没有额度了——回合以
+    ``BudgetExhaustedError`` 失败，用户什么也拿不到。
+
+    正确行为：宁可少跑一个可选分析（跳过会被记录），也不能拿不出结论。
+    """
+    harness: Harness = harness_factory(
+        responses={
+            "inquiry_framer": [
+                inquiry_response(
+                    question="这件事可能的解释是什么",
+                    depth=CognitiveDepth.D2,
+                    key_unknowns=["缺少可核验的一手材料"],
+                )
+            ],
+            "hypothesis_generator": [
+                hypotheses_response(
+                    hypothesis("解释甲", category="non_agentic"),
+                    hypothesis("解释乙", category="alternative"),
+                )
+            ],
+            "judgment_synthesizer": [
+                judgment_response(
+                    conclusion="目前只能给出暂定看法",
+                    unknowns=["缺少可核验的一手材料"],
+                )
+            ],
+            # 🔴 第一次复核就要求换方法——这正是会踩中该缺陷的路径
+            "metacognition": [
+                metacognition_response(
+                    proposed="change_method",
+                    reasons=["当前方法不足以推进"],
+                )
+            ],
+        }
+    )
+
+    outcome = await harness.run("这件事可能的解释是什么？")
+
+    # 回合必须拿出结论，而不是因为预算花光而失败
+    assert outcome.state is RoundState.COMPLETED
+    assert outcome.response_text
+    assert outcome.stop_reason
+
+    # 无论走了哪条路径，都不得超预算
+    budget = CognitiveBudget.for_depth(outcome.depth)
+    assert outcome.model_calls_used <= budget.max_model_calls
+
+
+async def test_optional_module_failure_degrades_instead_of_failing_the_round(
+    harness_factory,
+) -> None:
+    """可选分析模块失败时**降级**，而不是丢掉整个回合。
+
+    🔴 这条用例来自阶段 4 跑真实模型时的实测：推理模型的输出偶尔会
+    超过 ``max_tokens`` 被截断，于是 ``logical_analyzer`` 失败，
+    整个回合跟着失败——用户明明只差最后一步就能拿到回答。
+
+    任务书 §13.2 明确允许降级（"可返回当前认知服务降级一类的提示"），
+    阶段 4 的验收条件也写着"解析异常不会污染状态"。
+    可选模块本来就设计成"预算不够就跳过"，模型侧出问题应当同样处理。
+
+    ⚠️ **降级必须留痕**：被跳过的步骤进入 ``skipped_steps`` 并落库，
+    否则事后无法分辨"少做了一个分析"与"分析跑了但没产出"。
+    """
+    harness: Harness = harness_factory(
+        responses={
+            "inquiry_framer": [
+                inquiry_response(
+                    question="这件事可能的解释是什么",
+                    depth=CognitiveDepth.D2,
+                    key_unknowns=["缺少材料"],
+                )
+            ],
+            "judgment_synthesizer": [
+                judgment_response(conclusion="目前只能给出暂定看法", unknowns=["缺少材料"])
+            ],
+        },
+        faults=[
+            # logical_analyzer 永远返回非法结构 —— 重试也修不好
+            MockFault(
+                task_name="logical_analyzer",
+                mode="invalid_enum",
+                field="valid_links",
+                times=99,
+            )
+        ],
+    )
+
+    outcome = await harness.run("这件事可能的解释是什么？")
+
+    # 🔴 回合必须完成并给出回答
+    assert outcome.state is RoundState.COMPLETED
+    assert outcome.response_text
+    assert outcome.stop_reason
+
+    # 降级被记录，且指得出是哪一个步骤、为什么
+    assert any(
+        "logical_analysis" in item and "模型调用失败" in item for item in outcome.skipped_steps
+    ), outcome.skipped_steps
+
+    # 降级事实随终态事件落库（回放与审计都看得见）
+    events = await harness.events(outcome.cognitive_round_id)
+    terminal = [e for e in events if e.event_type is EventType.COGNITIVE_ROUND_COMPLETED]
+    assert terminal
+    assert any("logical_analysis" in str(item) for item in terminal[0].payload["skipped_steps"])
+
+    # 无论走了哪条路径，都不得超预算
+    assert outcome.model_calls_used <= CognitiveBudget.for_depth(outcome.depth).max_model_calls

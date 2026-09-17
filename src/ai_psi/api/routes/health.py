@@ -52,11 +52,7 @@ async def ready(container: ContainerDep) -> HealthResponse:
             ok=True,
             detail=container.settings.storage_backend,
         ),
-        DimensionStatus(
-            name="llm_provider",
-            ok=True,
-            detail=container.provider.name,
-        ),
+        _provider_check(container),
     ]
     if container.engine is not None:
         checks.append(await _check_database(container))
@@ -109,6 +105,17 @@ async def cognitive(container: ContainerDep) -> HealthResponse:
         )
     )
     return HealthResponse(status="ok", checks=checks)
+
+
+def _provider_check(container: Container) -> DimensionStatus:
+    """Provider 健康检查。
+
+    🔴 **熔断打开时状态是 ``degraded``**（任务书 §13.2）。
+    注意 ``DEGRADED`` 是**系统健康状态**，不是回合状态（ADR-0012）——
+    它出现在这里，不出现在状态机里。
+    """
+    status, detail = container.provider_status()
+    return DimensionStatus(name="llm_provider", ok=status == "ok", detail=detail)
 
 
 async def _check_database(container: Container) -> DimensionStatus:

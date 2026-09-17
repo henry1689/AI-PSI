@@ -49,6 +49,12 @@
 |---|---|---|
 | [0015](0015-stage-3-cognitive-pipeline.md) | 阶段 3 认知流水线 | 11 个模型任务 + 2 个确定性模块；预算表按实测重标定；D0 走规则层元认知复核；新增 `cognition.analysis.completed` 事件；终态具名事件；契约测试抓到两处 PostgreSQL 不一致；记忆不进 `UnitOfWork`；API 同步执行并返回真实终态 |
 
+### 阶段 4 实现决策（1 篇）
+
+| # | 标题 | 要点 |
+|---|---|---|
+| [0016](0016-real-llm-provider.md) | 真实 LLM Provider | 选 DeepSeek（OpenAI 兼容），Anthropic 延后；协议返回值改为 `ProviderResponse[T]` 以带回 token 用量；`reasoning_content` 只记数量不记内容；截断在解析前判定且不可重试；可选模块失败降级并留痕；缺 Key 明确失败不回落；**真实模型暴露的 6 个缺陷**；成本实测数据 |
+
 ---
 
 ## 任务书内部矛盾总览

@@ -24,6 +24,8 @@ dependencies = [
     # 阶段 3：API 层与进程入口
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
+    # 阶段 4：真实 Provider 的 HTTP 客户端
+    "httpx>=0.27",
 ]
 
 [dependency-groups]
@@ -34,8 +36,6 @@ dev = [
     "hypothesis>=6.115",
     "mypy>=1.13",
     "ruff>=0.8",
-    # API 测试用的 ASGI 客户端（starlette TestClient 依赖它）
-    "httpx>=0.27",
 ]
 
 [build-system]
@@ -142,6 +142,7 @@ markers = [
     "slow: 运行较慢的测试",
     "integration: 需要数据库的集成测试（阶段 2 起）",
     "scenario: 任务书第十五节场景测试（阶段 3 起）",
+    "live: 需要真实模型 API 与网络，默认跳过（阶段 4 起）",
 ]
 filterwarnings = ["error"]
 

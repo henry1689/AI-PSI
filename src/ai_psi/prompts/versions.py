@@ -24,6 +24,15 @@ __all__ = ["CONTRACTS", "PROMPT_VERSION_V1", "build_default_registry"]
 #: 全部任务的首个语义版本。各任务独立演进，此处只是共同起点。
 PROMPT_VERSION_V1: Final[str] = "1.0.0"
 
+# 🔴 **版本号跟踪的是「模板正文」，不是「传输参数」。**
+#
+# ``max_output_tokens`` 是发给供应商的**上限**，它不改变提示词说了什么，
+# 也就不改变模型的行为——除非它小到把输出截断（那时是配置错误，不是语义变化）。
+# 因此阶段 4 按实测重标定这个数值时**没有**递增版本号；
+# 改动与依据记录在 ADR-0016，模板正文一字未改。
+#
+# 反过来，任何改动 ``templates/`` 下文件内容的变更**必须**递增版本号。
+
 _INITIAL: Final[tuple[ChangelogEntry, ...]] = (
     ChangelogEntry(
         version=PROMPT_VERSION_V1,
@@ -43,8 +52,14 @@ def _contract(
     max_output_tokens: int,
     example_name: str,
     example_payload: dict[str, Any],
+    version: str = PROMPT_VERSION_V1,
+    changelog: tuple[ChangelogEntry, ...] | None = None,
 ) -> PromptContract:
-    """构造一个契约，并统一挂上初版 changelog 与一个测试样例。
+    """构造一个契约，并统一挂上一个测试样例。
+
+    🔴 **版本是逐个任务独立演进的。** 改了一个任务的提示词，
+    不该让另外十个任务的版本号跟着动——那会让"版本"失去定位能力：
+    回放历史回合时，需要知道的是**那一次用的到底是哪份模板**。
 
     Args:
         task_name: 全局唯一任务名。
@@ -55,13 +70,15 @@ def _contract(
         max_output_tokens: 输出长度上限。
         example_name: 样例名。
         example_payload: 契约自带的测试样例输入。
+        version: 语义版本号；默认初版。
+        changelog: 变更记录；``None`` 时使用初版记录。
 
     Returns:
         构造好的契约。
     """
     return PromptContract(
         task_name=task_name,
-        version=PROMPT_VERSION_V1,
+        version=version,
         description=description,
         input_model=input_model,
         output_model=output_model,
@@ -74,7 +91,7 @@ def _contract(
                 notes="契约完整性测试用它验证输入 Schema 可被实例化",
             ),
         ),
-        changelog=_INITIAL,
+        changelog=changelog if changelog is not None else _INITIAL,
     )
 
 
@@ -95,6 +112,29 @@ CONTRACTS: Final[tuple[PromptContract, ...]] = (
             "confirmed_user_goals": [],
             "system_status": ["正常"],
         },
+        version="1.1.0",
+        changelog=(
+            ChangelogEntry(
+                version="1.0.0",
+                change="初版",
+                reason="阶段 3 首次建立 Prompt 契约体系",
+            ),
+            ChangelogEntry(
+                version="1.1.0",
+                change=(
+                    "明确「用户正在提问时，至少必须输出一个 user_request 类关切」；"
+                    "把空列表的适用范围限定为系统自发触发的场景"
+                ),
+                reason=(
+                    "阶段 4 的 live 测试第一次跑真实模型时发现：对"
+                    "「水在标准大气压下多少摄氏度沸腾？」这类直接提问，"
+                    "模型选择了「没有值得启动认知的关切」这条出口，"
+                    "回合以 NO_CONCERN_DETECTED 结束，用户拿不到任何回答。"
+                    "旧提示词把「空列表是合法结论」写得很显眼，"
+                    "却没有说明它**不适用于用户正在提问的情形**"
+                ),
+            ),
+        ),
     ),
     _contract(
         task_name="inquiry_framer",
@@ -135,7 +175,7 @@ CONTRACTS: Final[tuple[PromptContract, ...]] = (
         input_model=s.LogicalAnalyzerInput,
         output_model=s.LogicalAnalysisOutput,
         max_input_tokens=6000,
-        max_output_tokens=1500,
+        max_output_tokens=1800,
         example_name="简单论证的逻辑检查",
         example_payload={
             "question": "朋友的简短回复是否说明关系变差？",
@@ -150,7 +190,7 @@ CONTRACTS: Final[tuple[PromptContract, ...]] = (
         input_model=s.CausalAnalyzerInput,
         output_model=s.CausalAnalysisOutput,
         max_input_tokens=4000,
-        max_output_tokens=1200,
+        max_output_tokens=2000,
         example_name="相关被当成因果",
         example_payload={
             "question": "工作压力是否导致了他的沉默？",
@@ -163,7 +203,7 @@ CONTRACTS: Final[tuple[PromptContract, ...]] = (
         input_model=s.ConceptAnalyzerInput,
         output_model=s.ConceptAnalysisOutput,
         max_input_tokens=4000,
-        max_output_tokens=1800,
+        max_output_tokens=2600,
         example_name="价值冲突中的概念澄清",
         example_payload={
             "question": "一个人应该坚持自我，还是适应环境？",
@@ -177,7 +217,7 @@ CONTRACTS: Final[tuple[PromptContract, ...]] = (
         input_model=s.DialecticalAnalyzerInput,
         output_model=s.DialecticalAnalysisOutput,
         max_input_tokens=6000,
-        max_output_tokens=1500,
+        max_output_tokens=1800,
         example_name="价值取舍问题",
         example_payload={
             "question": "一个人应该坚持自我，还是适应环境？",
@@ -223,7 +263,7 @@ CONTRACTS: Final[tuple[PromptContract, ...]] = (
         input_model=s.MetacognitionInput,
         output_model=s.MetacognitionOutput,
         max_input_tokens=4000,
-        max_output_tokens=1200,
+        max_output_tokens=1500,
         example_name="第二轮元认知检查",
         example_payload={
             "question": "朋友的简短回复有哪些可能的解释？",

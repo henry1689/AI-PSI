@@ -206,6 +206,14 @@ class RoundSummaryResponse(BaseModel):
         default_factory=list,
         description="系统对模型输出所做的改写，逐条留痕（如置信度下调、认知动作降级）",
     )
+    skipped_steps: list[str] = Field(
+        default_factory=list,
+        description=(
+            "**被跳过的分析步骤及原因**（预算不足 / 模型调用失败）。"
+            "🔴 降级本身可以接受，但必须可见——"
+            "否则事后无法分辨「少做了一个分析」与「分析跑了但没产出」"
+        ),
+    )
     model_invocations: list[ModelInvocationView] = Field(default_factory=list)
 
 

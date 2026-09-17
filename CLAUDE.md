@@ -8,16 +8,17 @@
 
 - 需求书（22 节）：`docs/AI_PSI_V0_1_TASK_SPEC.md`
 - 实施计划与进度（**唯一真相来源**）：`docs/implementation_plan.md`
-- 恢复状态：`D:\AI文件\personal-assistant\tasks\2026-09\2026-09-18-ai-psi-V0.1-阶段3完成.md`
-- 进度：**阶段 0/1/2/3 完成**（869 测试 + 11 跳过 / 总体覆盖率 95%）→ 下轮进阶段 4
-- **本轮边界**：不碰真实 LLM（阶段 4）、向量检索（阶段 5）、自迭代发布（阶段 6）
-- 已定决策不重问（Python 版本、路径、DB 策略、预算表见 ADR-0008）
+- 恢复状态：`D:\AI文件\personal-assistant\tasks\2026-09\2026-09-18-ai-psi-V0.1-阶段4完成.md`
+- 进度：**阶段 0/1/2/3/4 完成**（968 测试 + 16 跳过 / 总体覆盖率 95%，真实模型端到端已跑通）→ 下轮进阶段 5
+- **本轮边界**：不碰向量检索（阶段 5）、自迭代发布（阶段 6）
+- 已定决策不重问（Python 版本、路径、DB 策略、预算表见 ADR-0008、LLM 用 DeepSeek 见 ADR-0016）
 
 ## 技术栈
 
 - Python **3.13**｜依赖用 **uv** 管理
 - pydantic v2 + pydantic-settings｜psycopg3｜SQLAlchemy 2（异步）｜Alembic
-- FastAPI + uvicorn（阶段 3 引入）｜structlog
+- FastAPI + uvicorn｜httpx（真实 Provider）｜structlog
+- **LLM：DeepSeek `deepseek-v4-flash`**（OpenAI 兼容；Anthropic 未实现，ADR-0016）
 - PostgreSQL 16 + pgvector（docker compose，端口 **55432**）
 - 无前端、无 npm、无 K8s
 
@@ -27,6 +28,7 @@
 
 - lint：`make lint` ｜ 类型：`make typecheck` ｜ 测试：`make test`
 - 快跑（不需要数据库）：`make test-unit`
+- 真实模型端到端（**会花钱、会联网**）：`make test-live`（需配好 API Key）
 - 提交前全跑：`make check`（lint + typecheck + test + 覆盖率闸门）
 - 起库：`make up` ｜ 迁移：`make migrate` ｜ 建库校验：`make bootstrap`
 - 起服务：`uv run python -m ai_psi.main`
@@ -48,3 +50,6 @@
 - 禁止提前引入后续阶段的依赖
 - 禁止为通过检查而删除测试、放宽 Schema 或加 `# type: ignore`；
   任何豁免必须写进 ADR
+- 禁止让缺 API Key 静默回落到 Mock（ADR-0016 §6）
+- 禁止保存或打印模型的 `reasoning_content`（认知宪法红线一）；
+  只允许保留推理 token 的**计数**
