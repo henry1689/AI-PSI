@@ -17,6 +17,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ai_psi.domain.enums import EventType
 from ai_psi.domain.events import Event
 from ai_psi.domain.exceptions import ConflictError
 from ai_psi.infrastructure.db.errors import is_unique_violation
@@ -148,6 +149,34 @@ class SqlAlchemyEventStore:
             .order_by(EventRow.sequence)
             .limit(limit)
         )
+        result = await self._session.execute(stmt)
+        return [row_to_event(row) for row in result.scalars().all()]
+
+    async def read_by_event_type(
+        self,
+        *,
+        event_type: EventType,
+        limit: int | None = None,
+    ) -> list[Event]:
+        """按事件类型读取，按 ``sequence`` 升序。
+
+        走 ``ix_events_type_recorded`` 索引（阶段 2 就建好的），
+        因此它是一次索引扫描，不是全表扫描。
+
+        Args:
+            event_type: 目标事件类型。
+            limit: 返回条数上限；``None`` 表示不限制。
+
+        Returns:
+            命中事件，按 ``sequence`` 升序。
+        """
+        stmt = (
+            select(EventRow)
+            .where(EventRow.event_type == event_type.value)
+            .order_by(EventRow.sequence)
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
         result = await self._session.execute(stmt)
         return [row_to_event(row) for row in result.scalars().all()]
 

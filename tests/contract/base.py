@@ -142,6 +142,56 @@ class EventStoreContract:
         await event_store.append(_event(uuid4()))
         assert await event_store.count() == before + 1
 
+    async def test_read_by_event_type_filters(self, event_store) -> None:
+        """🔴 模式发现（任务书 §11.3）靠这条查询跨回合统计。
+
+        回合是一段段独立的事件流，按回合读拿不到全局视图。
+        """
+        round_id = uuid4()
+        wanted = [_event(round_id, event_type=EventType.EXPERIENCE_CREATED) for _ in range(3)]
+        await event_store.append_many(
+            [
+                wanted[0],
+                _event(round_id, event_type=EventType.HYPOTHESIS_CREATED),
+                wanted[1],
+                _event(round_id, event_type=EventType.RESPONSE_GENERATED),
+                wanted[2],
+            ]
+        )
+
+        found = await event_store.read_by_event_type(event_type=EventType.EXPERIENCE_CREATED)
+        assert [item.id for item in found] == [item.id for item in wanted]
+
+    async def test_read_by_event_type_is_ordered_by_sequence(self, event_store) -> None:
+        """顺序由 ``sequence`` 决定——按时间戳排序在同一微秒内是不确定的。"""
+        round_id = uuid4()
+        events = [_event(round_id, event_type=EventType.MEMORY_APPROVED) for _ in range(4)]
+        await event_store.append_many(events)
+        found = await event_store.read_by_event_type(event_type=EventType.MEMORY_APPROVED)
+        assert [item.id for item in found] == [item.id for item in events]
+
+    async def test_read_by_event_type_limit_takes_the_earliest(self, event_store) -> None:
+        """🔴 ``limit`` 取的是**最早的 N 条**（顺序是 sequence 升序）。
+
+        存储层不替调用方猜它要哪一头：要"最近 N 条"就先取
+        ``latest_sequence()`` 再自行截断。把两头都做成隐式选项，
+        迟早会有人以为自己在取最近的历史、实际拿到的是最早的。
+        """
+        round_id = uuid4()
+        events = [_event(round_id, event_type=EventType.MEMORY_EXPIRED) for _ in range(5)]
+        await event_store.append_many(events)
+        found = await event_store.read_by_event_type(event_type=EventType.MEMORY_EXPIRED, limit=2)
+        assert [item.id for item in found] == [item.id for item in events[:2]]
+
+    async def test_read_by_event_type_unknown_returns_empty(self, event_store) -> None:
+        await event_store.append(_event(uuid4()))
+        assert (
+            await event_store.read_by_event_type(
+                event_type=EventType.IMPROVEMENT_PROPOSAL_EVALUATED
+            )
+            == []
+        )
+
 
 class RoundRepositoryContract:
     """回合仓储的语义契约。"""

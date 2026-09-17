@@ -15,8 +15,15 @@ from typing import Self
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from ai_psi.application.ports import EventStore, IdempotencyStore, MemoryRepository, RoundRepository
+from ai_psi.application.ports import (
+    EventStore,
+    IdempotencyStore,
+    MemoryRepository,
+    ProposalRepository,
+    RoundRepository,
+)
 from ai_psi.infrastructure.db.memory_repository import SqlAlchemyMemoryRepository
+from ai_psi.infrastructure.db.proposal_repository import SqlAlchemyProposalRepository
 from ai_psi.infrastructure.db.repositories import (
     SqlAlchemyIdempotencyStore,
     SqlAlchemyRoundRepository,
@@ -90,6 +97,7 @@ class SqlAlchemyUnitOfWork:
         self.rounds: RoundRepository = SqlAlchemyRoundRepository(self._session)
         self.idempotency: IdempotencyStore = SqlAlchemyIdempotencyStore(self._session)
         self.memories: MemoryRepository = SqlAlchemyMemoryRepository(self._session, embeddings)
+        self.proposals: ProposalRepository = SqlAlchemyProposalRepository(self._session)
 
     async def __aenter__(self) -> Self:
         """进入事务作用域。"""

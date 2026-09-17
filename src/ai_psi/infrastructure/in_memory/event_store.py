@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from uuid import UUID
 
+from ai_psi.domain.enums import EventType
 from ai_psi.domain.events import Event
 from ai_psi.domain.exceptions import ConflictError
 
@@ -107,6 +108,31 @@ class InMemoryEventStore:
             if event.cognitive_round_id == cognitive_round_id
         ]
         return max(stream, default=0)
+
+    async def read_by_event_type(
+        self,
+        *,
+        event_type: EventType,
+        limit: int | None = None,
+    ) -> list[Event]:
+        """按事件类型读取，按 ``sequence`` 升序。
+
+        Args:
+            event_type: 目标事件类型。
+            limit: 返回条数上限；``None`` 表示不限制。
+
+        Returns:
+            命中事件，按 ``sequence`` 升序。
+        """
+        stream = [
+            (sequence, event)
+            for sequence, event in self._uow.visible_events()
+            if event.event_type is event_type
+        ]
+        ordered = sorted(stream, key=lambda pair: pair[0])
+        if limit is not None:
+            ordered = ordered[: max(0, limit)]
+        return [event for _, event in ordered]
 
     async def count(self) -> int:
         """事件总数。"""

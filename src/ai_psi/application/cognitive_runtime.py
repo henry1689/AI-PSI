@@ -87,6 +87,7 @@ from ai_psi.domain.judgments import Judgment
 from ai_psi.domain.memories import Memory
 from ai_psi.domain.observations import Observation
 from ai_psi.domain.reflections import Reflection
+from ai_psi.learning.error_classifier import STAGE_ERROR_CATEGORY
 from ai_psi.prompts.registry import PromptRegistry
 from ai_psi.prompts.schemas import ResponsePlan
 from ai_psi.providers.base import LLMProvider
@@ -1337,19 +1338,14 @@ def _situation_signature(
     return f"{depth.value}|{evidence_bucket}|h{hypothesis_count}"
 
 
-#: 阶段名到错误类别的映射。失败回合必须给出错误类别（不变量 20）。
-_STAGE_ERROR_CATEGORY: dict[str, ErrorType] = {
-    "triage": ErrorType.CONCEPTUAL_ERROR,
-    "frame": ErrorType.SCOPE_ERROR,
-    "retrieve": ErrorType.EVIDENCE_ERROR,
-    "analyze": ErrorType.REASONING_ERROR,
-    "deliberate": ErrorType.REASONING_ERROR,
-    "review": ErrorType.CALIBRATION_ERROR,
-    "synthesize": ErrorType.REASONING_ERROR,
-    "respond": ErrorType.EXPRESSION_ERROR,
-}
-
-
 def _category_for(stage: str) -> ErrorType:
-    """返回阶段对应的错误类别。"""
-    return _STAGE_ERROR_CATEGORY.get(stage, ErrorType.UNKNOWN_ERROR)
+    """返回阶段对应的错误类别。
+
+    🔴 映射表住在 :mod:`ai_psi.learning.error_classifier` 里，**只有一份**。
+
+    阶段 3 这里曾有一份副本，而阶段 6 的归因也需要同一张表。
+    两份各自维护的映射一旦漂移，"同一个失败在两个地方得到不同类别"
+    就会发生，而且没有任何地方会报错——失败回合照常有类别、
+    经验记录也照常有类别，只是它们对不上。
+    """
+    return STAGE_ERROR_CATEGORY.get(stage, ErrorType.UNKNOWN_ERROR)

@@ -17,6 +17,7 @@ from uuid import UUID
 
 from ai_psi.domain.cognitive_rounds import CognitiveRound
 from ai_psi.domain.events import Event
+from ai_psi.domain.improvement_proposals import ImprovementProposal
 from ai_psi.domain.memories import Memory
 
 __all__ = ["IdempotencyRecord", "InMemoryStore", "MemoryIndexEntry"]
@@ -71,6 +72,9 @@ class InMemoryStore:
     #: 向量索引。键是记忆 id，**只包含当前可检索的记忆**（不变量 15）。
     index: dict[UUID, MemoryIndexEntry] = field(default_factory=dict)
 
+    #: 改进提案（阶段 6）。状态可变，因此与经验不同——经验留在事件流里。
+    proposals: dict[UUID, ImprovementProposal] = field(default_factory=dict)
+
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
     _sequence: int = field(default=0, repr=False)
 
@@ -101,6 +105,7 @@ class InMemoryStore:
         reservations: dict[str, IdempotencyRecord],
         memories: dict[UUID, Memory],
         index: dict[UUID, MemoryIndexEntry | None],
+        proposals: dict[UUID, ImprovementProposal],
     ) -> None:
         """把一次事务的暂存区合并进共享数据。
 
@@ -113,7 +118,8 @@ class InMemoryStore:
             rounds: 待写入的回合。
             reservations: 待写入的幂等占位。
             memories: 待写入的记忆本体。
-            index: 待同步的索引项。**值为 ``None`` 表示删除该索引项**——
+            index: 待同步的索引项。
+            proposals: 待写入的改进提案。**值为 ``None`` 表示删除该索引项**——
                 用 ``None`` 而不是"从字典里去掉"来表达删除，
                 是因为"没改过它"与"要删掉它"必须能区分开。
         """
@@ -127,6 +133,7 @@ class InMemoryStore:
                     self.index.pop(memory_id, None)
                 else:
                     self.index[memory_id] = entry
+            self.proposals.update(proposals)
 
     def clear(self) -> None:
         """清空全部数据（测试夹具用）。"""
@@ -136,4 +143,5 @@ class InMemoryStore:
             self.idempotency.clear()
             self.memories.clear()
             self.index.clear()
+            self.proposals.clear()
             self._sequence = 0

@@ -1,13 +1,14 @@
 """API 路由。
 
-按任务书 §12 的分组划分。阶段 3 只实现**与认知回合直接相关**的三组：
+按任务书 §12 的分组划分，逐阶段落地，**不建空壳**（ADR-0012）：
 
-* ``conversations``（§12.1 创建会话与提交消息）
-* ``cognitive_rounds``（§12.1 回合状态、回答、结构化摘要）
-* ``replay`` 与 ``health``（§12.5）
-
-其余分组（``memories`` / ``feedback`` / ``proposals`` / ``beliefs``）
-依赖阶段 5/6 才交付的能力，**本阶段不建空壳**（ADR-0012）。
+* ``conversations`` / ``cognitive_rounds``（§12.1）、``replay``（§12.5）
+  ——阶段 3；
+* ``health``（§12.5）——阶段 3 建、阶段 6 补齐认知资产维度；
+* ``memories``（§12.3）——阶段 5；
+* ``feedback``（§12.2）与 ``proposals``（§12.4）——阶段 6；
+* ``beliefs``（§12.3 第一条）——**本版本不做**：
+  信念只活在事件流里、不是记忆，列出它需要另建判断投影（ADR-0017 §7）。
 """
 
 from __future__ import annotations

@@ -12,7 +12,7 @@
 
 ⚠️ 本模块是**纯状态机**：没有 IO、没有 asyncio、时钟可注入。
 这既让它能被穷尽地测试，也让它与"哪个 Provider"解耦——
-阶段 5 换 Provider 时它一行都不用改。
+阶段 4 接入 DeepSeek、阶段 5 接入向量 Provider 时它都一行未改。
 """
 
 from __future__ import annotations

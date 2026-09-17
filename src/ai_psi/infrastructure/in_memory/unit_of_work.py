@@ -20,12 +20,20 @@ from types import TracebackType
 from typing import Self
 from uuid import UUID
 
-from ai_psi.application.ports import EventStore, IdempotencyStore, MemoryRepository, RoundRepository
+from ai_psi.application.ports import (
+    EventStore,
+    IdempotencyStore,
+    MemoryRepository,
+    ProposalRepository,
+    RoundRepository,
+)
 from ai_psi.domain.cognitive_rounds import CognitiveRound
 from ai_psi.domain.events import Event
+from ai_psi.domain.improvement_proposals import ImprovementProposal
 from ai_psi.domain.memories import Memory
 from ai_psi.infrastructure.in_memory.event_store import InMemoryEventStore
 from ai_psi.infrastructure.in_memory.memory_store import InMemoryMemoryRepository
+from ai_psi.infrastructure.in_memory.proposal_store import InMemoryProposalRepository
 from ai_psi.infrastructure.in_memory.repositories import (
     InMemoryIdempotencyStore,
     InMemoryRoundRepository,
@@ -90,6 +98,7 @@ class InMemoryUnitOfWork:
         self._staged_rounds: dict[UUID, CognitiveRound] = {}
         self._staged_reservations: dict[str, IdempotencyRecord] = {}
         self._staged_memories: dict[UUID, Memory] = {}
+        self._staged_proposals: dict[UUID, ImprovementProposal] = {}
         #: 值为 ``None`` 表示"删除该索引项"。
         self._staged_index: dict[UUID, MemoryIndexEntry | None] = {}
 
@@ -97,6 +106,7 @@ class InMemoryUnitOfWork:
         self.rounds: RoundRepository = InMemoryRoundRepository(self)
         self.idempotency: IdempotencyStore = InMemoryIdempotencyStore(self)
         self.memories: MemoryRepository = InMemoryMemoryRepository(self, embeddings)
+        self.proposals: ProposalRepository = InMemoryProposalRepository(self)
 
     # ------------------------------------------------------------------
     # 事务边界
@@ -127,6 +137,7 @@ class InMemoryUnitOfWork:
             reservations=self._staged_reservations,
             memories=self._staged_memories,
             index=self._staged_index,
+            proposals=self._staged_proposals,
         )
         self._committed = True
         self.discard()
@@ -147,6 +158,7 @@ class InMemoryUnitOfWork:
         self._staged_reservations = {}
         self._staged_memories = {}
         self._staged_index = {}
+        self._staged_proposals = {}
 
     # ------------------------------------------------------------------
     # 暂存与可见性（供本包的仓储使用）
@@ -171,6 +183,10 @@ class InMemoryUnitOfWork:
     def stage_index(self, memory_id: UUID, entry: MemoryIndexEntry | None) -> None:
         """暂存一次索引变更；``entry`` 为 ``None`` 表示删除。"""
         self._staged_index[memory_id] = entry
+
+    def stage_proposal(self, proposal: ImprovementProposal) -> None:
+        """暂存一条改进提案（新增或更新）。"""
+        self._staged_proposals[proposal.id] = proposal
 
     def visible_events(self) -> list[tuple[int, Event]]:
         """返回"已提交 + 本事务暂存"的全部事件。"""
@@ -199,6 +215,18 @@ class InMemoryUnitOfWork:
         if memory_id in self._staged_memories:
             return self._staged_memories[memory_id]
         return self._store.memories.get(memory_id)
+
+    def visible_proposal(self, proposal_id: UUID) -> ImprovementProposal | None:
+        """按 id 返回可见提案。"""
+        if proposal_id in self._staged_proposals:
+            return self._staged_proposals[proposal_id]
+        return self._store.proposals.get(proposal_id)
+
+    def visible_proposals(self) -> list[ImprovementProposal]:
+        """返回「已提交 + 本事务暂存」的全部提案。"""
+        merged = dict(self._store.proposals)
+        merged.update(self._staged_proposals)
+        return list(merged.values())
 
     def visible_memories(self) -> list[Memory]:
         """返回"已提交 + 本事务暂存"的全部记忆。"""

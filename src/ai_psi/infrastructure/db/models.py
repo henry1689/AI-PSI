@@ -36,9 +36,11 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from ai_psi.domain.enums import (
     ActorType,
+    ApprovalLevel,
     ErrorType,
     MemoryStatus,
     MemoryType,
+    ProposalStatus,
     RetentionPolicy,
     RoundState,
     SensitivityLevel,
@@ -48,7 +50,14 @@ from ai_psi.domain.enums import (
 from ai_psi.infrastructure.db.base import Base, enum_check_expression
 from ai_psi.providers.embeddings import DEFAULT_EMBEDDING_DIMENSION
 
-__all__ = ["CognitiveRoundRow", "EventRow", "IdempotencyKeyRow", "MemoryEmbeddingRow", "MemoryRow"]
+__all__ = [
+    "CognitiveRoundRow",
+    "EventRow",
+    "IdempotencyKeyRow",
+    "ImprovementProposalRow",
+    "MemoryEmbeddingRow",
+    "MemoryRow",
+]
 
 
 class EventRow(Base):
@@ -389,4 +398,78 @@ class MemoryEmbeddingRow(Base):
             postgresql_ops={"embedding": "vector_cosine_ops"},
         ),
         Index("ix_memory_embeddings_version", "embedding_version"),
+    )
+
+
+class ImprovementProposalRow(Base):
+    """改进提案（任务书 §5.12、§11）。
+
+    🔴 **为什么提案有表，而经验没有。**
+
+    经验是**不可变的观察**（"这个回合发生了这件事"），写入之后从不更新，
+    因此它的家在事件流里——加一张表只会引入"投影与事件流不一致"的可能。
+    提案不同：它的状态会变（``DRAFT`` → … → 终态），需要乐观锁、
+    按 id 取、按状态列表查询。这与 ``cognitive_rounds`` 的理由完全一样
+    （ADR-0002：表是"为查询与并发控制而物化的投影"）。
+
+    🔴 **``status`` 的 CHECK 是对不变量 11 的数据库级强制。**
+
+    ``enum_check_expression`` 由 ``ProposalStatus`` 生成，而这个枚举里
+    **不存在 ACTIVE**。因此"把提案标记为已生效"这件事在数据库层
+    就不可能发生——即使应用层被绕过。
+    """
+
+    __tablename__ = "improvement_proposals"
+
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
+
+    # ---- EntityMetadata ----
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(16), nullable=False)
+
+    # ---- 提案内容 ----
+    target_component: Mapped[str] = mapped_column(String(128), nullable=False)
+    observed_problem: Mapped[str] = mapped_column(Text, nullable=False)
+    error_class: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    supporting_experience_ids: Mapped[list[UUID]] = mapped_column(
+        ARRAY(PGUUID(as_uuid=True)), nullable=False, default=list
+    )
+    counterexamples: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False, default=list)
+
+    proposed_change: Mapped[str] = mapped_column(Text, nullable=False)
+    expected_benefit: Mapped[str] = mapped_column(Text, nullable=False)
+
+    possible_regressions: Mapped[list[str]] = mapped_column(
+        ARRAY(Text), nullable=False, default=list
+    )
+    applicability: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False, default=list)
+
+    evaluation_plan: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False, default=list)
+    success_metrics: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False, default=list)
+    rollback_conditions: Mapped[list[str]] = mapped_column(
+        ARRAY(Text), nullable=False, default=list
+    )
+
+    approval_level: Mapped[str] = mapped_column(String(24), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(enum_check_expression("error_class", ErrorType), name="error_class_valid"),
+        CheckConstraint(
+            enum_check_expression("approval_level", ApprovalLevel), name="approval_level_valid"
+        ),
+        # 🔴 不变量 11 的数据库级强制：ProposalStatus 里没有 ACTIVE，
+        # 因此这个白名单**天然排除了"已生效"**。
+        CheckConstraint(enum_check_expression("status", ProposalStatus), name="status_valid"),
+        CheckConstraint("version >= 1", name="version_positive"),
+        CheckConstraint("target_component <> ''", name="target_component_non_empty"),
+        # 提案必须能解释自己为什么存在——没有预期收益的提案无法被评估
+        CheckConstraint("expected_benefit <> ''", name="expected_benefit_non_empty"),
+        Index("ix_improvement_proposals_status_created", "status", "created_at"),
+        Index("ix_improvement_proposals_error_class", "error_class"),
+        Index("ix_improvement_proposals_component", "target_component"),
     )

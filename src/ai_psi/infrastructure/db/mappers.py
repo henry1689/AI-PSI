@@ -15,11 +15,13 @@ from typing import Any
 from ai_psi.domain.cognitive_rounds import CognitiveBudget, CognitiveRound
 from ai_psi.domain.enums import (
     ActorType,
+    ApprovalLevel,
     CognitiveDepth,
     ErrorType,
     EventType,
     MemoryStatus,
     MemoryType,
+    ProposalStatus,
     RetentionPolicy,
     RoundState,
     SensitivityLevel,
@@ -27,18 +29,28 @@ from ai_psi.domain.enums import (
     VerificationStatus,
 )
 from ai_psi.domain.events import Event, ModelInvocationInfo
+from ai_psi.domain.improvement_proposals import ImprovementProposal
 from ai_psi.domain.memories import Memory
-from ai_psi.infrastructure.db.models import CognitiveRoundRow, EventRow, MemoryRow
+from ai_psi.infrastructure.db.models import (
+    CognitiveRoundRow,
+    EventRow,
+    ImprovementProposalRow,
+    MemoryRow,
+)
 
 __all__ = [
     "apply_event",
     "apply_memory",
+    "apply_proposal",
     "apply_round",
     "memory_to_row",
     "memory_to_values",
+    "proposal_to_row",
+    "proposal_to_values",
     "round_to_row",
     "row_to_event",
     "row_to_memory",
+    "row_to_proposal",
     "row_to_round",
 ]
 
@@ -332,4 +344,84 @@ def row_to_memory(row: MemoryRow) -> Memory:
         contradicts_ids=list(row.contradicts_ids),
         status=MemoryStatus(row.status),
         embedding_version=row.embedding_version,
+    )
+
+
+# ---------------------------------------------------------------------------
+# ImprovementProposal（阶段 6）
+# ---------------------------------------------------------------------------
+
+
+def proposal_to_values(proposal: ImprovementProposal) -> dict[str, Any]:
+    """把领域提案映射为列名 → 值的字典。
+
+    与 :func:`round_to_values` 同一条理由：**字段映射的唯一真相来源**。
+    插入路径与乐观锁更新路径共用它，否则新增字段时极易只改一处。
+
+    Args:
+        proposal: 领域对象。
+
+    Returns:
+        列名到值的映射，**不含主键**。
+    """
+    return {
+        "created_at": proposal.created_at,
+        "updated_at": proposal.updated_at,
+        "version": proposal.version,
+        "created_by": proposal.created_by,
+        "schema_version": proposal.schema_version,
+        "target_component": proposal.target_component,
+        "observed_problem": proposal.observed_problem,
+        "error_class": proposal.error_class.value,
+        "supporting_experience_ids": list(proposal.supporting_experience_ids),
+        "counterexamples": list(proposal.counterexamples),
+        "proposed_change": proposal.proposed_change,
+        "expected_benefit": proposal.expected_benefit,
+        "possible_regressions": list(proposal.possible_regressions),
+        "applicability": list(proposal.applicability),
+        "evaluation_plan": list(proposal.evaluation_plan),
+        "success_metrics": list(proposal.success_metrics),
+        "rollback_conditions": list(proposal.rollback_conditions),
+        "approval_level": proposal.approval_level.value,
+        "status": proposal.status.value,
+    }
+
+
+def proposal_to_row(proposal: ImprovementProposal) -> ImprovementProposalRow:
+    """把领域提案转换为新的 ORM 行。"""
+    values = proposal_to_values(proposal)
+    values["id"] = proposal.id
+    return ImprovementProposalRow(**values)
+
+
+def apply_proposal(row: ImprovementProposalRow, proposal: ImprovementProposal) -> None:
+    """把领域提案的全部字段写入已存在的 ORM 行。"""
+    row.id = proposal.id
+    for column, value in proposal_to_values(proposal).items():
+        setattr(row, column, value)
+
+
+def row_to_proposal(row: ImprovementProposalRow) -> ImprovementProposal:
+    """把 ORM 行还原为领域提案。"""
+    return ImprovementProposal(
+        id=row.id,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+        version=row.version,
+        created_by=row.created_by,
+        schema_version=row.schema_version,
+        target_component=row.target_component,
+        observed_problem=row.observed_problem,
+        error_class=ErrorType(row.error_class),
+        supporting_experience_ids=list(row.supporting_experience_ids),
+        counterexamples=list(row.counterexamples),
+        proposed_change=row.proposed_change,
+        expected_benefit=row.expected_benefit,
+        possible_regressions=list(row.possible_regressions),
+        applicability=list(row.applicability),
+        evaluation_plan=list(row.evaluation_plan),
+        success_metrics=list(row.success_metrics),
+        rollback_conditions=list(row.rollback_conditions),
+        approval_level=ApprovalLevel(row.approval_level),
+        status=ProposalStatus(row.status),
     )

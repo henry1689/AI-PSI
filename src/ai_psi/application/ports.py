@@ -19,7 +19,9 @@ from typing import Protocol, Self, runtime_checkable
 from uuid import UUID
 
 from ai_psi.domain.cognitive_rounds import CognitiveRound
+from ai_psi.domain.enums import ErrorType, EventType, ProposalStatus
 from ai_psi.domain.events import Event
+from ai_psi.domain.improvement_proposals import ImprovementProposal
 from ai_psi.domain.memories import Memory
 
 __all__ = [
@@ -28,6 +30,7 @@ __all__ = [
     "IdempotencyReservation",
     "IdempotencyStore",
     "MemoryRepository",
+    "ProposalRepository",
     "RoundRepository",
     "UnitOfWork",
     "UnitOfWorkFactory",
@@ -96,6 +99,37 @@ class EventStore(Protocol):
 
         增量回放需要它：领域事件对象**不携带序号**（序号是存储层概念，
         事件在构造时尚未写入数据库），因此游标只能由存储层提供。
+        """
+        ...
+
+    async def read_by_event_type(
+        self,
+        *,
+        event_type: EventType,
+        limit: int | None = None,
+    ) -> list[Event]:
+        """按事件类型读取，按 ``sequence`` 升序。
+
+        🔴 **这不是"顺手加的一个查询方法"，而是模式发现的唯一入口。**
+
+        "同类错误至少出现 3 次"（任务书 §11.3）要跨回合统计，
+        而回合是一段段独立的事件流——按回合读拿不到全局视图。
+        没有这个方法，学习层只剩两条路：把整张事件表拉回来在内存里过滤
+        （每调一次就是一次全表扫描），或者另建一张投影表
+        （于是"投影与事件流不一致"成为一个新的可能）。
+
+        ``events`` 表上已有 ``ix_events_type_recorded`` 索引，
+        因此这是一个**本来就该存在**的查询。
+
+        Args:
+            event_type: 目标事件类型。
+            limit: 返回条数上限；``None`` 表示不限制。
+                ⚠️ 顺序是 ``sequence`` 升序，因此 ``limit`` 取的是**最早的 N 条**。
+                要"最近 N 条"应当先取 ``latest_sequence()`` 再自行截断——
+                存储层不替调用方猜它要哪一头。
+
+        Returns:
+            命中事件，按 ``sequence`` 升序。
         """
         ...
 
@@ -239,6 +273,12 @@ class UnitOfWork(Protocol):
     #: 记忆的后果是累积的，这种"改都改了、却说不清为什么改"的状态
     #: 比一次整体失败糟糕得多（ADR-0015 §5、ADR-0017）。
     memories: MemoryRepository
+    #: 改进提案仓储（阶段 6）。
+    #:
+    #: 与记忆同理：提案的状态流转与它产生的审计事件必须同事务。
+    #: "状态改了但没记录为什么改"在提案上尤其致命——
+    #: 提案的全部意义就是**留下一个可被追溯的改进理由**。
+    proposals: ProposalRepository
 
     async def __aenter__(self) -> Self:
         """进入事务作用域。"""
@@ -329,7 +369,8 @@ class MemoryRepository(Protocol):
 
         Args:
             user_id: 检索发起者。``None`` 表示系统级记忆作用域。
-            query: 检索文本（阶段 3 用词面匹配，阶段 5 用向量）。
+            query: 检索文本（阶段 5 起走向量；默认 Provider 是词面向量，
+                见 :mod:`ai_psi.providers.embeddings`）。
             limit: 返回条数上限。
 
         Returns:
@@ -370,6 +411,72 @@ class MemoryRepository(Protocol):
         "索引里确实没有它"与"这次查询恰好没查出来"。
 
         两个实现都必须提供它，并由同一组契约断言固定。
+        """
+        ...
+
+
+# ---------------------------------------------------------------------------
+# 改进提案（阶段 6）
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class ProposalRepository(Protocol):
+    """改进提案仓储（任务书 §5.12、§12.4）。
+
+    🔴 **提案有表，经验没有。**
+
+    经验是不可变的观察，写入之后从不更新，因此它的家在事件流里——
+    加一张表只会引入"投影与事件流不一致"的可能。提案不同：
+    状态会变（``DRAFT`` → … → 终态），需要乐观锁、按 id 取、
+    按状态列表查询。这与 ``cognitive_rounds`` 的理由完全一样
+    （ADR-0002：表是"为查询与并发控制而物化的投影"）。
+
+    🔴 **本 Port 刻意没有"让提案生效"的方法。**
+
+    没有任何接口能把提案变成"已生效"——``ProposalStatus`` 里根本
+    没有这个成员（不变量 11）。缺的不是实现，是**这个概念本身**。
+    """
+
+    async def add(self, proposal: ImprovementProposal) -> None:
+        """写入一条新提案。
+
+        Raises:
+            ConflictError: 主键已存在。
+        """
+        ...
+
+    async def get(self, proposal_id: UUID) -> ImprovementProposal | None:
+        """按 id 读取；不存在返回 ``None``。"""
+        ...
+
+    async def save(self, proposal: ImprovementProposal, *, expected_version: int) -> None:
+        """带乐观锁的更新（状态流转用）。
+
+        Raises:
+            OptimisticLockError: 版本不匹配。
+            NotFoundError: 提案不存在。
+        """
+        ...
+
+    async def list_all(
+        self,
+        *,
+        status: ProposalStatus | None = None,
+        error_class: ErrorType | None = None,
+        limit: int | None = None,
+    ) -> list[ImprovementProposal]:
+        """列出提案。
+
+        Args:
+            status: 只看某个状态；``None`` 表示全部。
+            error_class: 只看某类错误；``None`` 表示全部。
+            limit: 条数上限；``None`` 表示不限制。
+
+        Returns:
+            按 ``created_at`` 降序、同时间按 id 升序排列——
+            **顺序必须确定**，"最近的三条提案"每次查出来不一样
+            会让任何一次排查都无从下手。
         """
         ...
 

@@ -94,8 +94,12 @@ class TestConversations:
     async def test_create_conversation_returns_id(self, client: httpx.AsyncClient) -> None:
         body = (await client.post(f"{API_PREFIX}/conversations")).json()
         UUID(body["conversation_id"])
-        # V0.1 不持久化会话实体——接口**如实说明**了这一点
-        assert "阶段 5" in body["note"]
+        # V0.1 不持久化会话实体——接口**如实说明**了这一点。
+        # 🔴 断言的是"说了不持久化"，不是某个具体措辞：阶段 3 这里曾写着
+        # "阶段 5 落地"，而阶段 5 落地的是记忆、不是会话。
+        # 钉住措辞会让这句诚实的说明变回一句不会发生的承诺。
+        assert "不持久化" in body["note"]
+        assert "阶段" not in body["note"]
 
     async def test_submit_message_completes_a_round(self, client: httpx.AsyncClient) -> None:
         body = await _submit(client)

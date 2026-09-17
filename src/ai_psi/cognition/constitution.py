@@ -30,6 +30,7 @@ from ai_psi.domain.memories import Memory
 from ai_psi.domain.user_models import UserModel
 
 __all__ = [
+    "AUTO_PROMOTION_FORBIDDEN_VALUES",
     "AUTO_WRITABLE_MEMORY_TYPES",
     "CONSTITUTION_VERSION",
     "FORBIDDEN_MEMORY_CONTENT_CLASSES",
@@ -295,6 +296,18 @@ def assert_user_model_not_confirmed(user_model: UserModel) -> None:
         )
 
 
+#: 表示"提案已生效"的状态值。
+#:
+#: 🔴 **这份名单只有一个来源。** 它同时被
+#: :func:`assert_no_automatic_promotion` 与
+#: :mod:`ai_psi.reliability.invariants` 的运行期自检使用——
+#: 两处各写一份，会让"宪法拦不住的那个值恰好不在自检名单里"成为可能，
+#: 而那正是自检存在的全部意义。
+AUTO_PROMOTION_FORBIDDEN_VALUES: Final[frozenset[str]] = frozenset(
+    {"active", "applied", "promoted", "live"}
+)
+
+
 def assert_no_automatic_promotion(status: ProposalStatus) -> None:
     """🔴 **I11**：改进提案不得自动生效。
 
@@ -306,7 +319,7 @@ def assert_no_automatic_promotion(status: ProposalStatus) -> None:
     Raises:
         ConstitutionViolationError: 状态表示提案已生效。
     """
-    if status.value in {"active", "applied", "promoted", "live"}:
+    if status.value in AUTO_PROMOTION_FORBIDDEN_VALUES:
         raise ConstitutionViolationError(
             f"改进提案不得自动生效：{status.value!r} 不是合法的提案状态",
             invariant_id="I11",
