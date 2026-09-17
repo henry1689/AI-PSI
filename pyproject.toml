@@ -43,7 +43,10 @@ packages = ["src/ai_psi"]
 target-version = "py312"
 line-length = 100
 src = ["src", "tests", "scripts"]
-extend-exclude = ["migrations", "evals/datasets"]
+# *.md 必须排除：ruff 0.14+ 会格式化 Markdown 中的 Python 代码块，
+# 而 docs/ 下的文档（尤其任务书）含有大量作为**示例**的代码片段，
+# 其中不乏伪代码与省略号占位，格式化它们会破坏需求文档的可读性与原意。
+extend-exclude = ["migrations", "evals/datasets", "**/*.md"]
 
 [tool.ruff.lint]
 select = [
