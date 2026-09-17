@@ -1,0 +1,33 @@
+# AI-PSI 开发环境依赖服务。
+#
+# 仅用于本地开发与测试。V0.1 不引入 Redis / Kafka / 消息中间件（ADR-0001）。
+# 端口默认 55432，避免与本机可能存在的 PostgreSQL 5432 冲突。
+
+services:
+  postgres:
+    # 默认官方镜像（CI 与可直连 Docker Hub 的环境）。
+    # 无法直连 Docker Hub 时，在 .env 中覆盖 AI_PSI_PG_IMAGE 为镜像源地址，
+    # 例如 AI_PSI_PG_IMAGE=docker.m.daocloud.io/pgvector/pgvector:pg16
+    image: ${AI_PSI_PG_IMAGE:-pgvector/pgvector:pg16}
+    container_name: ai-psi-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ai_psi}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ai_psi_dev_pw}
+      POSTGRES_DB: ${POSTGRES_DB:-ai_psi}
+      # 开发库使用确定性排序，避免跨机器测试结果漂移
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "${POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - ai_psi_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ai_psi} -d ${POSTGRES_DB:-ai_psi}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  ai_psi_pgdata:
+    name: ai_psi_pgdata

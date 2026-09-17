@@ -1,0 +1,73 @@
+# AI-PSI Cognitive Runtime — 开发任务入口
+#
+# ⚠️ Windows 默认不含 make。本机未装 make 时，用右侧等价的 uv 命令：
+#   make lint      →  uv run ruff check .  &&  uv run ruff format --check .
+#   make typecheck →  uv run mypy src tests scripts
+#   make test      →  uv run pytest --cov=ai_psi --cov-report=term-missing
+#   make fmt       →  uv run ruff check --fix .  &&  uv run ruff format .
+#   make up        →  docker compose up -d
+#   make down      →  docker compose down
+# CI（ubuntu-latest）自带 make，直接使用本文件的 recipe。
+
+UV ?= uv
+PY ?= $(UV) run python
+
+.PHONY: help install lint fmt typecheck test policy check up down logs ps bootstrap clean
+
+help:
+	@echo "AI-PSI 开发命令："
+	@echo "  install    安装依赖（含 dev 组）"
+	@echo "  lint       ruff check + ruff format --check"
+	@echo "  fmt        ruff 自动修复 + 格式化"
+	@echo "  typecheck  mypy --strict"
+	@echo "  test       pytest + 覆盖率采集"
+	@echo "  policy     覆盖率闸门（domain/cognition 85%、总体 75%）"
+	@echo "  check      lint + typecheck + test + policy（提交前跑这个）"
+	@echo "  up         启动 PostgreSQL 16 + pgvector 容器"
+	@echo "  down       停止容器（保留数据卷）"
+	@echo "  bootstrap  校验数据库连通并确保 vector 扩展就绪"
+	@echo "  clean      清理缓存与临时产物"
+
+install:
+	$(UV) sync --all-groups
+
+lint:
+	$(UV) run ruff check .
+	$(UV) run ruff format --check .
+
+fmt:
+	$(UV) run ruff check --fix .
+	$(UV) run ruff format .
+
+typecheck:
+	$(UV) run mypy src tests scripts
+
+test:
+	$(UV) run pytest --cov=ai_psi --cov-report=term-missing --cov-report=xml
+
+policy:
+	$(UV) run coverage report --fail-under=75
+	$(UV) run coverage report --include="*/ai_psi/domain/*,*/ai_psi/cognition/*" --fail-under=85
+
+check: lint typecheck test policy
+
+up:
+	docker compose up -d
+	@echo "等待容器健康检查通过..."
+	@docker compose ps
+
+down:
+	docker compose down
+
+logs:
+	docker compose logs -f postgres
+
+ps:
+	docker compose ps
+
+bootstrap:
+	$(PY) scripts/bootstrap_db.py
+
+clean:
+	rm -rf .pytest_cache .mypy_cache .ruff_cache .hypothesis htmlcov .coverage coverage.xml
+	find . -type d -name __pycache__ -prune -exec rm -rf {} +
