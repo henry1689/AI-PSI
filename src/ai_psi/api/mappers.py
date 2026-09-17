@@ -16,12 +16,14 @@ from typing import Any
 
 from ai_psi.api.schemas import (
     JudgmentView,
+    MemoryView,
     ModelInvocationView,
     ReflectionView,
 )
 from ai_psi.domain.events import ModelInvocationInfo
+from ai_psi.domain.memories import Memory
 
-__all__ = ["judgment_view", "model_invocation_view", "reflection_view"]
+__all__ = ["judgment_view", "memory_view", "model_invocation_view", "reflection_view"]
 
 
 def judgment_view(payload: dict[str, Any] | None) -> JudgmentView | None:
@@ -105,4 +107,45 @@ def model_invocation_view(info: ModelInvocationInfo) -> ModelInvocationView:
         retry_count=info.retry_count,
         result_status=info.result_status,
         response_hash=info.response_hash,
+    )
+
+
+def memory_view(memory: Memory, *, conflicts_within_results: bool = False) -> MemoryView:
+    """把领域记忆映射为 API 视图。
+
+    🔴 **这里包含正文，这是有意的。** 记忆是用户自己的数据，
+    ``GET /users/{id}/memories`` 与导出的全部意义就是把它们交还用户。
+    需要"不含正文"的是**审计**（事件负载），那条规则由
+    :func:`ai_psi.memory.redaction.audit_payload_for_memory` 与
+    它背后的断言强制，两者不是一回事。
+
+    ``embedding_version`` **不外发**：它是检索实现的内部约定，
+    客户端拿到它既做不了什么，又会让"换向量 Provider"看起来像是
+    一个破坏性变更。
+
+    Args:
+        memory: 领域记忆。
+        conflicts_within_results: 本条与同一批结果中其他成员是否存在显式冲突。
+
+    Returns:
+        API 视图。
+    """
+    return MemoryView(
+        id=memory.id,
+        user_id=memory.user_id,
+        memory_type=memory.memory_type,
+        content=memory.content,
+        status=memory.status,
+        verification_status=memory.verification_status,
+        sensitivity=memory.sensitivity,
+        retention_policy=memory.retention_policy,
+        applicability=list(memory.applicability),
+        valid_from=memory.valid_from,
+        valid_until=memory.valid_until,
+        supersedes_id=memory.supersedes_id,
+        contradicts_ids=list(memory.contradicts_ids),
+        conflicts_within_results=conflicts_within_results,
+        created_at=memory.created_at,
+        updated_at=memory.updated_at,
+        version=memory.version,
     )

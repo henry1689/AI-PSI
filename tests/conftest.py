@@ -17,6 +17,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from ai_psi.config import Settings
 from ai_psi.domain.beliefs import Belief
 from ai_psi.domain.cognitive_rounds import CognitiveBudget, CognitiveRound
 from ai_psi.domain.concerns import Concern
@@ -339,9 +340,19 @@ def _isolate_provider_credentials(
     "环境里恰好没有密钥"，它们就会在开发机上失败、在 CI 上通过——
     那是最难解释的一类测试失败，而且会诱使人把断言改松。
 
+    🔴 **两个来源都要摘，只摘环境变量是不够的。**
+
+    配置有**两个**注入通道：进程环境变量与项目根目录的 ``.env``。
+    阶段 4 只处理了前者，于是阶段 5 把开发密钥写进 ``.env`` 之后，
+    "缺 Key 时明确失败"这条用例立刻变得依赖"这台机器上有没有配 .env"——
+    正是上面那段话描述的那个问题，只是换了一个来源。
+    这里把 ``env_file`` 一并指向 ``None``，两条通道一起关掉。
+
     标记为 ``live`` 的用例是例外：它们要的就是真实密钥。
     """
     if request.node.get_closest_marker("live") is not None:
         return
     for name in _AMBIENT_CREDENTIAL_VARS:
         monkeypatch.delenv(name, raising=False)
+    # 注意：改的是**类属性上的 config 字典**，monkeypatch 会在用例结束后还原。
+    monkeypatch.setitem(Settings.model_config, "env_file", None)

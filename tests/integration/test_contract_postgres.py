@@ -6,9 +6,10 @@
 差异会在**写第二个实现的那一刻**暴露，而不是在阶段 5 替换时暴露——
 后者会让问题看起来像是"新代码的 bug"，而实际上它一直存在。
 
-⚠️ 阶段 3 只覆盖事件存储、回合仓储与幂等键存储。
-:class:`~ai_psi.application.ports.MemoryRepository` 的 PostgreSQL 实现
-要到阶段 5（需要建表 + pgvector）才交付，因此不在本文件里。
+阶段 3 覆盖事件存储、回合仓储与幂等键存储；阶段 5 补齐
+:class:`~ai_psi.application.ports.MemoryRepository`——
+阶段 3 留下的 ``TestPostgresMemoryRepository`` 占位类**直接启用**，
+没有另写一套断言。
 """
 
 from __future__ import annotations
@@ -16,7 +17,6 @@ from __future__ import annotations
 import pytest
 
 from ai_psi.application.ports import UnitOfWorkFactory
-from ai_psi.infrastructure.in_memory.memory_store import InMemoryMemoryRepository
 from tests.contract.base import (
     EventStoreContract,
     IdempotencyContract,
@@ -46,6 +46,12 @@ async def idempotency_store(uow_factory: UnitOfWorkFactory):
         yield uow.idempotency
 
 
+@pytest.fixture
+async def memory_repository(uow_factory: UnitOfWorkFactory):
+    async with uow_factory() as uow:
+        yield uow.memories
+
+
 class TestPostgresEventStore(EventStoreContract):
     """事件存储的 PostgreSQL 实现。"""
 
@@ -62,19 +68,8 @@ class TestPostgresUnitOfWork(UnitOfWorkContract):
     """工作单元的 PostgreSQL 实现。"""
 
 
-class TestMemoryPortIsNotYetPersistent:
-    """阶段 3 的边界：记忆仓储尚无 PostgreSQL 实现。
-
-    🔴 **这条断言存在的意义是让边界可见。**
-    如果哪天有人实现了持久化版本却忘了接上契约测试，
-    这个用例会提醒他：它现在跑的还是内存实现。
-    """
-
-    def test_memory_repository_is_the_in_memory_one(self) -> None:
-        repository = InMemoryMemoryRepository()
-        assert type(repository).__name__ == "InMemoryMemoryRepository"
-
-
-@pytest.mark.skip(reason="阶段 5 交付 PostgreSQL + pgvector 后启用")
 class TestPostgresMemoryRepository(MemoryRepositoryContract):
-    """占位：阶段 5 把记忆仓储接到 PostgreSQL 之后，本类即可启用。"""
+    """长期记忆仓储的 PostgreSQL + pgvector 实现。
+
+    阶段 3 留下的占位类在这里启用——断言**一行未改**。
+    """

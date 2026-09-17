@@ -27,16 +27,18 @@ from ai_psi.application.cognitive_runtime import (
     RoundOutcome,
     RoundRequest,
 )
+from ai_psi.application.memory_service import MemoryService
 from ai_psi.application.ports import UnitOfWorkFactory
 from ai_psi.cognition.projection import ArtifactView, project_artifacts
 from ai_psi.config import Settings
 from ai_psi.domain.enums import CognitiveDepth, EventType
 from ai_psi.domain.events import Event
-from ai_psi.infrastructure.in_memory.memory_store import InMemoryMemoryRepository
+from ai_psi.domain.memories import Memory
 from ai_psi.infrastructure.in_memory.store import InMemoryStore
 from ai_psi.infrastructure.in_memory.unit_of_work import make_in_memory_unit_of_work_factory
 from ai_psi.prompts.registry import PromptRegistry
 from ai_psi.prompts.versions import build_default_registry
+from ai_psi.providers.embeddings import EmbeddingProvider, LocalHashingEmbedding
 from ai_psi.providers.mock import MockFault, MockProvider, MockResponse
 
 __all__ = [
@@ -204,7 +206,8 @@ class Harness:
     runtime: CognitiveRuntime
     provider: MockProvider
     store: InMemoryStore
-    memory: InMemoryMemoryRepository
+    memory_service: MemoryService
+    embeddings: EmbeddingProvider
     prompts: PromptRegistry
     settings: Settings
     uow_factory: UnitOfWorkFactory
@@ -220,6 +223,17 @@ class Harness:
             回合结果。
         """
         return await self.runtime.run_round(RoundRequest(user_message=message, **overrides))
+
+    async def seed_memory(self, memory: Memory) -> None:
+        """直接写入一条记忆，**绕过写入策略**。
+
+        场景测试要的是"库里已经有一条记忆"，而不是"某条记忆能被策略批准"——
+        后者有它自己的单元测试。用 ``propose`` 造数据会让策略的改动
+        波及一大批与策略无关的场景（改一条白名单就能让场景 J 红掉）。
+        """
+        async with self.uow_factory() as uow:
+            await uow.memories.add(memory)
+            await uow.commit()
 
     async def events(self, round_id: UUID) -> list[Event]:
         """读取回合的事件流。"""
@@ -261,7 +275,9 @@ def harness_factory() -> Callable[..., Harness]:
         responses: dict[str, Sequence[MockResponse]] | None = None,
         faults: Sequence[MockFault] = (),
         settings: Settings | None = None,
-        memory: InMemoryMemoryRepository | None = None,
+        memory_service_factory: Callable[
+            [UnitOfWorkFactory, EmbeddingProvider], MemoryService
+        ] = MemoryService,
     ) -> Harness:
         resolved = settings or Settings(
             storage_backend="memory",
@@ -270,21 +286,23 @@ def harness_factory() -> Callable[..., Harness]:
         )
         prompts = build_default_registry()
         provider = MockProvider(responses=responses, faults=faults)
-        resolved_memory = memory if memory is not None else InMemoryMemoryRepository()
+        embeddings = LocalHashingEmbedding()
         store = InMemoryStore()
-        uow_factory = make_in_memory_unit_of_work_factory(store)
+        uow_factory = make_in_memory_unit_of_work_factory(store, embeddings)
+        memory_service = memory_service_factory(uow_factory, embeddings)
         runtime = CognitiveRuntime(
             uow_factory=uow_factory,
             provider=provider,
             prompts=prompts,
-            memory=resolved_memory,
+            memory_service=memory_service,
             settings=resolved,
         )
         return Harness(
             runtime=runtime,
             provider=provider,
             store=store,
-            memory=resolved_memory,
+            memory_service=memory_service,
+            embeddings=embeddings,
             prompts=prompts,
             settings=resolved,
             uow_factory=uow_factory,

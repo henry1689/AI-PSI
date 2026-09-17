@@ -17,8 +17,9 @@ from uuid import UUID
 
 from ai_psi.domain.cognitive_rounds import CognitiveRound
 from ai_psi.domain.events import Event
+from ai_psi.domain.memories import Memory
 
-__all__ = ["IdempotencyRecord", "InMemoryStore"]
+__all__ = ["IdempotencyRecord", "InMemoryStore", "MemoryIndexEntry"]
 
 
 @dataclass
@@ -28,6 +29,22 @@ class IdempotencyRecord:
     key: str
     request_hash: str
     cognitive_round_id: UUID | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryIndexEntry:
+    """向量索引中的一条记录。
+
+    对应 PostgreSQL 侧的 ``memory_embeddings`` 表。**刻意与记忆本体分开存放**，
+    因为两者的生命周期不同：记忆被逻辑删除时本体保留（审计需要），
+    索引行则被物理移除（不变量 15 需要"删了就不再检索得到"）。
+    把向量塞进 :class:`~ai_psi.domain.memories.Memory` 会让这两件事
+    绑在一起，于是"删除"只能二选一：要么丢掉审计轨迹，要么留下可检索的向量。
+    """
+
+    vector: list[float]
+    embedding_version: str
+    provider: str
 
 
 @dataclass
@@ -47,6 +64,12 @@ class InMemoryStore:
 
     #: 幂等键表。
     idempotency: dict[str, IdempotencyRecord] = field(default_factory=dict)
+
+    #: 长期记忆主表。
+    memories: dict[UUID, Memory] = field(default_factory=dict)
+
+    #: 向量索引。键是记忆 id，**只包含当前可检索的记忆**（不变量 15）。
+    index: dict[UUID, MemoryIndexEntry] = field(default_factory=dict)
 
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
     _sequence: int = field(default=0, repr=False)
@@ -76,6 +99,8 @@ class InMemoryStore:
         events: list[tuple[int, Event]],
         rounds: dict[UUID, CognitiveRound],
         reservations: dict[str, IdempotencyRecord],
+        memories: dict[UUID, Memory],
+        index: dict[UUID, MemoryIndexEntry | None],
     ) -> None:
         """把一次事务的暂存区合并进共享数据。
 
@@ -83,19 +108,25 @@ class InMemoryStore:
         把它放在 store 上（而不是让工作单元直接改字段）有两个好处：
         锁的边界清楚，且"未提交的写入不可见"这条规则只有一处需要保证。
 
-        记忆不在其中——:class:`~ai_psi.application.ports.MemoryRepository`
-        的每个方法自身就是一次原子操作，不参与工作单元
-        （见 :mod:`ai_psi.infrastructure.in_memory.memory_store` 的模块文档）。
-
         Args:
             events: 待追加的 ``(sequence, event)``。
             rounds: 待写入的回合。
             reservations: 待写入的幂等占位。
+            memories: 待写入的记忆本体。
+            index: 待同步的索引项。**值为 ``None`` 表示删除该索引项**——
+                用 ``None`` 而不是"从字典里去掉"来表达删除，
+                是因为"没改过它"与"要删掉它"必须能区分开。
         """
         with self._lock:
             self.events.extend(events)
             self.rounds.update(rounds)
             self.idempotency.update(reservations)
+            self.memories.update(memories)
+            for memory_id, entry in index.items():
+                if entry is None:
+                    self.index.pop(memory_id, None)
+                else:
+                    self.index[memory_id] = entry
 
     def clear(self) -> None:
         """清空全部数据（测试夹具用）。"""
@@ -103,4 +134,6 @@ class InMemoryStore:
             self.events.clear()
             self.rounds.clear()
             self.idempotency.clear()
+            self.memories.clear()
+            self.index.clear()
             self._sequence = 0

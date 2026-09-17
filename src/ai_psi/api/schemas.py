@@ -24,14 +24,24 @@ from ai_psi.domain.enums import (
     CognitiveDepth,
     ConfidenceBand,
     EpistemicAction,
+    MemoryStatus,
+    MemoryType,
+    RetentionPolicy,
     RoundState,
+    SensitivityLevel,
+    VerificationStatus,
 )
 
 __all__ = [
     "ConversationCreatedResponse",
+    "CorrectMemoryRequest",
+    "CorrectMemoryResponse",
+    "DeleteMemoryResponse",
     "DimensionStatus",
     "HealthResponse",
     "JudgmentView",
+    "MemoryListResponse",
+    "MemoryView",
     "ModelInvocationView",
     "ReflectionView",
     "ReplayResponse",
@@ -40,6 +50,8 @@ __all__ = [
     "RoundSummaryResponse",
     "SubmitMessageRequest",
     "SubmitMessageResponse",
+    "UserDataDeletionResponse",
+    "UserDataExportResponse",
 ]
 
 _STRICT = ConfigDict(extra="forbid")
@@ -266,3 +278,124 @@ class HealthResponse(BaseModel):
 
     status: str
     checks: list[DimensionStatus] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# 判断与记忆（§12.3）
+# ---------------------------------------------------------------------------
+
+
+class MemoryView(BaseModel):
+    """允许客户端看到的一条长期记忆。
+
+    🔴 **这里返回的是正文。** 记忆是**用户自己的数据**，
+    ``GET /users/{id}/memories`` 与导出接口存在的意义就是把它们交还给用户。
+    需要区别对待的是**审计**：事件负载里永远不含正文
+    （见 :mod:`ai_psi.memory.redaction` 与任务书 §10.5）。
+    """
+
+    model_config = _STRICT
+
+    id: UUID
+    user_id: UUID | None = None
+    memory_type: MemoryType
+    content: str
+    status: MemoryStatus
+    verification_status: VerificationStatus
+    sensitivity: SensitivityLevel
+    retention_policy: RetentionPolicy
+
+    applicability: list[str] = Field(default_factory=list)
+    valid_from: datetime
+    valid_until: datetime | None = None
+
+    supersedes_id: UUID | None = None
+    contradicts_ids: list[UUID] = Field(default_factory=list)
+    #: 本条与**同一批结果中**的其他记忆是否存在显式冲突关系。
+    #: 冲突要被呈现，而不是被排序掩盖（任务书 §5.11）。
+    conflicts_within_results: bool = False
+
+    created_at: datetime
+    updated_at: datetime
+    version: int = Field(ge=1)
+
+    @property
+    def default_retrievable(self) -> bool:
+        """是否属于默认可检索状态（不变量 6）。"""
+        return self.status.is_default_retrievable
+
+
+class MemoryListResponse(BaseModel):
+    """某用户的记忆列表。"""
+
+    model_config = _STRICT
+
+    user_id: UUID
+    count: int = Field(ge=0)
+    include_inactive: bool
+    memories: list[MemoryView] = Field(default_factory=list)
+
+
+class CorrectMemoryRequest(BaseModel):
+    """用户纠正一条记忆。"""
+
+    model_config = _STRICT
+
+    user_id: UUID = Field(description="发起纠正的用户；必须与记忆的作用域一致")
+    new_content: str = Field(min_length=1, description="新的内容")
+
+
+class CorrectMemoryResponse(BaseModel):
+    """纠正结果。
+
+    🔴 **不变量 5**：旧记忆被取代，**不就地覆盖**。
+    两个 id 都返回，客户端因此可以完整地展示版本链。
+    """
+
+    model_config = _STRICT
+
+    corrected_memory_id: UUID
+    replacement_memory_id: UUID
+    superseded_status: MemoryStatus
+    replacement_status: MemoryStatus
+    audit_event_ids: list[UUID] = Field(default_factory=list)
+
+
+class DeleteMemoryResponse(BaseModel):
+    """删除结果。"""
+
+    model_config = _STRICT
+
+    memory_id: UUID
+    status: MemoryStatus
+    audit_event_id: UUID
+
+
+class UserDataExportResponse(BaseModel):
+    """用户数据导出（任务书 §10.5）。
+
+    ``export`` 是完整的导出包，含**被取代与已删除的记忆**——
+    "为什么发生过修正"靠版本链回答，只导出有效记忆会让纠错痕迹消失。
+    """
+
+    model_config = _STRICT
+
+    user_id: UUID
+    audit_event_id: UUID
+    export: dict[str, Any]
+
+
+class UserDataDeletionResponse(BaseModel):
+    """用户数据删除结果。
+
+    ⚠️ **只覆盖记忆。** 事件流、认知回合与判断是系统运行史，不在删除范围内；
+    "事件只追加"是根本约束（ADR-0002）。这一点必须在文档里说清楚，
+    不能靠调用方自己猜。
+    """
+
+    model_config = _STRICT
+
+    user_id: UUID
+    deleted_count: int = Field(ge=0)
+    memory_ids: list[UUID] = Field(default_factory=list)
+    audit_event_ids: list[UUID] = Field(default_factory=list)

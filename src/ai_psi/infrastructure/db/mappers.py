@@ -18,18 +18,27 @@ from ai_psi.domain.enums import (
     CognitiveDepth,
     ErrorType,
     EventType,
+    MemoryStatus,
+    MemoryType,
+    RetentionPolicy,
     RoundState,
     SensitivityLevel,
     TrustLevel,
+    VerificationStatus,
 )
 from ai_psi.domain.events import Event, ModelInvocationInfo
-from ai_psi.infrastructure.db.models import CognitiveRoundRow, EventRow
+from ai_psi.domain.memories import Memory
+from ai_psi.infrastructure.db.models import CognitiveRoundRow, EventRow, MemoryRow
 
 __all__ = [
     "apply_event",
+    "apply_memory",
     "apply_round",
+    "memory_to_row",
+    "memory_to_values",
     "round_to_row",
     "row_to_event",
+    "row_to_memory",
     "row_to_round",
 ]
 
@@ -219,4 +228,108 @@ def row_to_round(row: CognitiveRoundRow) -> CognitiveRound:
         causation_id=row.causation_id,
         started_at=row.started_at,
         completed_at=row.completed_at,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Memory
+# ---------------------------------------------------------------------------
+
+
+def memory_to_values(memory: Memory) -> dict[str, Any]:
+    """把领域记忆映射为列名 → 值的字典。
+
+    与 :func:`round_to_values` 同一条理由：**本函数是字段映射的唯一真相来源**，
+    插入路径与乐观锁更新路径共用它。另写一份字段列表，
+    新增字段时就可能只改插入、忘了更新——得到"能存进去但改不动"。
+
+    Args:
+        memory: 领域对象。
+
+    Returns:
+        列名到值的映射，**不含主键**。
+    """
+    return {
+        "created_at": memory.created_at,
+        "updated_at": memory.updated_at,
+        "version": memory.version,
+        "created_by": memory.created_by,
+        "schema_version": memory.schema_version,
+        "user_id": memory.user_id,
+        "memory_type": memory.memory_type.value,
+        "content": memory.content,
+        "source_event_ids": list(memory.source_event_ids),
+        "evidence_ids": list(memory.evidence_ids),
+        "verification_status": memory.verification_status.value,
+        "applicability": list(memory.applicability),
+        "sensitivity": memory.sensitivity.value,
+        "retention_policy": memory.retention_policy.value,
+        "access_scope": list(memory.access_scope),
+        "valid_from": memory.valid_from,
+        "valid_until": memory.valid_until,
+        "supersedes_id": memory.supersedes_id,
+        "contradicts_ids": list(memory.contradicts_ids),
+        "status": memory.status.value,
+        "embedding_version": memory.embedding_version,
+    }
+
+
+def memory_to_row(memory: Memory) -> MemoryRow:
+    """把领域记忆转换为新的 ORM 行。
+
+    Args:
+        memory: 领域对象。
+
+    Returns:
+        可直接 `session.add()` 的 ORM 行。
+    """
+    values = memory_to_values(memory)
+    values["id"] = memory.id
+    return MemoryRow(**values)
+
+
+def apply_memory(row: MemoryRow, memory: Memory) -> None:
+    """把领域记忆的全部字段写入已存在的 ORM 行。
+
+    Args:
+        row: 目标 ORM 行。
+        memory: 源领域对象。
+    """
+    row.id = memory.id
+    for column, value in memory_to_values(memory).items():
+        setattr(row, column, value)
+
+
+def row_to_memory(row: MemoryRow) -> Memory:
+    """把 ORM 行还原为领域记忆。
+
+    Args:
+        row: 数据库行。
+
+    Returns:
+        领域对象。
+    """
+    return Memory(
+        id=row.id,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+        version=row.version,
+        created_by=row.created_by,
+        schema_version=row.schema_version,
+        user_id=row.user_id,
+        memory_type=MemoryType(row.memory_type),
+        content=row.content,
+        source_event_ids=list(row.source_event_ids),
+        evidence_ids=list(row.evidence_ids),
+        verification_status=VerificationStatus(row.verification_status),
+        applicability=list(row.applicability),
+        sensitivity=SensitivityLevel(row.sensitivity),
+        retention_policy=RetentionPolicy(row.retention_policy),
+        access_scope=list(row.access_scope),
+        valid_from=row.valid_from,
+        valid_until=row.valid_until,
+        supersedes_id=row.supersedes_id,
+        contradicts_ids=list(row.contradicts_ids),
+        status=MemoryStatus(row.status),
+        embedding_version=row.embedding_version,
     )

@@ -19,12 +19,13 @@ from __future__ import annotations
 import pytest
 
 from ai_psi.application.cognitive_runtime import CognitiveRuntime, RoundRequest
+from ai_psi.application.memory_service import MemoryService
 from ai_psi.config import Settings
 from ai_psi.domain.enums import EventType
-from ai_psi.infrastructure.in_memory.memory_store import InMemoryMemoryRepository
 from ai_psi.infrastructure.in_memory.store import InMemoryStore
 from ai_psi.infrastructure.in_memory.unit_of_work import make_in_memory_unit_of_work_factory
 from ai_psi.prompts.versions import build_default_registry
+from ai_psi.providers.embeddings import LocalHashingEmbedding
 from ai_psi.providers.mock import MockProvider
 from ai_psi.providers.registry import resolve_model
 
@@ -34,14 +35,15 @@ pytestmark = pytest.mark.unit
 async def _run_with(settings: Settings) -> list[str]:
     """在给定配置下跑一次回合，返回事件里记录的全部模型标识。"""
     store = InMemoryStore()
-    uow_factory = make_in_memory_unit_of_work_factory(store)
+    embeddings = LocalHashingEmbedding()
+    uow_factory = make_in_memory_unit_of_work_factory(store, embeddings)
     runtime = CognitiveRuntime(
         uow_factory=uow_factory,
         # 用 Mock 作为**传输层替身**：本测试关心的是"发出去的模型名是什么"，
         # 而不是"谁来回应它"。
         provider=MockProvider(),
         prompts=build_default_registry(),
-        memory=InMemoryMemoryRepository(),
+        memory_service=MemoryService(uow_factory, embeddings),
         settings=settings,
     )
     outcome = await runtime.run_round(RoundRequest(user_message="水在标准大气压下多少摄氏度沸腾？"))

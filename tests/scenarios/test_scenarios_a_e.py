@@ -29,7 +29,9 @@ from ai_psi.domain.enums import (
 from ai_psi.domain.evidence import Evidence
 from ai_psi.domain.exceptions import ConstitutionViolationError
 from ai_psi.domain.memories import Memory
-from ai_psi.infrastructure.in_memory.memory_store import InMemoryMemoryRepository
+from ai_psi.infrastructure.in_memory.store import InMemoryStore
+from ai_psi.infrastructure.in_memory.unit_of_work import make_in_memory_unit_of_work_factory
+from ai_psi.providers.embeddings import LocalHashingEmbedding
 from ai_psi.reliability.confidence import derive_ceiling
 from tests.scenarios.conftest import (
     Harness,
@@ -521,13 +523,16 @@ async def test_scope_violation_is_not_silently_filtered() -> None:
         status=MemoryStatus.ACTIVE,
     )
 
-    repository = InMemoryMemoryRepository()
-    await repository.add(memory)
+    uow_factory = make_in_memory_unit_of_work_factory(InMemoryStore(), LocalHashingEmbedding())
+    async with uow_factory() as uow:
+        await uow.memories.add(memory)
+        await uow.commit()
 
-    # 以另一个用户的身份检索：返回空（作用域过滤生效）
-    assert await repository.retrieve(user_id=uuid4(), query="私人偏好", limit=10) == []
-    # 以正确的用户身份：返回该条
-    assert len(await repository.retrieve(user_id=other_user, query="私人偏好", limit=10)) == 1
+    async with uow_factory() as uow:
+        # 以另一个用户的身份检索：返回空（作用域过滤生效）
+        assert await uow.memories.retrieve(user_id=uuid4(), query="私人偏好", limit=10) == []
+        # 以正确的用户身份：返回该条
+        assert len(await uow.memories.retrieve(user_id=other_user, query="私人偏好", limit=10)) == 1
 
     # 防御性断言在"过滤失效"时必须抛错
     with pytest.raises(ConstitutionViolationError):

@@ -30,7 +30,8 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel
 
 from ai_psi.application.artifact_service import ArtifactService, RoundScope
-from ai_psi.application.ports import MemoryRepository, UnitOfWorkFactory
+from ai_psi.application.memory_service import MemoryService
+from ai_psi.application.ports import UnitOfWorkFactory
 from ai_psi.application.round_service import CognitiveRoundService, StartRoundResult
 from ai_psi.cognition.base import ModuleOutcome
 from ai_psi.cognition.causal_analyzer import CausalAnalyzer
@@ -167,7 +168,7 @@ class CognitiveRuntime:
         uow_factory: UnitOfWorkFactory,
         provider: LLMProvider,
         prompts: PromptRegistry,
-        memory: MemoryRepository,
+        memory_service: MemoryService,
         settings: Settings,
         round_service: CognitiveRoundService | None = None,
         artifacts: ArtifactService | None = None,
@@ -176,9 +177,9 @@ class CognitiveRuntime:
 
         Args:
             uow_factory: 工作单元工厂。
-            provider: LLM Provider（阶段 3 是 Mock）。
+            provider: LLM Provider。
             prompts: Prompt 注册表。
-            memory: 长期记忆仓储。阶段 3 只有内存实现（ADR-0009）。
+            memory_service: 长期记忆服务（阶段 5 起含 PostgreSQL + pgvector 实现）。
             settings: 运行时配置。
             round_service: 回合服务；``None`` 时按工厂构造。
             artifacts: 产物记录服务；``None`` 时按工厂构造。
@@ -186,7 +187,7 @@ class CognitiveRuntime:
         self._uow_factory = uow_factory
         self._provider = provider
         self._prompts = prompts
-        self._memory = memory
+        self._memory_service = memory_service
         self._settings = settings
         # 🔴 模型标识**在这里解析一次**。
         #
@@ -213,9 +214,15 @@ class CognitiveRuntime:
         return self._prompts
 
     @property
-    def memory(self) -> MemoryRepository:
-        """长期记忆仓储。"""
-        return self._memory
+    def memory_service(self) -> MemoryService:
+        """长期记忆服务。
+
+        🔴 **这里给的是服务而不是仓储**：阶段 5 起记忆仓储属于工作单元
+        （``uow.memories``），它的生命周期是一次事务。把仓储直接暴露出去，
+        调用方就得自己管事务边界——而"自己管事务边界"正是
+        记忆写入与事件写入分家的原因（ADR-0015 §5）。
+        """
+        return self._memory_service
 
     @property
     def settings(self) -> Settings:
@@ -594,7 +601,7 @@ class _RoundExecution:
         memories: tuple[Memory, ...] = ()
         if self._request.allow_long_term_memory:
             memories = tuple(
-                await self._runtime.memory.retrieve(
+                await self._runtime.memory_service.retrieve(
                     user_id=self._request.user_id,
                     query=inquiry.question,
                     limit=self._budget.budget.max_retrieved_memories,

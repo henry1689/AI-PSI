@@ -29,16 +29,20 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from ai_psi.application.artifact_service import ArtifactService
 from ai_psi.application.cognitive_runtime import CognitiveRuntime
 from ai_psi.application.memory_service import MemoryService
-from ai_psi.application.ports import MemoryRepository, UnitOfWorkFactory
+from ai_psi.application.ports import UnitOfWorkFactory
 from ai_psi.application.round_service import CognitiveRoundService
 from ai_psi.config import Settings, get_settings
-from ai_psi.infrastructure.in_memory.memory_store import InMemoryMemoryRepository
 from ai_psi.infrastructure.in_memory.store import InMemoryStore
 from ai_psi.infrastructure.in_memory.unit_of_work import make_in_memory_unit_of_work_factory
 from ai_psi.prompts.registry import PromptRegistry
 from ai_psi.prompts.versions import build_default_registry
 from ai_psi.providers.base import LLMProvider
-from ai_psi.providers.registry import build_provider_with_client, provider_health
+from ai_psi.providers.embeddings import EmbeddingProvider
+from ai_psi.providers.registry import (
+    build_embedding_provider,
+    build_provider_with_client,
+    provider_health,
+)
 
 __all__ = ["Container", "build_container"]
 
@@ -51,7 +55,7 @@ class Container:
         settings: 配置。
         prompts: Prompt 注册表。
         provider: LLM Provider。
-        memory: 长期记忆仓储。
+        embeddings: 向量 Provider（长期记忆检索）。
         uow_factory: 工作单元工厂。
         round_service: 回合服务。
         artifact_service: 产物记录服务。
@@ -64,7 +68,7 @@ class Container:
     settings: Settings
     prompts: PromptRegistry
     provider: LLMProvider
-    memory: MemoryRepository
+    embeddings: EmbeddingProvider
     uow_factory: UnitOfWorkFactory
     round_service: CognitiveRoundService
     artifact_service: ArtifactService
@@ -107,7 +111,7 @@ def build_container(settings: Settings | None = None) -> Container:
     # 每次调用新建客户端会丢掉连接池，也会让超时配置失去统一入口。
     http_client = httpx.AsyncClient()
     provider = build_provider_with_client(resolved, http_client)
-    memory = InMemoryMemoryRepository()
+    embeddings = build_embedding_provider(resolved, http_client)
 
     engine: AsyncEngine | None = None
     uow_factory: UnitOfWorkFactory
@@ -117,19 +121,21 @@ def build_container(settings: Settings | None = None) -> Container:
         from ai_psi.infrastructure.db.session import create_session_factory
         from ai_psi.infrastructure.db.unit_of_work import make_unit_of_work_factory
 
-        uow_factory = make_unit_of_work_factory(create_session_factory(engine))
+        uow_factory = make_unit_of_work_factory(create_session_factory(engine), embeddings)
     else:
         store = InMemoryStore()
-        uow_factory = make_in_memory_unit_of_work_factory(store)
+        uow_factory = make_in_memory_unit_of_work_factory(store, embeddings)
 
     round_service = CognitiveRoundService(uow_factory)
     artifact_service = ArtifactService(uow_factory)
-    memory_service = MemoryService(uow_factory, memory)
+    # 🔴 一个容器一个 MemoryService：它同时被 API 路由与认知运行时使用，
+    # 两个实例会各自持有一份写入策略，策略一旦被局部替换就会分家。
+    memory_service = MemoryService(uow_factory, embeddings)
     runtime = CognitiveRuntime(
         uow_factory=uow_factory,
         provider=provider,
         prompts=prompts,
-        memory=memory,
+        memory_service=memory_service,
         settings=resolved,
         round_service=round_service,
         artifacts=artifact_service,
@@ -139,7 +145,7 @@ def build_container(settings: Settings | None = None) -> Container:
         settings=resolved,
         prompts=prompts,
         provider=provider,
-        memory=memory,
+        embeddings=embeddings,
         uow_factory=uow_factory,
         round_service=round_service,
         artifact_service=artifact_service,

@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-from typing import Final
+from typing import Final, cast
 
 import httpx
 from pydantic import SecretStr
@@ -25,6 +25,12 @@ from pydantic import SecretStr
 from ai_psi.config import Settings
 from ai_psi.domain.exceptions import ConfigurationError
 from ai_psi.providers.base import LLMProvider
+from ai_psi.providers.embeddings import (
+    AVAILABLE_EMBEDDING_PROVIDERS,
+    EmbeddingProvider,
+    LocalHashingEmbedding,
+    OpenAICompatibleEmbedding,
+)
 from ai_psi.providers.mock import MockProvider
 from ai_psi.providers.openai_compatible import (
     DEFAULT_REASONING_HEADROOM,
@@ -34,9 +40,11 @@ from ai_psi.providers.resilience import ResilientProvider
 from ai_psi.reliability.circuit_breaker import CircuitBreaker
 
 __all__ = [
+    "AVAILABLE_EMBEDDING_PROVIDERS",
     "AVAILABLE_PROVIDERS",
     "DEFAULT_MODELS",
     "NOT_IMPLEMENTED_PROVIDERS",
+    "build_embedding_provider",
     "build_provider_with_client",
     "resolve_model",
 ]
@@ -185,6 +193,64 @@ def _resolve_base_url(settings: Settings, name: str) -> str:
     if name == "openai_compatible" and settings.openai_base_url:
         return settings.openai_base_url
     return DEFAULT_BASE_URLS[name]
+
+
+def build_embedding_provider(
+    settings: Settings,
+    client: httpx.AsyncClient,
+) -> EmbeddingProvider:
+    """按配置构造向量 Provider（阶段 5）。
+
+    🔴 **不套熔断。** 熔断保护的是"供应商不稳定时不要反复打"，
+    而向量 Provider 的失败会**直接让记忆写入失败**——
+    熔断打开只会让它更快失败，不会让任何一次写入更可能成功。
+    对写入路径而言，"明确失败、用户重试"本来就是想要的语义。
+
+    Args:
+        settings: 运行时配置。
+        client: 共享的 HTTP 客户端。
+
+    Returns:
+        向量 Provider。
+
+    Raises:
+        ConfigurationError: 外部 Provider 的必要配置缺失。
+    """
+    name = settings.embedding_provider.strip().lower()
+    # ⚠️ 这里**不再**重复判断名称是否合法：``Settings`` 的校验器已经用
+    # 同一份 ``AVAILABLE_EMBEDDING_PROVIDERS`` 拦过了。两处各写一份规则，
+    # 除了会各自漂移，还会制造一段**永远执行不到**的分支——
+    # 而"看起来在防、其实不会触发"的检查比没有检查更让人放心得过头。
+    if name == "local":
+        return LocalHashingEmbedding(dimension=settings.embedding_dimension)
+
+    model = settings.embedding_model
+    base_url = settings.embedding_base_url
+    api_key = settings.embedding_api_key
+    missing = [
+        env
+        for env, value in (
+            ("AI_PSI_EMBEDDING_MODEL", model),
+            ("AI_PSI_EMBEDDING_BASE_URL", base_url),
+            ("AI_PSI_EMBEDDING_API_KEY", api_key),
+        )
+        if not value
+    ]
+    if missing:
+        msg = (
+            f"embedding_provider={name!r} 需要配置 {missing}。"
+            "本项目**不会**静默回落到本地向量——那会让检索质量悄悄变成另一个样子，"
+            "而「改错了看不出来」正是记忆系统最不能接受的失效方式"
+        )
+        raise ConfigurationError(msg)
+
+    return OpenAICompatibleEmbedding(
+        client=client,
+        api_key=cast(SecretStr, api_key),
+        base_url=cast(str, base_url),
+        model=cast(str, model),
+        dimension=settings.embedding_dimension,
+    )
 
 
 def provider_health(provider: LLMProvider) -> tuple[str, str]:

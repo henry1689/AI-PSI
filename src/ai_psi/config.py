@@ -20,6 +20,10 @@ from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ai_psi.domain.exceptions import ConfigurationError
+from ai_psi.providers.embeddings import (
+    AVAILABLE_EMBEDDING_PROVIDERS,
+    DEFAULT_EMBEDDING_DIMENSION,
+)
 
 __all__ = ["Environment", "Settings", "get_settings", "reset_settings_cache"]
 
@@ -169,6 +173,35 @@ class Settings(BaseSettings):
     anthropic_api_key: SecretStr | None = None
 
     # ------------------------------------------------------------------
+    # 向量（阶段 5：长期记忆检索）
+    # ------------------------------------------------------------------
+    #: 向量来源：``local`` 或 ``openai_compatible``。
+    #:
+    #: ``local`` 是**确定性词面向量**（不是语义向量，见
+    #: :mod:`ai_psi.providers.embeddings`）：零成本、离线、完全可测。
+    #: ``openai_compatible`` 走外部 ``/embeddings`` 接口。
+    embedding_provider: str = "local"
+
+    #: 向量维度。🔴 **它是数据库列的固定属性**——
+    #: 改这里必须同时改迁移，否则装配时会明确失败。
+    embedding_dimension: int = Field(default=DEFAULT_EMBEDDING_DIMENSION, gt=0)
+
+    #: 外部向量模型名（``embedding_provider=openai_compatible`` 时必填）。
+    embedding_model: str | None = None
+
+    #: 外部向量服务的基础地址（``.../v1``）。
+    embedding_base_url: str | None = None
+
+    #: 外部向量服务的密钥。
+    #:
+    #: ⚠️ 刻意**不复用** ``openai_api_key``：向量与对话可以是两家不同的服务，
+    #: 让一个密钥字段同时代表两件事，会在"只想换向量服务"时被迫改掉对话的密钥。
+    embedding_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AI_PSI_EMBEDDING_API_KEY", "EMBEDDING_API_KEY"),
+    )
+
+    # ------------------------------------------------------------------
     # 校验
     # ------------------------------------------------------------------
     @field_validator("log_level")
@@ -188,6 +221,18 @@ class Settings(BaseSettings):
         normalized = value.strip().lower()
         if normalized not in allowed:
             msg = f"storage_backend 必须是 {sorted(allowed)} 之一，收到 {value!r}"
+            raise ValueError(msg)
+        return normalized
+
+    @field_validator("embedding_provider")
+    @classmethod
+    def _validate_embedding_provider(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in AVAILABLE_EMBEDDING_PROVIDERS:
+            msg = (
+                f"embedding_provider 必须是 {sorted(AVAILABLE_EMBEDDING_PROVIDERS)} 之一，"
+                f"收到 {value!r}"
+            )
             raise ValueError(msg)
         return normalized
 
@@ -269,6 +314,11 @@ class Settings(BaseSettings):
             "anthropic_api_key": "***" if self.anthropic_api_key else None,
             "openai_api_key": "***" if self.openai_api_key else None,
             "openai_base_url": self.openai_base_url,
+            "embedding_provider": self.embedding_provider,
+            "embedding_dimension": self.embedding_dimension,
+            "embedding_model": self.embedding_model,
+            "embedding_base_url": self.embedding_base_url,
+            "embedding_api_key": "***" if self.embedding_api_key else None,
         }
 
 

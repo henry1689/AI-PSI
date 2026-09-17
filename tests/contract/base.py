@@ -373,6 +373,62 @@ class UnitOfWorkContract:
         async with uow_factory() as uow:
             assert await uow.rounds.get(round_.id) is None
 
+    async def test_uncommitted_memory_writes_are_discarded(self, uow_factory) -> None:
+        """🔴 记忆也必须在工作单元内（阶段 5 引入）。
+
+        阶段 3 时记忆不在工作单元里，"取代旧记忆 + 写入新记忆 + 记录事件"
+        跨在三个事务上；这条断言钉住的是修复之后的语义。
+        """
+        memory = _memory()
+        async with uow_factory() as uow:
+            await uow.memories.add(memory)
+            # 不调用 commit()
+
+        async with uow_factory() as uow:
+            assert await uow.memories.get(memory.id) is None
+
+    async def test_committed_memory_persists_with_its_index(self, uow_factory) -> None:
+        """🔴 提交后**本体与向量索引都要在**。
+
+        只提交本体、索引没跟上，会让一条刚刚写好的记忆立刻检索不到——
+        而它既没有报错，也没有任何地方能看出索引缺了一行。
+        """
+        user = uuid4()
+        memory = _memory(user_id=user, content="用户偏好简洁回答")
+        async with uow_factory() as uow:
+            await uow.memories.add(memory)
+            await uow.commit()
+
+        async with uow_factory() as uow:
+            assert await uow.memories.get(memory.id) is not None
+            found = await uow.memories.retrieve(user_id=user, query="简洁回答", limit=5)
+            assert [item.id for item in found] == [memory.id]
+
+    async def test_memory_deletion_propagates_to_the_index(self, uow_factory) -> None:
+        """🔴 不变量 15 的**直接证据**：索引里真的没有它了。
+
+        ``retrieve`` 返回空可以有很多原因（相似度、limit、状态过滤），
+        而这条断言问的是索引本身——"删了还检索得到"必须是不可能的，
+        不能只是"查询恰好没查到"。
+        """
+        user = uuid4()
+        memory = _memory(user_id=user)
+        async with uow_factory() as uow:
+            await uow.memories.add(memory)
+            await uow.commit()
+
+        async with uow_factory() as uow:
+            assert memory.id in await uow.memories.indexed_ids()
+            await uow.memories.delete(memory.id)
+            await uow.commit()
+
+        async with uow_factory() as uow:
+            assert memory.id not in await uow.memories.indexed_ids()
+            # 本体保留（逻辑删除），索引移除——两者生命周期不同
+            stored = await uow.memories.get(memory.id)
+            assert stored is not None
+            assert stored.status is MemoryStatus.DELETED
+
     async def test_sequence_does_not_rewind_after_rollback(self, uow_factory) -> None:
         """🔴 回滚后序号**跳过而不是回退**。
 

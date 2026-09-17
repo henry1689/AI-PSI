@@ -729,6 +729,11 @@ class EventType(StrEnum):
     MEMORY_REJECTED = "memory.rejected"
     MEMORY_EXPIRED = "memory.expired"
     MEMORY_CORRECTED = "memory.corrected"
+    #: 阶段 5 新增。导出同样是**数据访问**，必须有痕迹——
+    #: 任务书 §17.1 要求"所有导出和删除操作留存不含正文的审计事件"。
+    #: 与删除不同：删除是让内容消失，导出是把内容交出去，
+    #: 两者都改变不了"曾经发生过"这个事实。
+    MEMORY_EXPORTED = "memory.exported"
 
     # 经验与提案
     EXPERIENCE_CREATED = "experience.created"

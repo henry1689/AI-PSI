@@ -32,8 +32,7 @@
 | **2** | 数据库、事件存储、认知状态机 | ✅ 完成 | 2026-09-17 |
 | **3** | Mock LLM 与认知流水线（场景 A–J） | ✅ 完成 | 2026-09-18 |
 | **4** | 真实 LLM Provider（DeepSeek） | ✅ 完成 | 2026-09-18 |
-| 4 | 真实 LLM Provider | ⬜ 未开始 | — |
-| 5 | 长期记忆（pgvector） | ⬜ 未开始 | — |
+| **5** | 长期记忆（PostgreSQL + pgvector） | ✅ 完成 | 2026-09-18 |
 | 6 | 反馈、经验与改进提案 | ⬜ 未开始 | — |
 | 7 | 评测与回放 | ⬜ 未开始 | — |
 | 8 | 完整验收与交付 | ⬜ 未开始 | — |
@@ -279,23 +278,64 @@ Event Store、状态机（接仓储）、幂等支持、集成测试。
 ⚠️ **推理 token 占输出的大头。** 后续项：提示词没有约束输出规模
 （`logical_analyzer` 要求八项检查却不限长度），瘦身需评测支撑，列为阶段 7。
 
-### 阶段 5：长期记忆
+### 阶段 5：长期记忆 ✅
 
-**交付**：Memory Repository（PostgreSQL + pgvector）、冲突/过期/取代、
-用户纠正、删除与导出、用户隔离测试。
-**本阶段创建**：`memory/` 的其余模块与 `SqlAlchemyMemoryRepository`。
+**交付**：Memory Repository（PostgreSQL + pgvector）、向量 Provider、
+WritePolicy（阶段 3 已交付）、冲突/过期/取代、用户纠正、删除与导出、用户隔离测试。
+**新增依赖**：`pgvector`（Python 包，仅提供 SQLAlchemy 的 `Vector` 类型）。
+**本阶段创建**：`providers/embeddings.py`、
+`memory/{retrieval,ranking,conflict_detection,lifecycle,redaction}.py`、
+`infrastructure/db/memory_repository.py`、`api/routes/memories.py`。
 
-⚠️ **阶段 3 已经交付的部分**：`memory/write_policy.py`（写入策略）
-与 `MemoryRepository` Port 及其内存实现（ADR-0009、ADR-0015）。
-阶段 5 需要闭合的已知边界：
+**验收条件与结果**（任务书 §18 阶段 5）：
 
-* 记忆仓储接入 PostgreSQL（建表 + pgvector），并**接入契约测试**
-  （`tests/integration/test_contract_postgres.py` 里已留好占位类）；
-* 把记忆仓储纳入 `UnitOfWork`，让"取代 + 写入 + 记录事件"成为跨表原子操作；
-* 语义级重复检测（当前的反刍信号是词面相似度，见 `risks.md` R32）。
+| 验收条件 | 结果 |
+|---|---|
+| 用户 A 无法检索用户 B 的私有记忆 | ✅ 过滤写在 SQL 的 `WHERE` 里，取回之后**不再过滤**；结果逐条过 `assert_memory_retrievable_by` 防御性断言 |
+| superseded 记忆不默认生效 | ✅ 状态过滤在 SQL；**索引行被物理删除** |
+| 删除后不再出现在向量结果中 | ✅ 不是"查询恰好带了过滤"，而是索引表里那一行真的没了——可直接查表断言 |
+| pgvector 检索 | ✅ 512 维向量 + HNSW 余弦索引，真实数据库上验证 |
 
-**验收**：用户 A 无法检索用户 B 的私有记忆；superseded 记忆不默认生效；
-删除后不再出现在向量结果中。
+**交付清单**：
+
+| 模块 | 内容 |
+|---|---|
+| `providers/embeddings.py` | `EmbeddingProvider` 协议 + 本地确定性实现（默认）+ OpenAI 兼容实现 |
+| `infrastructure/db/models.py` | `memories` 与 `memory_embeddings` 两张表（含 HNSW 索引与 12 条 CHECK） |
+| `infrastructure/db/memory_repository.py` | `SqlAlchemyMemoryRepository`：向量索引维护是仓储的职责 |
+| `memory/retrieval.py` | 相似度、召回规模、零向量判定、词面重合度（两实现共用） |
+| `memory/ranking.py` | 综合排序：相关度 + 时效；冲突不降权；同分有确定兜底 |
+| `memory/conflict_detection.py` | 重复（**确定**判据）与疑似冲突（**线索**） |
+| `memory/lifecycle.py` | 过期判定与保留策略说明 |
+| `memory/redaction.py` | 审计脱敏（不含正文）与导出（含正文） |
+| `application/memory_service.py` | 一个事务内完成写入/纠正/删除 + 审计；导出与用户数据删除；`reindex` |
+| `api/routes/memories.py` | §12.3 的五条路由 |
+
+**实测验收结果**：
+
+| 检查 | 结果 |
+|---|---|
+| `make lint` | ✅ 0 error |
+| `make typecheck` | ✅ mypy strict，**175 个文件** 0 error |
+| `make test` | ✅ **1156 passed, 5 skipped** |
+| `make policy` | ✅ 总体 **96%**；`domain/`+`cognition/` **98%** |
+| 契约测试 | ✅ 记忆仓储的内存实现与 PostgreSQL 实现跑**同一组断言**（阶段 3 预留的占位类直接启用，断言一行未改） |
+| 真实数据库 | ✅ 向量维度、HNSW 索引、删除传播、外键级联、`IS NOT DISTINCT FROM` 空值语义均在真实 PostgreSQL 上验证 |
+
+**本阶段闭合的既有债务**：
+
+* **ADR-0015 §5**：记忆写入与事件写入不在同一事务 → 记忆仓储挂进
+  `UnitOfWork`，`TestAtomicity` 用"一写事件就失败"的存储作为直接证据。
+
+**本阶段明确不做的事**（均登记于 ADR-0017 §7）：
+
+* `GET /users/{user_id}/beliefs`（信念不是记忆，需要另建判断投影）；
+* `RetentionPolicy.SESSION` 的会话级失效（V0.1 没有"会话"这一等对象）；
+* 语义级反刍阈值重标定（需要评测数据，阶段 7）；
+* 后台过期扫描（读时判定 + 显式调用，避免时序不确定）。
+
+⚠️ **V0.1 没有认证层**（risks.md R40）：作用域过滤防的是"代码写错导致的
+串号"，不是"恶意调用者"。这条边界写在路由的模块文档里。
 
 ### 阶段 6：反馈、经验与改进提案
 
@@ -370,6 +410,6 @@ Markdown/JSON 报告、Baseline 对照接口。
 | `make` 本机安装 | ✅ 已解决 | `winget install ezwinports.make`（GNU Make 4.4.1），需重启终端生效 |
 | 本机无法直连 Docker Hub | ✅ 已解决 | compose 支持 `AI_PSI_PG_IMAGE` 覆盖；本地 `.env` 指向镜像源 |
 | ruff 会格式化 Markdown 代码块 | ✅ 已解决 | `pyproject.toml` 排除 `**/*.md`（ADR-0007） |
-| 记忆写入与事件写入不在同一事务 | ⚠️ 阶段 3 已知边界 | 用"先做可能失败的操作、后写事件"压小风险；阶段 5 纳入 `UnitOfWork` 后闭合（ADR-0015 §5） |
+| 记忆写入与事件写入不在同一事务 | ✅ 阶段 5 已闭合 | 记忆仓储纳入 `UnitOfWork`，四步同事务；`TestAtomicity` 为直接证据（ADR-0017 §3） |
 | 反刍检测是**词面**相似度 | ⚠️ 阶段 3 已知局限 | 只捕捉逐字重复；改写过的同一论点不触发。语义级检测待阶段 5 的向量检索（`risks.md` R32） |
 | 任务书 20 项内部冲突 | ✅ 已处理 | 4 项实质矛盾见 ADR-0006/0009/0010/0012，16 项缺口默认值见 ADR-0008/0012 |

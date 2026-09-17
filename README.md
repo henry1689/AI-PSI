@@ -72,7 +72,7 @@ V0.1 要验证的不是"回答看起来多深刻"，而是下面五件事在代�
 | 阶段 2 | 数据库、事件存储、认知状态机 | ✅ 已完成 |
 | 阶段 3 | Mock LLM 与认知流水线（场景 A–J） | ✅ 已完成 |
 | 阶段 4 | 真实 LLM Provider（DeepSeek） | ✅ 已完成 |
-| 阶段 5 | 长期记忆（pgvector） | ⬜ 未开始 |
+| 阶段 5 | 长期记忆（PostgreSQL + pgvector） | ✅ 已完成 |
 | 阶段 6 | 反馈、经验与改进提案 | ⬜ 未开始 |
 | 阶段 7 | 评测与回放 | ⬜ 未开始 |
 | 阶段 8 | 完整验收与交付 | ⬜ 未开始 |
@@ -80,19 +80,20 @@ V0.1 要验证的不是"回答看起来多深刻"，而是下面五件事在代�
 > 大型自主编码任务最常见的失败，不是写得慢，而是接口尚未稳定就盖到第八层。
 > 因此本项目**严格按阶段推进，每个阶段结束时仓库都处于可运行状态**。
 
-### 当前质量指标（阶段 4 实测）
+### 当前质量指标（阶段 5 实测）
 
 | 检查 | 结果 |
 |---|---|
 | `make lint`（ruff） | 0 error |
-| `make typecheck`（mypy strict，164 个文件） | 0 error |
-| `make test` | **968 passed, 16 skipped**（单元 + 属性 + 契约 + 场景 + API + 集成） |
-| 测试覆盖率 | 总体 **95%**；`domain/` 与 `cognition/` **98%**（门槛 85% / 75%） |
-| 契约测试 | 事件存储 / 回合仓储 / 幂等键：同一组断言跑**内存与 PostgreSQL 两个实现** |
+| `make typecheck`（mypy strict，176 个文件） | 0 error |
+| `make test` | **1156 passed, 5 skipped**（单元 + 属性 + 契约 + 场景 + API + 集成） |
+| 测试覆盖率 | 总体 **96%**；`domain/` 与 `cognition/` **98%**（门槛 85% / 75%） |
+| 契约测试 | 事件存储 / 回合仓储 / 幂等键 / **长期记忆**：同一组断言跑**内存与 PostgreSQL 两个实现** |
 | 场景 A–J | **全部通过**（任务书 §15.4） |
 | **真实模型端到端** | ✅ `make test-live`：**5 passed**（真实 DeepSeek；D0/D2/D4 三类回合全部跑通） |
+| **向量检索** | ✅ 512 维 + HNSW 余弦索引，在**真实 PostgreSQL** 上验证维度、索引、删除传播、空值语义 |
 | 预算 | **无超预算回合**：调用前扣减 + 可选模块跳过 + 强制尾部保留 |
-| 数据库迁移 | `alembic upgrade head` 通过；10 条 CHECK 约束（含不变量 19/20 的 DB 级强制） |
+| 数据库迁移 | `alembic upgrade head` 通过；22 条 CHECK 约束（含不变量 19/20 与记忆自我引用的 DB 级强制） |
 | 开发数据库 | PostgreSQL 16.15 + pgvector 0.8.6 |
 
 > **零依赖与真实模型两条路都通。**
@@ -163,7 +164,7 @@ make test-live        # 需要 AI_PSI_DEEPSEEK_API_KEY 已配置
 # 零外部依赖：内存存储 + Mock Provider
 AI_PSI_STORAGE_BACKEND=memory uv run python -m ai_psi.main
 
-# 或用真实数据库存事件与回合（记忆仍走内存，见下方说明）
+# 或用真实数据库存事件、回合与记忆
 docker compose up -d && uv run alembic upgrade head
 uv run python -m ai_psi.main
 
@@ -176,9 +177,27 @@ curl -s localhost:8000/api/v1/cognitive-rounds/<round_id>/summary | jq
 curl -s -X POST localhost:8000/api/v1/replay/cognitive-rounds/<round_id> | jq
 ```
 
-⚠️ `AI_PSI_STORAGE_BACKEND=postgres` 时**记忆仍走内存实现**——
-记忆表要到阶段 5 才建。这个混合是刻意的：它让认知闭环可以在真实数据库上验证，
-同时不会假装记忆已经持久化（ADR-0015 §5）。
+⚠️ **向量（embedding）默认走本地确定性实现，它不是语义向量。**
+
+它用字符 n-gram 的哈希把文本映射到固定维度，余弦相似度因此近似于
+**词面重合度**：`喜欢简洁` 与 `讨厌啰嗦` 在这个空间里几乎正交。
+它让 pgvector 的全部机制（固定维度、HNSW 索引、删除传播、版本兼容）
+在没有外部服务的情况下就能跑通并被测试钉死。
+
+需要真语义检索时换成外部服务——检索路径一行都不用动：
+
+```bash
+AI_PSI_EMBEDDING_PROVIDER=openai_compatible
+AI_PSI_EMBEDDING_MODEL=text-embedding-3-small
+AI_PSI_EMBEDDING_BASE_URL=https://your-endpoint/v1
+AI_PSI_EMBEDDING_API_KEY=...
+```
+
+🔴 **换向量 Provider 之后必须重建索引**（`MemoryService.reindex`）：
+检索只比对同版本的向量，旧向量会立刻全部失效——**旧记忆一条都检索不到**，
+而且不会报任何错（ADR-0017 §7、risks.md R43）。
+
+🔴 **`AI_PSI_EMBEDDING_DIMENSION` 是数据库列的固定属性**，改它必须同时改迁移。
 
 ### 启动开发数据库
 
@@ -219,7 +238,7 @@ ai-psi/
 │   ├── prompts/             契约、版本、Schema、模板、结构化输入的编解码
 │   ├── providers/           协议、Mock、网关、解析修复、HTTP 错误映射、熔断装饰器、OpenAI 兼容实现
 │   ├── reliability/         预算记账、反刍信号、置信度上限、熔断状态机
-│   ├── memory/              记忆写入策略（默认拒绝）
+│   ├── memory/              写入策略 / 检索 / 排序 / 冲突检测 / 生命周期 / 脱敏
 │   ├── application/         应用服务（唯一允许发起写入的层）+ 全部 Port
 │   ├── infrastructure/      PostgreSQL、内存适配器、事件存储、日志
 │   └── api/                 FastAPI 路由、Schema、错误处理、依赖注入
@@ -236,7 +255,7 @@ ai-psi/
 ```
 
 > **只创建有实际内容的包。** `learning/`、`reliability/` 的其余部分、
-> `memory/` 的检索与冲突检测在各自阶段引入，不预留空壳
+> 每个包只在本阶段有实体内容时才创建，不预留空壳（ADR-0012）
 > （`docs/adr/0012-v0-1-scope-boundaries.md`）。
 
 ### 分层与依赖方向

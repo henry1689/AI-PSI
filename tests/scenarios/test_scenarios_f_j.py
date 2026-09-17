@@ -5,11 +5,13 @@
 
 from __future__ import annotations
 
+from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
 
 from ai_psi.application.memory_service import MemoryService
+from ai_psi.application.ports import UnitOfWorkFactory
 from ai_psi.domain.cognitive_rounds import CognitiveBudget
 from ai_psi.domain.enums import (
     CognitiveDepth,
@@ -28,8 +30,8 @@ from ai_psi.domain.improvement_proposals import (
     ImprovementProposal,
 )
 from ai_psi.domain.memories import Memory
-from ai_psi.infrastructure.in_memory.memory_store import InMemoryMemoryRepository
 from ai_psi.memory.write_policy import MemoryWriteProposal, WriteDecision, WritePolicy
+from ai_psi.providers.embeddings import EmbeddingProvider
 from ai_psi.providers.mock import MockFault
 from tests.scenarios.conftest import (
     Harness,
@@ -59,7 +61,7 @@ async def test_scenario_f_user_corrects_long_term_memory(harness: Harness) -> No
     * 后续回答采用新偏好。
     """
     user_id = uuid4()
-    service = MemoryService(harness.uow_factory, harness.memory)
+    service = harness.memory_service
 
     # 先写入旧偏好（用户当初明确确认过 → 策略批准）
     old = await service.propose(
@@ -440,15 +442,19 @@ async def test_budget_guard_skips_optional_modules(harness_factory) -> None:
 # ---------------------------------------------------------------------------
 
 
-class RecordingMemory(InMemoryMemoryRepository):
-    """记录每次检索所用作用域的记忆仓储。
+class RecordingMemoryService(MemoryService):
+    """记录每次检索所用作用域的记忆服务。
 
     用它来断言"运行时确实按发起用户的作用域检索"，
     而不是只看检索结果——后者在数据恰好不重叠时也会通过。
+
+    ⚠️ 探针挂在**服务**上而不是仓储上：阶段 5 起记忆仓储属于工作单元，
+    它的生命周期是一次事务（``uow.memories``），没法在运行时构造之前
+    先建好一个"被记录的仓储实例"。服务则始终只有一个，是天然的接缝。
     """
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, uow_factory: UnitOfWorkFactory, embeddings: EmbeddingProvider) -> None:
+        super().__init__(uow_factory, embeddings)
         self.scopes: list[UUID | None] = []
 
     async def retrieve(self, *, user_id: UUID | None, query: str, limit: int) -> list[Memory]:
@@ -469,12 +475,8 @@ async def test_scenario_j_cross_user_isolation(harness_factory) -> None:
     content_a = "用户 A 的私人偏好：周末喜欢独自爬山"
     content_b = "用户 B 的私人偏好：周末喜欢独自看电影"
 
-    memory = RecordingMemory()
-    await memory.add(_active_memory(user_a, content_a))
-    await memory.add(_active_memory(user_b, content_b))
-
     harness: Harness = harness_factory(
-        memory=memory,
+        memory_service_factory=RecordingMemoryService,
         responses={
             "inquiry_framer": [
                 inquiry_response(
@@ -492,18 +494,24 @@ async def test_scenario_j_cross_user_isolation(harness_factory) -> None:
         },
     )
 
+    recorder = cast(RecordingMemoryService, harness.memory_service)
+    await harness.seed_memory(_active_memory(user_a, content_a))
+    await harness.seed_memory(_active_memory(user_b, content_b))
+
     outcome = await harness.run("周末适合做什么？", user_id=user_a)
     assert outcome.state is RoundState.COMPLETED
 
     # 🔴 检索只以发起用户为作用域
-    assert memory.scopes
-    assert set(memory.scopes) == {user_a}
-    assert user_b not in memory.scopes
+    assert recorder.scopes
+    assert set(recorder.scopes) == {user_a}
+    assert user_b not in recorder.scopes
 
     # 检索结果不含另一用户的记忆
-    assert [item.id for item in await memory.retrieve(user_id=user_a, query="周末", limit=10)] == [
-        m.id for m in await memory.list_for_user(user_id=user_a)
-    ]
+    retrieved = {
+        item.id for item in await recorder.retrieve(user_id=user_a, query="周末", limit=10)
+    }
+    listed = {item.id for item in await recorder.list_for_user(user_id=user_a)}
+    assert retrieved == listed
 
     # 另一用户的内容没有出现在本回合的任何产物或事件里
     assert outcome.response_text is not None

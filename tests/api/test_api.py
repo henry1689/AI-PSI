@@ -280,10 +280,30 @@ class TestOpenApiContract:
         assert f"{API_PREFIX}/replay/cognitive-rounds/{{round_id}}" in paths
         assert f"{API_PREFIX}/health/live" in paths
 
-    async def test_stage5_and_6_routes_are_absent(self, client: httpx.AsyncClient) -> None:
-        """🔴 不建空壳：阶段 5/6 的接口现在**不该存在**（ADR-0012）。"""
+    async def test_stage5_routes_are_registered(self, client: httpx.AsyncClient) -> None:
+        """阶段 5 交付的记忆接口（任务书 §12.3）。"""
         schema = (await client.get("/openapi.json")).json()
         paths = set(schema["paths"])
-        assert not any("memories" in path for path in paths)
+        assert f"{API_PREFIX}/users/{{user_id}}/memories" in paths
+        assert f"{API_PREFIX}/memories/{{memory_id}}/correct" in paths
+        assert f"{API_PREFIX}/memories/{{memory_id}}" in paths
+        assert f"{API_PREFIX}/users/{{user_id}}/export" in paths
+        assert f"{API_PREFIX}/users/{{user_id}}/data" in paths
+
+    async def test_stage6_routes_are_absent(self, client: httpx.AsyncClient) -> None:
+        """🔴 不建空壳：阶段 6 的接口现在**不该存在**（ADR-0012）。"""
+        schema = (await client.get("/openapi.json")).json()
+        paths = set(schema["paths"])
         assert not any("improvement-proposals" in path for path in paths)
         assert not any("feedback" in path for path in paths)
+
+    async def test_beliefs_route_is_not_shipped_in_stage5(self, client: httpx.AsyncClient) -> None:
+        """``GET /users/{user_id}/beliefs``（§12.3 第一条）**本阶段不做**。
+
+        信念只活在事件流里，不是记忆；列出它需要另建一套判断投影，
+        那是另一件事。这条断言让"暂缓"成为一个**可见的决定**，
+        而不是一次遗漏——否则它只会在阶段 8 验收时以
+        "任务书里列了但没实现"的形式重新出现（ADR-0017）。
+        """
+        schema = (await client.get("/openapi.json")).json()
+        assert not any("beliefs" in path for path in set(schema["paths"]))

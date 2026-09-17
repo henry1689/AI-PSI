@@ -43,6 +43,7 @@ from ai_psi.infrastructure.asyncio_compat import (
 )
 from ai_psi.infrastructure.db.session import create_session_factory
 from ai_psi.infrastructure.db.unit_of_work import make_unit_of_work_factory
+from ai_psi.providers.embeddings import LocalHashingEmbedding
 
 # 🔴 除了下面的 hook，还要在导入时设置一次全局策略。
 # 原因：hook 只对**异步测试**生效；当**同步测试**请求异步夹具
@@ -50,8 +51,13 @@ from ai_psi.infrastructure.db.unit_of_work import make_unit_of_work_factory
 # 创建循环的路径，那条路径读的是全局策略。两条路都要覆盖。
 install_selector_loop_policy()
 
-#: 清库时按依赖倒序处理（目前无外键，顺序仅作防御）
-_TABLES = ("events", "cognitive_rounds", "idempotency_keys")
+#: 清库时按依赖倒序处理。
+#:
+#: ⚠️ 阶段 5 起 ``memory_embeddings`` 有指向 ``memories`` 的外键，
+#: 顺序不再是"仅作防御"：先清被引用的一方会直接违反外键约束。
+#: （``TRUNCATE ... CASCADE`` 会自动带上引用它的表，
+#: 但显式列出更清楚，也避免依赖 CASCADE 的隐式行为。）
+_TABLES = ("events", "cognitive_rounds", "idempotency_keys", "memory_embeddings", "memories")
 
 
 def pytest_asyncio_loop_factories(
@@ -168,6 +174,20 @@ def session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
 
 
 @pytest.fixture
-async def uow_factory(engine: AsyncEngine, clean_tables: None) -> UnitOfWorkFactory:
+def embeddings() -> LocalHashingEmbedding:
+    """向量 Provider。
+
+    用**本地确定性实现**：契约测试跑的是存储语义，不是检索质量。
+    它对随机性与网络零依赖，因此断言不会因为供应商状态而间歇失败。
+    """
+    return LocalHashingEmbedding()
+
+
+@pytest.fixture
+async def uow_factory(
+    engine: AsyncEngine,
+    clean_tables: None,
+    embeddings: LocalHashingEmbedding,
+) -> UnitOfWorkFactory:
     """工作单元工厂（每个用例前清库）。"""
-    return make_unit_of_work_factory(create_session_factory(engine))
+    return make_unit_of_work_factory(create_session_factory(engine), embeddings)

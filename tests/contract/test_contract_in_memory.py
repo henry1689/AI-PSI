@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import pytest
 
-from ai_psi.infrastructure.in_memory.memory_store import InMemoryMemoryRepository
 from ai_psi.infrastructure.in_memory.store import InMemoryStore
 from ai_psi.infrastructure.in_memory.unit_of_work import make_in_memory_unit_of_work_factory
+from ai_psi.providers.embeddings import LocalHashingEmbedding
 from tests.contract.base import (
     EventStoreContract,
     IdempotencyContract,
@@ -25,7 +25,7 @@ pytestmark = pytest.mark.unit
 @pytest.fixture
 def uow_factory():
     """每次用例一块全新的内存存储。"""
-    return make_in_memory_unit_of_work_factory(InMemoryStore())
+    return make_in_memory_unit_of_work_factory(InMemoryStore(), LocalHashingEmbedding())
 
 
 @pytest.fixture
@@ -47,8 +47,14 @@ async def idempotency_store(uow_factory):
 
 
 @pytest.fixture
-def memory_repository() -> InMemoryMemoryRepository:
-    return InMemoryMemoryRepository()
+async def memory_repository(uow_factory):
+    """记忆仓储同样**挂在工作单元上**（阶段 5 起）。
+
+    形状与 ``event_store`` / ``round_repository`` 完全一致，这不是巧合：
+    三个仓储的事务边界本来就该由同一个工作单元决定。
+    """
+    async with uow_factory() as uow:
+        yield uow.memories
 
 
 class TestInMemoryEventStore(EventStoreContract):

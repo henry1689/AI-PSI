@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import httpx
 import pytest
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 from ai_psi.config import Settings
 from ai_psi.domain.exceptions import ConfigurationError, StructuredOutputError
+from ai_psi.providers.embeddings import LocalHashingEmbedding, OpenAICompatibleEmbedding
 from ai_psi.providers.mock import MockProvider
 from ai_psi.providers.openai_compatible import OpenAICompatibleProvider
 from ai_psi.providers.parsing import (
@@ -24,6 +25,7 @@ from ai_psi.providers.registry import (
     AVAILABLE_PROVIDERS,
     DEFAULT_MODELS,
     NOT_IMPLEMENTED_PROVIDERS,
+    build_embedding_provider,
     build_provider_with_client,
     provider_health,
     resolve_model,
@@ -280,3 +282,86 @@ class TestReasoningHeadroomPlumbing:
             llm_reasoning_headroom_tokens=0,
         )
         assert self._headroom_of(settings) == 0
+
+
+class TestEmbeddingProviderFactory:
+    """向量 Provider 的装配（阶段 5）。
+
+    🔴 **配置缺失时不得静默回落。** 向量 Provider 决定了记忆能不能被检索到，
+    而"用错了向量空间"不会报任何错——它只会让记忆安静地查不出来。
+    一个悄悄降级到本地向量的默认值，会把这类事故变成"看起来正常"。
+    """
+
+    def test_local_is_the_default(self) -> None:
+        provider = build_embedding_provider(_settings(), _client())
+        assert isinstance(provider, LocalHashingEmbedding)
+        assert provider.name == "local_hashing"
+
+    def test_local_honours_the_configured_dimension(self) -> None:
+        provider = build_embedding_provider(_settings(embedding_dimension=64), _client())
+        assert provider.dimension == 64
+
+    def test_unknown_provider_is_rejected_at_configuration_time(self) -> None:
+        """🔴 名称在**构造配置时就**被拒，而不是等到装配。
+
+        越早失败越好：配置错误在启动时暴露，是一条启动日志；
+        拖到第一次记忆写入时暴露，是一次运行到一半的失败。
+        判断依据与装配共用同一份 ``AVAILABLE_EMBEDDING_PROVIDERS``——
+        两处各写一份名单，迟早会各自漂移，而且会制造一段
+        永远执行不到的分支（"看起来在防、其实不触发"）。
+        """
+        from ai_psi.providers.embeddings import AVAILABLE_EMBEDDING_PROVIDERS
+
+        with pytest.raises(ValidationError, match="embedding_provider"):
+            _settings(embedding_provider="some-vendor")
+        assert "local" in AVAILABLE_EMBEDDING_PROVIDERS
+
+    @pytest.mark.parametrize(
+        "missing",
+        ["embedding_model", "embedding_base_url", "embedding_api_key"],
+    )
+    def test_missing_external_configuration_fails_loudly(self, missing: str) -> None:
+        payload: dict[str, object] = {
+            "embedding_provider": "openai_compatible",
+            "embedding_model": "text-embedding-3-small",
+            "embedding_base_url": "https://embeddings.example/v1",
+            "embedding_api_key": SecretStr("sk-test"),
+        }
+        payload[missing] = None
+        with pytest.raises(ConfigurationError) as excinfo:
+            build_embedding_provider(_settings(**payload), _client())
+        assert str(excinfo.value).count("AI_PSI_EMBEDDING") >= 1
+        assert "不会" in str(excinfo.value)
+
+    def test_external_provider_is_built_from_configuration(self) -> None:
+        provider = build_embedding_provider(
+            _settings(
+                embedding_provider="openai_compatible",
+                embedding_model="text-embedding-3-small",
+                embedding_base_url="https://embeddings.example/v1",
+                embedding_api_key=SecretStr("sk-test"),
+                embedding_dimension=8,
+            ),
+            _client(),
+        )
+        assert isinstance(provider, OpenAICompatibleEmbedding)
+        assert provider.dimension == 8
+        assert provider.model == "text-embedding-3-small"
+
+    def test_embedding_provider_is_not_wrapped_in_a_circuit_breaker(self) -> None:
+        """🔴 向量调用**不套熔断**。
+
+        熔断保护的是"供应商不稳定时不要反复打"，而向量失败会直接让
+        记忆写入失败。熔断打开只会让它更快失败，不会让任何一次写入
+        更可能成功——对写入路径而言，"明确失败、用户重试"本来就是想要的语义。
+        """
+        provider = build_embedding_provider(
+            _settings(
+                embedding_provider="openai_compatible",
+                embedding_model="m",
+                embedding_base_url="https://embeddings.example/v1",
+                embedding_api_key=SecretStr("k"),
+            ),
+            _client(),
+        )
+        assert not isinstance(provider, ResilientProvider)
