@@ -60,9 +60,22 @@ class CognitiveBudget(BaseModel):
 
 
 #: ADR-0008 的深度预算表。修改此表必须同步修改 ADR-0008。
+#:
+#: 🔴 ``max_model_calls`` 在阶段 3 **按实测的模块成本重新标定**过。
+#: 阶段 1 写下的 3/5/8/11/12 是**估算**；阶段 3 实现模块矩阵后逐档核算：
+#:
+#:   D0 标称 4（关切 + 框定 + 判断 + 渲染），无元认知循环
+#:   D1 标称 6（+ 逻辑 + 元认知）
+#:   D2 标称 8（+ 假设 + 因果），另留 2 次供一次额外循环（判断 + 元认知）
+#:   D3 标称 10（+ 概念 + 辩证），另留 2
+#:   D4 标称 11（+ 哲理），另留 2
+#:
+#: 标称值必须与 :data:`ai_psi.cognition.depth_router.NOMINAL_MODEL_CALLS_BY_DEPTH`
+#: 以及 :data:`ai_psi.cognition.orchestrator.MODULE_MATRIX` 一致，
+#: 由 ``tests/unit/test_orchestrator.py`` 断言三者不漂移。
 _BUDGET_BY_DEPTH: dict[CognitiveDepth, dict[str, int]] = {
     CognitiveDepth.D0: {
-        "max_model_calls": 3,
+        "max_model_calls": 4,
         "max_metacognitive_loops": 0,
         "max_hypotheses": 1,
         "max_retrieved_memories": 5,
@@ -70,7 +83,7 @@ _BUDGET_BY_DEPTH: dict[CognitiveDepth, dict[str, int]] = {
         "max_duration_seconds": 15,
     },
     CognitiveDepth.D1: {
-        "max_model_calls": 5,
+        "max_model_calls": 6,
         "max_metacognitive_loops": 1,
         "max_hypotheses": 2,
         "max_retrieved_memories": 10,
@@ -78,7 +91,7 @@ _BUDGET_BY_DEPTH: dict[CognitiveDepth, dict[str, int]] = {
         "max_duration_seconds": 30,
     },
     CognitiveDepth.D2: {
-        "max_model_calls": 8,
+        "max_model_calls": 10,
         "max_metacognitive_loops": 2,
         "max_hypotheses": 4,
         "max_retrieved_memories": 15,
@@ -86,7 +99,7 @@ _BUDGET_BY_DEPTH: dict[CognitiveDepth, dict[str, int]] = {
         "max_duration_seconds": 60,
     },
     CognitiveDepth.D3: {
-        "max_model_calls": 11,
+        "max_model_calls": 12,
         "max_metacognitive_loops": 2,
         "max_hypotheses": 4,
         "max_retrieved_memories": 20,
@@ -94,7 +107,7 @@ _BUDGET_BY_DEPTH: dict[CognitiveDepth, dict[str, int]] = {
         "max_duration_seconds": 90,
     },
     CognitiveDepth.D4: {
-        "max_model_calls": 12,
+        "max_model_calls": 13,
         "max_metacognitive_loops": 2,
         "max_hypotheses": 4,
         "max_retrieved_memories": 20,

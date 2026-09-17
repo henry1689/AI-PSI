@@ -30,7 +30,7 @@
 | **0** | 架构与文档 | ✅ 完成 | 2026-09-17 |
 | **1** | 项目骨架与领域对象 | ✅ 完成 | 2026-09-17 |
 | **2** | 数据库、事件存储、认知状态机 | ✅ 完成 | 2026-09-17 |
-| 3 | Mock LLM 与认知流水线 | ⬜ 未开始 | — |
+| **3** | Mock LLM 与认知流水线（场景 A–J） | ✅ 完成 | 2026-09-18 |
 | 4 | 真实 LLM Provider | ⬜ 未开始 | — |
 | 5 | 长期记忆（pgvector） | ⬜ 未开始 | — |
 | 6 | 反馈、经验与改进提案 | ⬜ 未开始 | — |
@@ -132,15 +132,82 @@ Event Store、状态机（接仓储）、幂等支持、集成测试。
 3. **生成的迁移缺少 `postgresql` 导入** —— 用了 `postgresql.JSONB` 却没 import，
    会在 `alembic upgrade head` 时 NameError。已在模板中修好，避免后续迁移重犯。
 
-### 阶段 3：Mock LLM 与认知流水线
+### 阶段 3：Mock LLM 与认知流水线 ✅
 
 **交付**：Provider Protocol、Mock Provider、Prompt Registry、
-关切/框定/深度/认知分类/假设/判断、元认知停止、Response Planner/Renderer、
-完整场景集成测试。
-**本阶段创建**：`application/`、`providers/`、`prompts/`、`api/`、`main.py`；
-并从 ADR-0009 落地**内存适配器**以支撑场景 F/J。
+关切/框定/深度/认知状态/假设/判断/元认知/回答规划与渲染、
+完整场景 A–J 集成测试、API 路由。
+**本阶段创建**：`providers/`、`prompts/`、`reliability/`、`memory/`、`api/`、
+`main.py`、`application/cognitive_runtime.py`；并落地 ADR-0009 的**内存适配器**。
+**新增依赖**：`fastapi`、`uvicorn`。
 
-**验收**：不使用外部 API 也能完整运行；场景 A–J 全部通过；循环永不超预算。
+**验收条件与结果**：
+
+| 任务书 §18 验收条件 | 结果 |
+|---|---|
+| 不使用外部 API 也能完整运行 | ✅ 默认 `Mock` Provider + 内存适配器，`storage_backend=memory` 下零外部依赖跑通全流程 |
+| **场景 A～J 全部通过** | ✅ 16 个场景用例全绿（含每个场景的多条结构断言） |
+| 循环永不超预算 | ✅ 预算在**调用之前**扣减；可选模块不足则跳过并记录；强制模块始终保留额度 |
+
+**交付清单**：
+
+| 模块 | 内容 |
+|---|---|
+| `providers/base.py` | `LLMProvider` Protocol、`LLMMessage`、`ModelConfig`、`InvocationContext` |
+| `providers/mock.py` | 确定性规则引擎 + 脚本化响应 + 故障注入 |
+| `providers/gateway.py` | 预算记账、有限重试、超时映射、**只记录响应哈希**的调用审计 |
+| `providers/registry.py` | 按配置装配 Provider；未实现的名称显式报错 |
+| `prompts/payload.py` | 结构化输入的编码与提取；**反引号转义**阻断提示词注入 |
+| `prompts/registry.py` | 契约校验（版本 / changelog / 模板结构 / 占位符白名单）、渲染、长度上限 |
+| `prompts/versions.py` + 11 个模板 | 11 个 Prompt 任务的契约与模板 |
+| `cognition/depth_router.py` | 确定性深度路由 + 预算降级 |
+| `cognition/orchestrator.py` | 模块矩阵（纯函数）；与预算表、标称调用数三者不许漂移 |
+| `cognition/context_builder.py` | 上下文选择；冲突与失效材料**不参与裁剪** |
+| `cognition/epistemic_analyzer.py` | 八类认知状态分类（确定性） |
+| `cognition/{concern_detector,inquiry_framer,hypothesis_generator,logical_analyzer,causal_analyzer,concept_analyzer,dialectical_analyzer,philosophical_analyzer,judgment_synthesizer,metacognition,response_renderer}.py` | 11 个模型调用模块 |
+| `cognition/hypothesis_evaluator.py`、`response_planner.py` | 确定性模块（评估、回答规划） |
+| `reliability/{budgets,repetition_detector,confidence}.py` | 预算记账、反刍信号、置信度上限 |
+| `memory/write_policy.py` | 四档写入裁决，默认拒绝 |
+| `infrastructure/in_memory/` | 事件存储 / 回合仓储 / 幂等键 / 记忆的内存实现 |
+| `application/{cognitive_runtime,artifact_service,memory_service}.py` | 回合执行器、产物记录、记忆读写 |
+| `application/ports.py` | 新增 `MemoryRepository` Port |
+| `cognition/projection.py` | 新增 `project_artifacts()`（只读审计视图） |
+| `api/` + `main.py` | §12.1 与 §12.5 的路由、错误处理、依赖装配 |
+
+**实测验收结果**：
+
+| 检查 | 结果 |
+|---|---|
+| `make lint` | ✅ 0 error |
+| `make typecheck` | ✅ mypy strict，**142 个文件** 0 error |
+| `make test` | ✅ **869 passed, 11 skipped** |
+| `make policy` | ✅ 总体 **95%**；`domain/`+`cognition/` **98%** |
+| 契约测试 | ✅ 同一组断言跑内存与 PostgreSQL **两个实现** |
+| 场景 A–J | ✅ 全部通过 |
+
+**测试期间发现并修复的真实缺陷**：
+
+1. **🔴 状态机不允许 `DELIBERATING → SYNTHESIZING` 直达。**
+   元认知被跳过（D0 或预算不足）时，回合会撞上一个非法转移。
+   修法不是加一条边，而是让**规则层元认知复核**始终执行——
+   它不花钱，并且照样留下"为什么停下来"的记录。
+2. **🔴 分析模块的模型调用没有地方记录。** 逻辑/因果/辩证/哲理四个模块
+   的产出被塞进判断负载，它们的 `model` 与 `prompt_version` **无处可查**，
+   直接违反不变量 18。新增事件类型 `cognition.analysis.completed`（ADR-0015 §3.2）。
+3. **🔴 四种终态事件从未被发出。** 任务书 §5.2 列出了
+   `cognitive_round.completed/failed/suspended/cancelled`，
+   阶段 2 却把它们统一写成了 `state_changed`——是一份死的词汇表。
+4. **契约测试抓到两处 PostgreSQL 实现与契约不符**：
+   事件存储把 `IntegrityError` 泄漏给调用方（应为 `ConflictError`）；
+   幂等键 `bind` 在 key 未占位时静默成功（此后每次重试都会得到
+   `CONFLICT` 而不是 `REPLAY`，根因却无处记录）。
+   **这两处都不是阶段 3 引入的**——它们一直存在，只是在有第二个实现之前无从对照。
+5. **`Settings` 的六个 `budget_max_*` 字段是死配置**（无任何读取方），已删除。
+   死配置比没有配置更糟：它看起来可调，却不会有任何作用。
+
+**与阶段 0 文档的偏差**（详见 ADR-0015）：13 个 Prompt 任务 → 11 个
+（`response_planner` 改为确定性代码）；预算表按实测重标定；
+`epistemic_analyzer` 与 `hypothesis_evaluator` 改为确定性模块。
 
 ### 阶段 4：真实 LLM Provider
 
@@ -152,9 +219,18 @@ Event Store、状态机（接仓储）、幂等支持、集成测试。
 
 ### 阶段 5：长期记忆
 
-**交付**：Memory Repository（PostgreSQL + pgvector）、WritePolicy、
-冲突/过期/取代、用户纠正、删除与导出、用户隔离测试。
-**本阶段创建**：`memory/`。
+**交付**：Memory Repository（PostgreSQL + pgvector）、冲突/过期/取代、
+用户纠正、删除与导出、用户隔离测试。
+**本阶段创建**：`memory/` 的其余模块与 `SqlAlchemyMemoryRepository`。
+
+⚠️ **阶段 3 已经交付的部分**：`memory/write_policy.py`（写入策略）
+与 `MemoryRepository` Port 及其内存实现（ADR-0009、ADR-0015）。
+阶段 5 需要闭合的已知边界：
+
+* 记忆仓储接入 PostgreSQL（建表 + pgvector），并**接入契约测试**
+  （`tests/integration/test_contract_postgres.py` 里已留好占位类）；
+* 把记忆仓储纳入 `UnitOfWork`，让"取代 + 写入 + 记录事件"成为跨表原子操作；
+* 语义级重复检测（当前的反刍信号是词面相似度，见 `risks.md` R32）。
 
 **验收**：用户 A 无法检索用户 B 的私有记忆；superseded 记忆不默认生效；
 删除后不再出现在向量结果中。
@@ -220,4 +296,6 @@ Markdown/JSON 报告、Baseline 对照接口。
 | `make` 本机安装 | ✅ 已解决 | `winget install ezwinports.make`（GNU Make 4.4.1），需重启终端生效 |
 | 本机无法直连 Docker Hub | ✅ 已解决 | compose 支持 `AI_PSI_PG_IMAGE` 覆盖；本地 `.env` 指向镜像源 |
 | ruff 会格式化 Markdown 代码块 | ✅ 已解决 | `pyproject.toml` 排除 `**/*.md`（ADR-0007） |
+| 记忆写入与事件写入不在同一事务 | ⚠️ 阶段 3 已知边界 | 用"先做可能失败的操作、后写事件"压小风险；阶段 5 纳入 `UnitOfWork` 后闭合（ADR-0015 §5） |
+| 反刍检测是**词面**相似度 | ⚠️ 阶段 3 已知局限 | 只捕捉逐字重复；改写过的同一论点不触发。语义级检测待阶段 5 的向量检索（`risks.md` R32） |
 | 任务书 20 项内部冲突 | ✅ 已处理 | 4 项实质矛盾见 ADR-0006/0009/0010/0012，16 项缺口默认值见 ADR-0008/0012 |

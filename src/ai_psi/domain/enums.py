@@ -676,15 +676,19 @@ class RoundState(StrEnum):
 
 
 class EventType(StrEnum):
-    """事件类型全集，共 32 种。
+    """事件类型全集，共 33 种。
 
     事件只追加，永不修改、永不删除（ADR-0002）。
 
-    ⚠️ 任务书 §5.2 的清单实际列出 **31 条**，其中
-    ``cognitive_round.cancelled`` **缺失**——但 §6.1 的状态机里
-    存在 ``CANCELLED`` 状态。若不为取消补事件类型，
-    取消一个回合将不留下任何审计轨迹，直接违反"重要对象保留变更事件"。
-    故补齐此条并登记于 ADR-0012。
+    ⚠️ **任务书 §5.2 的清单与状态机、模块清单并不一致，已补两条：**
+
+    * ``cognitive_round.cancelled``（ADR-0012）：任务书清单里没有，
+      但 §6.1 的状态机存在 ``CANCELLED`` 状态。缺了它，
+      取消一个回合将不留下任何审计轨迹。
+    * ``cognition.analysis.completed``（ADR-0015）：任务书 §9 描述了
+      逻辑/因果/辩证/哲理四个分析模块，§5.2 的清单里却没有任何一条
+      事件与之对应。缺了它，这些模块的模型调用就**没有地方记录**
+      ``model`` 与 ``prompt_version``——直接违反不变量 18。
 
     ``tests/unit/test_enums.py`` 断言每个终态都有对应的事件类型。
     """
@@ -703,6 +707,8 @@ class EventType(StrEnum):
     ASSUMPTION_IDENTIFIED = "assumption.identified"
     HYPOTHESIS_CREATED = "hypothesis.created"
     HYPOTHESIS_EVALUATED = "hypothesis.evaluated"
+    #: 任务书 §5.2 清单中缺失，为覆盖 §9 的分析模块而补齐（ADR-0015）。
+    COGNITION_ANALYSIS_COMPLETED = "cognition.analysis.completed"
 
     # 信念
     BELIEF_CREATED = "belief.created"

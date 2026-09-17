@@ -47,28 +47,59 @@ class PromptContract(BaseModel):
 
 ---
 
-## 3. 任务清单
+## 3. 任务清单（阶段 3 已实现）
 
-阶段 3 需要实现的 Prompt 任务（任务书 §9）：
+实际注册的任务共 **11 个**：
 
 | `task_name` | 输入 | 输出 | 启用深度 |
 |---|---|---|---|
 | `concern_detector` | 事件 + 会话摘要 + 未完成问题 + 用户目标 + 系统状态 | `list[Concern]` | 全部 |
-| `inquiry_framer` | `Concern` | `Inquiry` | 全部 |
-| `epistemic_analyzer` | 上下文条目 | `list[EpistemicClassification]` | 全部 |
-| `concept_analyzer` | 问题 + 概念 | `list[Concept]` + 歧义 | D2 可选，D3/D4 必跑 |
-| `hypothesis_generator` | `Inquiry` + 证据 | `list[Hypothesis]` | D2+ |
+| `inquiry_framer` | `Concern` | `Inquiry` + 深度信号 | 全部 |
 | `logical_analyzer` | 主张 + 前提 | `LogicalAnalysis` | D1+ |
 | `causal_analyzer` | 因果主张 | `CausalAnalysis` | D2+ |
+| `concept_analyzer` | 问题 + 概念 | `list[Concept]` + 歧义 | D3/D4 |
+| `hypothesis_generator` | `Inquiry` + 证据 | `list[Hypothesis]` | D2+ |
 | `dialectical_analyzer` | 主张 + 反方 | `DialecticalAnalysis` | D3/D4 |
-| `philosophical_analyzer` | 问题 | `PhilosophicalAnalysis` | D4 |
+| `philosophical_analyzer` | 问题 + 事实层未知 | `PhilosophicalAnalysis` | D4 |
 | `judgment_synthesizer` | 假设 + 证据 + 未知 | `Judgment` | 全部 |
-| `metacognition` | 本轮反思指标 | `Reflection` | D1+ |
-| `response_planner` | `Judgment` | `ResponsePlan` | 全部 |
-| `response_renderer` | `ResponsePlan` | **纯文本** | 全部 |
+| `metacognition` | 本轮客观指标 + 判断摘要 | 偏差自检 | D1+ |
+| `response_renderer` | `ResponsePlan` + 判断 | **纯文本** | 全部 |
 
 **注意**：任务书 §4 的模板目录只列了 9 个，而 §9 描述了 13 个分析任务。
 **以 §9 为准**（ADR-0012 已登记此偏差）。
+
+### 3.1 与原始清单的两处差异（ADR-0015）
+
+* **`response_planner` 不再是 Prompt 任务。** 它要决定的六件事
+  （直接回答什么、哪些不确定性要告诉用户、是否展示替代解释、
+  哪些候选不应表达、是否需要澄清、回答多长）**全部可以从 `Judgment`
+  与 `Reflection` 直接读出**。让模型决定"要不要表现得确定"，
+  等于让被约束方自己执行不变量 7。改由 `cognition/response_planner.py`
+  以确定性代码实现。
+* **`epistemic_analyzer` 不是 Prompt 任务。** §9.4 的八类分类完全可以从
+  材料元数据（信任等级、核验状态、时效性、冲突标记）推出；
+  交给模型重新分类既多花一次调用，又引入出错环节。
+  改由 `cognition/epistemic_analyzer.py` 实现。
+
+同理，`hypothesis_evaluator`（依据证据关系给假设定状态）也是确定性代码。
+
+### 3.2 结构化输入的携带方式
+
+提示词中的结构化输入放在一个**带专用标识的围栏块**里：
+
+    ```ai-psi-input
+    { ... }
+    ```
+
+为什么另起一个标识而不用通用的 `json`：提示词里常有说明性的 JSON 示例，
+用通用标识会让"哪一段是输入"变成猜测。
+
+🔴 **反引号会被转义。** JSON 标准**不转义反引号**，
+因此一条包含三连反引号的用户消息原本可以直接截断数据块，
+把后续文字变成"指令"。编码时把 `` ` `` 换成 ``\\u0060``
+（JSON 中还原为反引号本身）之后，用户内容**不可能**拼出一个闭合标记。
+
+完整的攻击复现见 `tests/unit/test_prompt_registry.py::TestPayloadEncoding`。
 
 ---
 

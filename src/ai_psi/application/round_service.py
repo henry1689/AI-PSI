@@ -197,6 +197,8 @@ class CognitiveRoundService:
         error_category: ErrorType | None = None,
         model_calls_used: int | None = None,
         metacognitive_loops: int | None = None,
+        budget: CognitiveBudget | None = None,
+        depth_level: CognitiveDepth | None = None,
     ) -> RoundTransitionResult:
         """把回合推进到新状态。
 
@@ -210,6 +212,11 @@ class CognitiveRoundService:
             error_category: 错误类别。``FAILED`` 时**必填**（不变量 20）。
             model_calls_used: 覆盖已消耗的模型调用数。
             metacognitive_loops: 覆盖已执行的元认知循环轮数。
+            budget: 覆盖回合预算。深度路由在 ``FRAMING`` 阶段才最终定级，
+                此时把预算从初始上限**下调**到该深度的真实预算。
+                若已消耗的调用数超过新预算，模型校验器会拒绝这次转移——
+                宁可保留较宽的预算，也不能出现"预算比已花费还小"的回合。
+            depth_level: 覆盖认知深度（深度路由的最终结果）。
 
         Returns:
             转移结果。
@@ -244,6 +251,10 @@ class CognitiveRoundService:
                 changes["model_calls_used"] = model_calls_used
             if metacognitive_loops is not None:
                 changes["metacognitive_loops"] = metacognitive_loops
+            if budget is not None:
+                changes["budget"] = budget
+            if depth_level is not None:
+                changes["depth_level"] = depth_level
             if to_state.is_terminal:
                 changes["completed_at"] = utc_now()
 
@@ -267,11 +278,46 @@ class CognitiveRoundService:
                     "budget_snapshot": {
                         "model_calls_used": updated.model_calls_used,
                         "metacognitive_loops": updated.metacognitive_loops,
+                        "max_model_calls": updated.budget.max_model_calls,
+                        "max_metacognitive_loops": updated.budget.max_metacognitive_loops,
+                        "depth_level": updated.depth_level.value,
                     },
                 },
             )
 
             await uow.events.append(event)
+
+            # 🔴 终态额外写一条**具名**事件。
+            #
+            # 只有 state_changed 的话，"找出所有失败的回合"就必须解析
+            # 每条事件的负载才知道它到没到终态；而任务书 §5.2 明确列出了
+            # cognitive_round.failed / completed / suspended / cancelled
+            # 四种事件，它们在阶段 2 里从未被发出过——是**死的词汇表**。
+            #
+            # 两条事件在同一个事务里写入，因此不会出现"状态变了但没有终态事件"。
+            terminal_type = _TERMINAL_EVENT_TYPES.get(to_state)
+            if terminal_type is not None:
+                await uow.events.append(
+                    _build_event(
+                        event_type=terminal_type,
+                        round_=updated,
+                        actor_id=actor_id,
+                        causation_id=event.id,
+                        payload={
+                            "from_state": current.state.value,
+                            "to_state": to_state.value,
+                            "reason": reason,
+                            "stop_reason": updated.stop_reason,
+                            "failure_stage": updated.failure_stage,
+                            "error_category": (
+                                updated.error_category.value
+                                if updated.error_category is not None
+                                else None
+                            ),
+                        },
+                    )
+                )
+
             await uow.rounds.save(updated, expected_version=current.version)
             await uow.commit()
 
@@ -360,6 +406,19 @@ class CognitiveRoundService:
         return await self.transition(
             round_id, RoundState.CANCELLED, reason=reason, actor_id=actor_id
         )
+
+
+#: 终态到**具名**终态事件的映射。
+#:
+#: 任务书 §5.2 列出了这四种事件；阶段 2 把全部转移统一写成
+#: ``cognitive_round.state_changed``，于是这四种类型从未被发出。
+#: 阶段 3 的失败路径测试暴露了这个缺口（ADR-0015）。
+_TERMINAL_EVENT_TYPES: dict[RoundState, EventType] = {
+    RoundState.COMPLETED: EventType.COGNITIVE_ROUND_COMPLETED,
+    RoundState.FAILED: EventType.COGNITIVE_ROUND_FAILED,
+    RoundState.SUSPENDED: EventType.COGNITIVE_ROUND_SUSPENDED,
+    RoundState.CANCELLED: EventType.COGNITIVE_ROUND_CANCELLED,
+}
 
 
 def _build_event(

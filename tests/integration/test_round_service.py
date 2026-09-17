@@ -63,7 +63,8 @@ class TestCreateRound:
 
     async def test_budget_defaults_from_depth(self, service: CognitiveRoundService) -> None:
         result = await service.start_round(depth_level=CognitiveDepth.D4)
-        assert result.round.budget.max_model_calls == 12
+        # 13 是阶段 3 按真实模块成本重新标定后的值（ADR-0008 已修订）
+        assert result.round.budget.max_model_calls == 13
 
     async def test_explicit_budget_wins(self, service: CognitiveRoundService) -> None:
         from ai_psi.domain.cognitive_rounds import CognitiveBudget
@@ -230,10 +231,14 @@ class TestInvariant19And20TerminalDiagnostics:
         async with uow_factory() as uow:
             events = await uow.events.read_stream(cognitive_round_id=started.round.id)
 
+        # 🔴 终态会额外写一条**具名**事件（阶段 3 补齐，见 ADR-0015）：
+        # 只有 state_changed 的话，"找出所有失败回合"必须解析每条负载。
+        # 关键是：先前的事件一条都没少，也没有被改写。
         assert [e.event_type for e in events] == [
             EventType.COGNITIVE_ROUND_STARTED,
             EventType.COGNITIVE_ROUND_STATE_CHANGED,
             EventType.COGNITIVE_ROUND_STATE_CHANGED,
+            EventType.COGNITIVE_ROUND_FAILED,
         ]
 
 

@@ -20,12 +20,14 @@ from uuid import UUID
 
 from ai_psi.domain.cognitive_rounds import CognitiveRound
 from ai_psi.domain.events import Event
+from ai_psi.domain.memories import Memory
 
 __all__ = [
     "EventStore",
     "IdempotencyOutcome",
     "IdempotencyReservation",
     "IdempotencyStore",
+    "MemoryRepository",
     "RoundRepository",
     "UnitOfWork",
     "UnitOfWorkFactory",
@@ -254,6 +256,92 @@ class UnitOfWork(Protocol):
 
     async def rollback(self) -> None:
         """回滚事务。"""
+        ...
+
+
+# ---------------------------------------------------------------------------
+# 长期记忆
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class MemoryRepository(Protocol):
+    """长期记忆仓储（任务书 §10，ADR-0009）。
+
+    🔴 **本 Port 在阶段 3 定型，阶段 5 才会换上 PostgreSQL + pgvector 实现。**
+    接口形状直接依据任务书 §10 的记忆操作清单设计，不自创语义——
+    Port 设计不当会让阶段 5 的替换波及场景测试（risks.md R12）。
+
+    两条语义契约，**任何实现都必须满足**，并由同一组契约测试固定：
+
+    1. :meth:`retrieve` 必须强制 ``user_id`` 作用域，且**不得**返回
+       非默认可检索状态（``SUPERSEDED`` / ``EXPIRED`` / ``DELETED`` 等）的记忆；
+    2. :meth:`delete` 必须**同时**作用于主表与检索索引——
+       "删了但还检索得到"是本系统最不能接受的失效模式（不变量 15）。
+    """
+
+    async def add(self, memory: Memory) -> None:
+        """写入一条记忆。
+
+        Raises:
+            ConflictError: 主键已存在。
+        """
+        ...
+
+    async def get(self, memory_id: UUID) -> Memory | None:
+        """按 id 读取；不存在返回 ``None``。"""
+        ...
+
+    async def save(self, memory: Memory, *, expected_version: int) -> None:
+        """带乐观锁的更新。
+
+        Raises:
+            OptimisticLockError: 版本不匹配。
+        """
+        ...
+
+    async def retrieve(
+        self,
+        *,
+        user_id: UUID | None,
+        query: str,
+        limit: int,
+    ) -> list[Memory]:
+        """按作用域检索默认有效的记忆。
+
+        🔴 ``user_id`` **没有默认值**：调用方必须显式写出作用域。
+        一个可以省略的作用域参数，迟早在某条调用路径上被省略。
+
+        Args:
+            user_id: 检索发起者。``None`` 表示系统级记忆作用域。
+            query: 检索文本（阶段 3 用词面匹配，阶段 5 用向量）。
+            limit: 返回条数上限。
+
+        Returns:
+            按相关度降序排列的记忆，**不超过 ``limit`` 条**。
+
+        Raises:
+            ScopeViolationError: 若返回结果会包含其他用户的记忆。
+        """
+        ...
+
+    async def list_for_user(
+        self,
+        *,
+        user_id: UUID,
+        include_inactive: bool = False,
+    ) -> list[Memory]:
+        """列出某用户的记忆。
+
+        Args:
+            user_id: 目标用户。
+            include_inactive: 是否包含已被取代/删除的记忆。
+                用户查看"为什么被纠正"时需要它为 ``True``（任务书 §10.4）。
+        """
+        ...
+
+    async def delete(self, memory_id: UUID) -> None:
+        """删除一条记忆，**并同步作用于检索索引**（不变量 15）。"""
         ...
 
 

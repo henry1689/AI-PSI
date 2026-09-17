@@ -97,9 +97,14 @@ class TestBudgetByDepth:
         assert calls[0] < calls[-1]
 
     def test_d4_matches_task_book_defaults(self) -> None:
-        """D4 应当是任务书 §13.1 给出的默认值上限。"""
+        """D4 的上限与任务书 §13.1 的默认值对齐。
+
+        ⚠️ ``max_model_calls`` 在阶段 3 **按实测的模块成本重新标定**为 13：
+        D4 的标称模块数是 11，另留 2 次供一次额外认知循环（ADR-0008 修订）。
+        §13.1 明确允许"按 D0～D4 配置不同预算"，因此这不构成偏差。
+        """
         b = CognitiveBudget.for_depth(CognitiveDepth.D4)
-        assert b.max_model_calls == 12
+        assert b.max_model_calls == 13
         assert b.max_metacognitive_loops == 2
         assert b.max_hypotheses == 4
         assert b.max_retrieved_memories == 20
@@ -111,8 +116,9 @@ class TestBudgetByDepth:
         assert CognitiveBudget.for_depth(CognitiveDepth.D0).max_metacognitive_loops == 0
 
     def test_d0_is_cheap(self) -> None:
+        """D0 是最省的一档：4 次调用（关切 + 框定 + 判断 + 渲染），无元认知。"""
         b = CognitiveBudget.for_depth(CognitiveDepth.D0)
-        assert b.max_model_calls <= 3
+        assert b.max_model_calls == 4
         assert b.max_context_tokens <= 4_000
 
     def test_metacognitive_loops_capped_at_two_for_d2_plus(self) -> None:

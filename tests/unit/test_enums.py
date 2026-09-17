@@ -208,8 +208,14 @@ class TestCognitiveDepth:
 
 
 class TestEventType:
-    def test_thirty_two_members(self) -> None:
-        assert len(EventType) == 32
+    def test_member_count_is_pinned(self) -> None:
+        """条数是**刻意钉死**的：多一条少一条都应当是有意的决定。
+
+        任务书 §5.2 列了 31 条，本系统有 33 条，多出的两条各有原因
+        （``cognitive_round.cancelled`` 见 ADR-0012，
+        ``cognition.analysis.completed`` 见 ADR-0015）。
+        """
+        assert len(EventType) == 33
 
     def test_values_are_dotted_namespaced(self) -> None:
         for event_type in EventType:

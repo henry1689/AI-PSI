@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ai_psi.application.ports import IdempotencyOutcome, IdempotencyReservation
 from ai_psi.domain.cognitive_rounds import CognitiveRound
 from ai_psi.domain.exceptions import ConflictError, NotFoundError, OptimisticLockError
+from ai_psi.infrastructure.db.errors import is_unique_violation
 from ai_psi.infrastructure.db.mappers import round_to_row, round_to_values, row_to_round
 from ai_psi.infrastructure.db.models import CognitiveRoundRow, IdempotencyKeyRow
 
@@ -46,7 +47,7 @@ class SqlAlchemyRoundRepository:
         try:
             await self._session.flush()
         except Exception as exc:
-            if _is_unique_violation(exc):
+            if is_unique_violation(exc):
                 msg = f"认知回合已存在：{round_.id}"
                 raise ConflictError(msg, context={"cognitive_round_id": str(round_.id)}) from exc
             raise
@@ -187,22 +188,23 @@ class SqlAlchemyIdempotencyStore:
     async def bind(self, *, key: str, cognitive_round_id: UUID) -> None:
         """把占位与已创建的回合绑定。
 
-        Args:
-            key: 幂等键。
-            cognitive_round_id: 已创建的回合 id。
+        🔴 **受影响行数为 0 时必须报错，而不是静默成功。**
+
+        绑定一个从未占位的 key 说明调用流程出了问题。静默跳过会让这个
+        幂等键永远处于"已占位但未绑定"的状态——此后每一次重试都会得到
+        ``CONFLICT`` 而不是 ``REPLAY``，用户看到的是"重试永远失败"，
+        而根因（一次错误的调用顺序）却没有任何地方记录。
+
+        Raises:
+            ConflictError: 该 key 从未被占位。
         """
         stmt = (
             update(IdempotencyKeyRow)
             .where(IdempotencyKeyRow.key == key)
             .values(cognitive_round_id=cognitive_round_id)
         )
-        await self._session.execute(stmt)
+        result = cast(CursorResult[Any], await self._session.execute(stmt))
+        if result.rowcount == 0:
+            msg = f"幂等键 {key!r} 尚未占位，无法绑定回合"
+            raise ConflictError(msg, context={"idempotency_key": key})
         await self._session.flush()
-
-
-def _is_unique_violation(exc: Exception) -> bool:
-    """判断异常是否为唯一约束冲突（psycopg 的 SQLSTATE 23505）。"""
-    sqlstate = getattr(exc, "sqlstate", None) or getattr(
-        getattr(exc, "orig", None), "sqlstate", None
-    )
-    return sqlstate == "23505"

@@ -22,8 +22,8 @@ help:
 	@echo "  lint             ruff check + ruff format --check"
 	@echo "  fmt              ruff 自动修复 + 格式化"
 	@echo "  typecheck        mypy --strict"
-	@echo "  test             全部测试（单元 + 属性 + 集成，**需要数据库**）"
-	@echo "  test-unit        只跑单元与属性测试（快，不需要数据库）"
+	@echo "  test             全部测试（单元 + 属性 + 契约 + 场景 + API + 集成，**需要数据库**）"
+	@echo "  test-unit        单元/属性/契约/场景/API（快，不需要数据库）"
 	@echo "  test-integration 只跑集成测试（需要数据库）"
 	@echo "  policy           覆盖率闸门（domain/cognition 85%、总体 75%）"
 	@echo "  check            lint + typecheck + test + policy（提交前跑这个）"
@@ -51,8 +51,10 @@ typecheck:
 test:
 	$(UV) run pytest $(COV)
 
+# 单元 / 属性 / 契约 / 场景 / API —— 全部零外部依赖（ADR-0009）。
+# 集成测试需要 PostgreSQL，因此不在这一组里。
 test-unit:
-	$(UV) run pytest tests/unit tests/property $(COV)
+	$(UV) run pytest tests/unit tests/property tests/contract tests/scenarios tests/api $(COV)
 
 test-integration:
 	$(UV) run pytest tests/integration -m integration

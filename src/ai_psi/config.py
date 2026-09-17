@@ -76,15 +76,29 @@ class Settings(BaseSettings):
         description="集成测试专用数据库连接串；None 表示按开发库名派生",
     )
 
+    # ⚠️ 认知预算**不在这里**。
+    #
+    # 阶段 1 曾在此放了一组 `budget_max_*` 字段，但阶段 3 实现后发现：
+    # 真正生效的是 `CognitiveBudget.for_depth()` 的**按深度预算表**（ADR-0008），
+    # 那组字段没有任何读取方——它们是死配置。
+    #
+    # 死配置比没有配置更糟：它看起来可调，却不会有任何作用。
+    # 因此阶段 3 删除了它们，并在 ADR-0015 中登记。
+
+    #: 存储后端（阶段 3 起）：``postgres`` 或 ``memory``。
+    #:
+    #: ``memory`` 让整套系统在零外部依赖下完整运行（ADR-0009），
+    #: 用于测试与本地演示；``postgres`` 是真实开发环境。
+    storage_backend: str = Field(default="postgres")
+
     # ------------------------------------------------------------------
-    # 认知预算默认值（任务书 §13.1；按深度等级覆盖表见 ADR-0008）
+    # 认知可靠性（阶段 3）
     # ------------------------------------------------------------------
-    budget_max_model_calls: int = Field(default=12, ge=1)
-    budget_max_metacognitive_loops: int = Field(default=2, ge=0)
-    budget_max_hypotheses: int = Field(default=4, ge=1)
-    budget_max_retrieved_memories: int = Field(default=20, ge=0)
-    budget_max_context_tokens: int = Field(default=32_000, ge=1)
-    budget_max_duration_seconds: int = Field(default=120, ge=1)
+    #: 判定"连续两轮判断重复"的相似度阈值（任务书 §13.3）。
+    #:
+    #: 🔴 阈值属于配置而非硬编码——反刍的判定标准会随模型与任务变化，
+    #: 把它钉死在代码里会让调整必须走发版（ADR-0008 的同一思路）。
+    repetition_threshold: float = Field(default=0.85, ge=0.0, le=1.0)
 
     # ------------------------------------------------------------------
     # LLM Provider（阶段 4 才实现真实 Provider，此处仅保留配置位）
@@ -108,6 +122,16 @@ class Settings(BaseSettings):
         normalized = value.upper()
         if normalized not in allowed:
             msg = f"log_level 必须是 {sorted(allowed)} 之一，收到 {value!r}"
+            raise ValueError(msg)
+        return normalized
+
+    @field_validator("storage_backend")
+    @classmethod
+    def _validate_storage_backend(cls, value: str) -> str:
+        allowed = {"postgres", "memory"}
+        normalized = value.strip().lower()
+        if normalized not in allowed:
+            msg = f"storage_backend 必须是 {sorted(allowed)} 之一，收到 {value!r}"
             raise ValueError(msg)
         return normalized
 
@@ -173,6 +197,8 @@ class Settings(BaseSettings):
             "debug": self.debug,
             "log_level": self.log_level,
             "log_include_user_content": self.log_include_user_content,
+            "storage_backend": self.storage_backend,
+            "repetition_threshold": self.repetition_threshold,
             # 连接串本身含密码，只暴露主机/库名的存在性，不暴露内容
             "database_url": "***" if self.database_url else None,
             "llm_provider": self.llm_provider,

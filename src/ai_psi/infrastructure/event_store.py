@@ -14,10 +14,12 @@ from __future__ import annotations
 from uuid import UUID
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_psi.domain.events import Event
 from ai_psi.domain.exceptions import ConflictError
+from ai_psi.infrastructure.db.errors import is_unique_violation
 from ai_psi.infrastructure.db.mappers import apply_event, row_to_event
 from ai_psi.infrastructure.db.models import EventRow
 
@@ -75,7 +77,18 @@ class SqlAlchemyEventStore:
         self._session.add_all(rows)
         # flush 让数据库约束立刻生效——问题在这里暴露，
         # 而不是等到整个事务提交时才以难以定位的形式出现。
-        await self._session.flush()
+        try:
+            await self._session.flush()
+        except IntegrityError as exc:
+            # 🔴 **Port 不允许泄漏基础设施异常。**
+            # 契约说"重复 id 抛 ConflictError"，调用方就按 ConflictError 写
+            # ``except``；把 SQLAlchemy 的 IntegrityError 透出去，
+            # 那些 except 会静默失效，而这正是契约测试要防的漂移。
+            if is_unique_violation(exc):
+                conflicts = sorted(str(i) for i in ids)
+                msg = f"事件 id 已存在，事件只追加不可覆盖：{conflicts}"
+                raise ConflictError(msg, context={"duplicate_ids": conflicts}) from exc
+            raise
 
     async def read_stream(
         self,

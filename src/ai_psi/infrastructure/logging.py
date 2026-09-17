@@ -20,6 +20,7 @@ __all__ = [
     "NEVER_LOGGED_KEYS",
     "SENSITIVE_KEYS",
     "configure_logging",
+    "get_logger",
     "make_redact_processor",
     "redact_processor",
 ]
@@ -242,3 +243,20 @@ def configure_logging(
         logger_factory=structlog.PrintLoggerFactory(sys.stderr),
         cache_logger_on_first_use=True,
     )
+
+
+def get_logger(name: str) -> Any:
+    """返回一个按名字绑定的结构化日志器。
+
+    统一入口的意义在于：**日志器的配置只有一处**。
+    如果各处自行调用 ``structlog.get_logger`` 或标准库 logging，
+    脱敏处理器就可能在某条路径上被绕过——而脱敏一旦被绕过，
+    泄漏的就是密钥或用户正文。
+
+    Args:
+        name: 通常传 ``__name__``。
+
+    Returns:
+        已绑定名字的 structlog 日志器。
+    """
+    return structlog.get_logger(name)

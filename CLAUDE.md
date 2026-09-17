@@ -7,34 +7,44 @@
 **严格按阶段 0→8 走。只做当前 Step，做完停下汇报。绝不一次性写完、不擅自扩大范围。**
 
 - 需求书（22 节）：`docs/AI_PSI_V0_1_TASK_SPEC.md`
-- 恢复状态：`D:\AI文件\personal-assistant\tasks\2026-09\2026-09-17-ai-psi-V0.1-阶段0-1-完成.md`
-- 进度：阶段 0+1 完成（428 测试全绿 / 覆盖率 99%）→ 下轮进阶段 2
-- **本轮边界**：不碰真实 LLM、向量检索、自迭代发布
-- 已定决策不重问（Python 版本、路径、DB 策略、依赖引入时机）
+- 实施计划与进度（**唯一真相来源**）：`docs/implementation_plan.md`
+- 恢复状态：`D:\AI文件\personal-assistant\tasks\2026-09\2026-09-18-ai-psi-V0.1-阶段3完成.md`
+- 进度：**阶段 0/1/2/3 完成**（869 测试 + 11 跳过 / 总体覆盖率 95%）→ 下轮进阶段 4
+- **本轮边界**：不碰真实 LLM（阶段 4）、向量检索（阶段 5）、自迭代发布（阶段 6）
+- 已定决策不重问（Python 版本、路径、DB 策略、预算表见 ADR-0008）
 
 ## 技术栈
 
 - Python **3.13**｜依赖用 **uv** 管理
-- pydantic v2 + pydantic-settings｜psycopg3
+- pydantic v2 + pydantic-settings｜psycopg3｜SQLAlchemy 2（异步）｜Alembic
+- FastAPI + uvicorn（阶段 3 引入）｜structlog
 - PostgreSQL 16 + pgvector（docker compose，端口 **55432**）
-- **尚未引入**：FastAPI · SQLAlchemy · Alembic · structlog（阶段 2/3 才进，现在不预写）
 - 无前端、无 npm、无 K8s
 
-## 命令（本机没装 make，用等价 uv 命令）
+## 命令
 
-- lint：`uv run ruff check .` + `uv run ruff format --check .`
-- 类型：`uv run mypy src tests scripts`（strict）
-- 测试：`uv run pytest --cov=ai_psi --cov-report=term-missing`
-- 起库：`docker compose up -d` ｜ 建库校验：`uv run python scripts/bootstrap_db.py`
-- 提交前全跑：lint + typecheck + test + 覆盖率闸门
+本机已装 GNU Make 4.4.1（winget），直接用 `make`：
+
+- lint：`make lint` ｜ 类型：`make typecheck` ｜ 测试：`make test`
+- 快跑（不需要数据库）：`make test-unit`
+- 提交前全跑：`make check`（lint + typecheck + test + 覆盖率闸门）
+- 起库：`make up` ｜ 迁移：`make migrate` ｜ 建库校验：`make bootstrap`
+- 起服务：`uv run python -m ai_psi.main`
+
+> 若 `make` 不在 PATH（终端启动于安装之前），等价命令见 `Makefile` 顶部注释。
 
 ## 质量闸门
 
 - mypy **strict** 必须过
 - 覆盖率：domain/cognition **≥85%**、总体 **≥75%**，不达标即失败
+- 场景 A–J（`tests/scenarios/`）是阶段 3 的硬性验收条件，**不得为了通过而放宽断言**
+- 存储 Port 的改动必须同时满足 `tests/contract/` 与
+  `tests/integration/test_contract_postgres.py` 里的**同一组**契约断言
 
 ## 禁止
 
 - 禁止提交 `.env`、禁止在代码中写密钥
 - 禁止跳过测试 / mypy 直接进下一阶段
 - 禁止提前引入后续阶段的依赖
+- 禁止为通过检查而删除测试、放宽 Schema 或加 `# type: ignore`；
+  任何豁免必须写进 ADR

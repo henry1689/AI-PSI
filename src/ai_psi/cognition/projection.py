@@ -15,15 +15,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
 from ai_psi.cognition.state_machine import assert_transition
 from ai_psi.domain.enums import ErrorType, EventType, RoundState
-from ai_psi.domain.events import Event
+from ai_psi.domain.events import Event, ModelInvocationInfo
 from ai_psi.domain.exceptions import DomainError
 
-__all__ = ["RoundProjection", "Transition", "project_round"]
+__all__ = [
+    "ArtifactRecord",
+    "ArtifactView",
+    "RoundProjection",
+    "Transition",
+    "project_artifacts",
+    "project_round",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,3 +176,125 @@ def _parse_state(payload: dict[str, Any], key: str, event: Event) -> RoundState:
         raise DomainError(
             msg, context={"event_id": str(event.id), "invalid_value": str(raw)}
         ) from exc
+
+
+# ---------------------------------------------------------------------------
+# 认知产物的投影
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactRecord:
+    """事件流中的一条认知产物记录。
+
+    ``payload`` 保持**原始字典**，不在投影阶段还原成领域对象：
+    投影是只读审计视图，重新构造领域对象既昂贵又在语义上多余
+    （ADR-0006 反对无谓的三层互转）。
+    """
+
+    event_type: EventType
+    occurred_at: datetime
+    actor_id: str
+    payload: dict[str, Any]
+    model_info: ModelInvocationInfo | None
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactView:
+    """一个回合的全部认知产物（按事件顺序）。"""
+
+    cognitive_round_id: UUID
+    records: tuple[ArtifactRecord, ...]
+
+    def of_type(self, *types: EventType) -> tuple[ArtifactRecord, ...]:
+        """按事件类型筛选。
+
+        Args:
+            *types: 目标事件类型。
+
+        Returns:
+            命中的记录，保持事件顺序。
+        """
+        wanted = set(types)
+        return tuple(record for record in self.records if record.event_type in wanted)
+
+    @property
+    def response_text(self) -> str | None:
+        """最后一次渲染出的回答文本。"""
+        rendered = self.of_type(EventType.RESPONSE_GENERATED)
+        if not rendered:
+            return None
+        value = rendered[-1].payload.get("text")
+        return None if value is None else str(value)
+
+    @property
+    def latest_judgment(self) -> dict[str, Any] | None:
+        """最后一次判断的原始负载（可能因认知循环而有多条）。"""
+        judgments = self.of_type(EventType.JUDGMENT_CREATED)
+        if not judgments:
+            return None
+        payload = judgments[-1].payload.get("judgment")
+        return payload if isinstance(payload, dict) else None
+
+    @property
+    def all_judgments(self) -> tuple[dict[str, Any], ...]:
+        """全部判断负载——认知循环会产出多条，保留它们是审计信息。"""
+        return tuple(
+            payload
+            for record in self.of_type(EventType.JUDGMENT_CREATED)
+            if isinstance(payload := record.payload.get("judgment"), dict)
+        )
+
+    @property
+    def latest_reflection(self) -> dict[str, Any] | None:
+        """最后一次元认知反思的原始负载。"""
+        reflections = self.of_type(EventType.METACOGNITION_COMPLETED)
+        if not reflections:
+            return None
+        payload = reflections[-1].payload.get("reflection")
+        return payload if isinstance(payload, dict) else None
+
+    @property
+    def model_invocations(self) -> tuple[ModelInvocationInfo, ...]:
+        """本回合全部模型调用记录（不变量 18 的审计出口）。
+
+        🔴 只包含**元信息**：模型名、Prompt 版本、耗时、响应哈希与重试次数。
+        不含任何响应内容。
+        """
+        return tuple(record.model_info for record in self.records if record.model_info is not None)
+
+
+def project_artifacts(events: list[Event]) -> ArtifactView:
+    """把事件流投影为认知产物视图。
+
+    Args:
+        events: 按 ``sequence`` 升序排列的事件。
+
+    Returns:
+        产物视图。
+
+    Raises:
+        DomainError: 事件流为空或不属于同一回合。
+    """
+    if not events:
+        msg = "事件流为空，无法投影认知产物"
+        raise DomainError(msg)
+
+    round_ids = {event.cognitive_round_id for event in events}
+    if len(round_ids) > 1 or None in round_ids:
+        msg = f"事件流跨越了多个回合或存在无回合事件，无法投影：{sorted(map(str, round_ids))}"
+        raise DomainError(msg)
+
+    return ArtifactView(
+        cognitive_round_id=next(iter(round_ids)),  # type: ignore[arg-type]
+        records=tuple(
+            ArtifactRecord(
+                event_type=event.event_type,
+                occurred_at=event.occurred_at,
+                actor_id=event.actor_id,
+                payload=dict(event.payload),
+                model_info=event.model_info,
+            )
+            for event in events
+        ),
+    )

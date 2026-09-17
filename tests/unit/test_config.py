@@ -36,14 +36,10 @@ class TestDefaults:
         """🔴 任务书 §17.1：日志默认脱敏。"""
         assert settings().log_include_user_content is False
 
-    def test_budget_defaults_match_task_book(self) -> None:
-        s = settings()
-        assert s.budget_max_model_calls == 12
-        assert s.budget_max_metacognitive_loops == 2
-        assert s.budget_max_hypotheses == 4
-        assert s.budget_max_retrieved_memories == 20
-        assert s.budget_max_context_tokens == 32_000
-        assert s.budget_max_duration_seconds == 120
+    def test_repetition_threshold_is_configurable(self) -> None:
+        """反刍判定的阈值属于配置，不硬编码在认知模块里（任务书 §13.3）。"""
+        assert settings().repetition_threshold == 0.85
+        assert settings(repetition_threshold=0.5).repetition_threshold == 0.5
 
     def test_secrets_default_to_none(self) -> None:
         s = settings()
@@ -88,9 +84,9 @@ class TestValidation:
         with pytest.raises(ValidationError):
             settings(database_url="mysql://u@localhost/db")
 
-    def test_budget_must_be_positive(self) -> None:
+    def test_repetition_threshold_must_be_a_ratio(self) -> None:
         with pytest.raises(ValidationError):
-            settings(budget_max_model_calls=0)
+            settings(repetition_threshold=1.5)
 
     def test_timeout_must_be_positive(self) -> None:
         with pytest.raises(ValidationError):
@@ -148,10 +144,12 @@ class TestSecretRedaction:
 
 
 class TestDerivedBudgetConfig:
-    def test_budget_values_are_ints(self) -> None:
-        s = settings()
-        assert isinstance(s.budget_max_model_calls, int)
-        assert isinstance(s.budget_max_context_tokens, int)
+    def test_storage_backend_is_validated(self) -> None:
+        """存储后端只允许两个取值，写错立刻报错而不是静默回落。"""
+        assert settings().storage_backend == "postgres"
+        assert settings(storage_backend="MEMORY").storage_backend == "memory"
+        with pytest.raises(ValidationError):
+            settings(storage_backend="sqlite")
 
     def test_llm_settings_are_carried(self) -> None:
         s = settings(llm_provider="anthropic", llm_model="claude-opus-5", llm_max_retries=3)
