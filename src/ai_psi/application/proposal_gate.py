@@ -47,6 +47,7 @@ from typing import Final, NoReturn
 from uuid import UUID
 
 from ai_psi.application.experience_reader import ExperienceLoad, ExperienceReader
+from ai_psi.domain.common import is_blank
 from ai_psi.domain.enums import ErrorType
 from ai_psi.domain.exceptions import InvalidRequestError
 from ai_psi.domain.improvement_proposals import PROPOSAL_ESCALATION_THRESHOLD
@@ -293,7 +294,7 @@ class ProposalGate:
         Raises:
             InvalidRequestError: 情境签名为空白。
         """
-        if not situation_signature.strip():
+        if is_blank(situation_signature):
             msg = "情境签名不得为空白：门禁无法复核一个没有范围的模式"
             raise InvalidRequestError(msg, context={"error_type": error_type.value})
 

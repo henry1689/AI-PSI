@@ -12,21 +12,74 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Annotated, Any, Self
+from typing import Annotated, Any, Final, Self
 from uuid import UUID, uuid4
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
 __all__ = [
+    "INVISIBLE_CHARACTERS",
     "SCHEMA_VERSION_V1",
     "EntityMetadata",
     "UtcDatetime",
     "UtcDatetimeOptional",
+    "is_blank",
     "utc_now",
 ]
 
 #: 领域对象结构的初始版本号。结构发生不兼容变更时递增。
 SCHEMA_VERSION_V1 = "1.0.0"
+
+#: 会被当作"空白"处理的**不可见格式字符**（Unicode 类别 ``Cf``）。
+#:
+#: 🔴 **``str.strip()`` 不认识它们。**
+#:
+#: ``"​".isspace()`` 是 ``False``——零宽空格在 Unicode 里
+#: 属于格式字符（``Cf``），不属于空白（``White_Space``）。
+#: 于是一个只由零宽字符组成的字符串，长度不为 0、``strip()`` 之后
+#: 也不为空，能一路穿过 ``min_length=1``，被当成一条**有内容的**记录
+#: 落进只追加的事件流。它看起来是空的，占着位置，而且删不掉。
+#:
+#: ⚠️ **这不是"更严格"，是"同一件事的两种写法"。**
+#: 用户按下零宽空格与按下普通空格，表达的意图完全一样：
+#: "我没输入内容"。把它们区别对待，是让用户去猜实现用了哪个判据。
+#:
+#: ⚠️ 刻意**不含**方向控制符（``U+202A``–``U+202E``）与
+#: 变体选择符（``U+FE00``–``U+FE0F``）：前者出现在正文里是
+#: 一种真实（虽然可疑）的表达，后者是 emoji 的一部分。
+#: 把它们一起抹掉会改变**有内容**的输入。
+INVISIBLE_CHARACTERS: Final[frozenset[str]] = frozenset(
+    # ⚠️ 用**码点**而不是字面量：把不可见字符直接写进源码，
+    # 会让这个集合本身变成一段看不见的代码——评审时无从检查，
+    # 编辑时容易连同注释一起被误删。码点写法是可读、可搜索、可核对的。
+    chr(code_point)
+    for code_point in (
+        0x00AD,  # 软连字符 SOFT HYPHEN
+        0x200B,  # 零宽空格 ZERO WIDTH SPACE
+        0x200C,  # 零宽非连接符 ZERO WIDTH NON-JOINER
+        0x200D,  # 零宽连接符 ZERO WIDTH JOINER
+        0x2060,  # 词连接符 WORD JOINER
+        0xFEFF,  # 零宽不换行空格 ZERO WIDTH NO-BREAK SPACE（BOM）
+    )
+)
+
+
+def is_blank(text: str) -> bool:
+    """该文本是否**只说了一件事：什么都没说**。
+
+    🔴 判据是"去掉空白与不可见格式字符之后还剩下什么"，
+    而不是"``len()`` 是不是 0"。
+
+    ``min_length=1`` 挡得住空串，挡不住 ``"\\u200b"``——
+    而后者在事件流里占着一条记录、看起来是空的、且无法被检索命中。
+
+    Args:
+        text: 待判定的文本。
+
+    Returns:
+        去掉 Unicode 空白与 :data:`INVISIBLE_CHARACTERS` 之后为空时返回 ``True``。
+    """
+    return not text.strip("".join(INVISIBLE_CHARACTERS)).strip()
 
 
 def utc_now() -> datetime:

@@ -21,6 +21,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ai_psi.application.feedback_service import MemoryEffect
+from ai_psi.domain.common import is_blank
 from ai_psi.domain.enums import (
     ApprovalLevel,
     CognitiveDepth,
@@ -87,6 +88,54 @@ _STRICT_TRIMMED = ConfigDict(extra="forbid", str_strip_whitespace=True)
 #: 炸成 500——**两个后端对同一个 HTTP 契约给出不同结果**。
 _ACTOR_ID_MAX = 128
 
+#: 会话类自由文本的上限：用户消息、反馈正文、记忆内容。
+#:
+#: 🔴 **没有上限的自由文本不是"宽松"，是一条存储耗尽通道。**
+#: 这些字段会进**只追加**的事件表，而且反馈正文还会进记忆。
+#: 没有上限意味着一个请求就能往一个删不掉的地方写任意多字节。
+#: 定的值远大于任何真实输入（8000 字符约等于一篇长文），
+#: 因此它约束的是滥用，不是用法。
+_FREE_TEXT_MAX = 8_000
+
+#: 短说明类文本的上限：驳回理由、批准说明、单条对照口径。
+_NOTE_MAX = 2_000
+
+#: 列表字段的条目数上限。
+#:
+#: 与长度上限同理：`evidence` 会原样进提案并持久化，
+#: 一个一万项的列表就是一个一万项的提案。
+_LIST_MAX = 50
+
+
+def _reject_if_blank(value: str) -> str:
+    """把"看起来有内容、实际什么都没说"的输入挡在边界上。
+
+    🔴 **``min_length=1`` 挡不住它。**
+
+    ``str_strip_whitespace`` 用的是 ``str.strip()``，而后者不认识
+    零宽空格一类的格式字符（``"\\u200b".isspace()`` 是 ``False``）。
+    于是一个只由零宽字符组成的正文，长度不为 0、strip 之后也不为空，
+    会一路穿到事件流里——它看起来是空的，占着位置，而且删不掉。
+
+    判据统一在 :func:`ai_psi.domain.common.is_blank` 里，
+    服务层与边界用的是**同一个**函数：两处各写一份的话，
+    "什么算空白"会在 HTTP 层与领域层给出不同答案，
+    而两处各自都是自洽的。
+
+    Args:
+        value: 待校验的字符串（已由配置去掉首尾空白）。
+
+    Returns:
+        原值。
+
+    Raises:
+        ValueError: 该文本去掉空白与不可见格式字符后为空。
+    """
+    if is_blank(value):
+        msg = "该字段不能是空白（含零宽字符等不可见格式字符）"
+        raise ValueError(msg)
+    return value
+
 
 # ---------------------------------------------------------------------------
 # 会话与消息（§12.1）
@@ -117,16 +166,29 @@ class ConversationCreatedResponse(BaseModel):
 class SubmitMessageRequest(BaseModel):
     """提交用户消息并启动认知回合。"""
 
-    model_config = _STRICT
+    model_config = _STRICT_TRIMMED
 
     user_id: UUID | None = Field(default=None, description="归属用户")
-    content: str = Field(min_length=1, description="用户消息原文")
+    content: str = Field(
+        min_length=1,
+        max_length=_FREE_TEXT_MAX,
+        description=(
+            "用户消息原文。⚠️ 首尾空白会被去掉，因此「   」是一个 422 "
+            "而不是一个空消息启动的完整认知回合"
+        ),
+    )
     requested_depth: CognitiveDepth | None = Field(
         default=None,
         description="用户显式请求的深度。🔴 仍受预算与规则约束（ADR-0008）",
     )
-    response_style: str = Field(default="structured", min_length=1)
+    response_style: str = Field(default="structured", min_length=1, max_length=_NOTE_MAX)
     allow_long_term_memory: bool = True
+
+    @field_validator("content")
+    @classmethod
+    def _content_must_say_something(cls, value: str) -> str:
+        """🔴 空白消息不该启动一个认知回合——那会白花一次预算。"""
+        return _reject_if_blank(value)
 
 
 class SubmitMessageResponse(BaseModel):
@@ -378,10 +440,18 @@ class MemoryListResponse(BaseModel):
 class CorrectMemoryRequest(BaseModel):
     """用户纠正一条记忆。"""
 
-    model_config = _STRICT
+    model_config = _STRICT_TRIMMED
 
     user_id: UUID = Field(description="发起纠正的用户；必须与记忆的作用域一致")
-    new_content: str = Field(min_length=1, description="新的内容")
+    new_content: str = Field(
+        min_length=1, max_length=_FREE_TEXT_MAX, description="新的内容"
+    )
+
+    @field_validator("new_content")
+    @classmethod
+    def _content_must_say_something(cls, value: str) -> str:
+        """🔴 把一条记忆纠正成"看不见的东西"，等于用纠正把它删了。"""
+        return _reject_if_blank(value)
 
 
 class CorrectMemoryResponse(BaseModel):
@@ -453,10 +523,12 @@ class FeedbackRequest(BaseModel):
     feedback_type: FeedbackType = Field(description="反馈类型")
     content: str = Field(
         min_length=1,
+        max_length=_FREE_TEXT_MAX,
         description=("反馈正文。⚠️ 首尾空白会被去掉，因此「   」是一个 422 而不是一个 500"),
     )
     related_claim: str | None = Field(
         default=None,
+        max_length=_NOTE_MAX,
         description="用户指出的、被纠正的具体说法",
     )
     allow_memory_update: bool = Field(
@@ -467,6 +539,12 @@ class FeedbackRequest(BaseModel):
             "写入仍由记忆写入策略裁决（ADR-0004）"
         ),
     )
+
+    @field_validator("content")
+    @classmethod
+    def _content_must_say_something(cls, value: str) -> str:
+        """🔴 只由不可见字符组成的反馈，是一条**看起来存在的**记录。"""
+        return _reject_if_blank(value)
 
 
 class FeedbackResponse(BaseModel):
@@ -562,13 +640,14 @@ class EvaluateProposalRequest(BaseModel):
     )
     evidence: list[str] = Field(
         min_length=1,
+        max_length=_LIST_MAX,
         description=(
             "对照口径、样本量、参照版本。**不得为空、也不得全是空白**——"
             "「结论：改善」而没说跟什么比、比了多少个样本，"
             "是一条无法被复核、因而也无法被推翻的记录"
         ),
     )
-    notes: str | None = Field(default=None, description="评审说明")
+    notes: str | None = Field(default=None, max_length=_NOTE_MAX, description="评审说明")
     actor_id: str = Field(default="reviewer", min_length=1, max_length=_ACTOR_ID_MAX)
 
     @field_validator("evidence")
@@ -580,9 +659,13 @@ class EvaluateProposalRequest(BaseModel):
         `evidence=["   "]` 会带着一句空白被永久写进事件负载，
         而它正是这个字段要防的那类"无法被复核的记录"。
         """
-        blank = [index for index, item in enumerate(value) if not item.strip()]
+        blank = [index for index, item in enumerate(value) if is_blank(item)]
         if blank:
             msg = f"evidence 的第 {blank} 项是空白——没有对照口径的结论无法被复核"
+            raise ValueError(msg)
+        over = [index for index, item in enumerate(value) if len(item) > _NOTE_MAX]
+        if over:
+            msg = f"evidence 的第 {over} 项超过 {_NOTE_MAX} 字符"
             raise ValueError(msg)
         return value
 
@@ -609,7 +692,7 @@ class ApproveProposalRequest(BaseModel):
     model_config = _STRICT_TRIMMED
 
     approved_by: str = Field(min_length=1, max_length=_ACTOR_ID_MAX, description="批准人标识")
-    note: str | None = Field(default=None, description="批准说明")
+    note: str | None = Field(default=None, max_length=_NOTE_MAX, description="批准说明")
 
 
 class RejectProposalRequest(BaseModel):
@@ -622,6 +705,12 @@ class RejectProposalRequest(BaseModel):
         min_length=1,
         description=(
             "驳回理由。**必填**：「不想做」与「做不了」对后来者是完全不同的信息。"
-            "⚠️ 首尾空白会被去掉，因此「   」是一个 422"
+            "⚠️ 首尾空白与不可见格式字符会被去掉，因此「   」是一个 422"
         ),
     )
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_must_say_something(cls, value: str) -> str:
+        """🔴 一条"看不见理由"的驳回，等于把"不想做"记成了"做不了"。"""
+        return _reject_if_blank(value)

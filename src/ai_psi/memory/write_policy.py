@@ -34,6 +34,7 @@ from ai_psi.cognition.constitution import (
     AUTO_WRITE_MAX_SENSITIVITY,
     FORBIDDEN_MEMORY_CONTENT_CLASSES,
 )
+from ai_psi.domain.common import is_blank
 from ai_psi.domain.enums import MemoryType, SensitivityLevel
 
 __all__ = [
@@ -187,7 +188,12 @@ class WritePolicy:
         Returns:
             裁决结果。
         """
-        if not proposal.content.strip():
+        # 🔴 用 `is_blank` 而不是 `not content.strip()`：后者放行
+        # 只由零宽字符组成的内容（`"​".isspace()` 是 False），
+        # 于是一条"看起来是空的"记忆会落库、占位、且检索不到。
+        # HTTP 边界的校验器用的是同一个函数——两处各写一份的话，
+        # "什么算空白"会在边界与领域层给出不同答案。
+        if is_blank(proposal.content):
             # 🔴 策略放行的东西，下游必须**能构造出一个 Memory**。
             #
             # 空白内容连 `Memory` 都构造不出来（`content` 有 min_length=1），

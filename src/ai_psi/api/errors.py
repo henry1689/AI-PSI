@@ -21,6 +21,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from ai_psi.domain.exceptions import (
@@ -38,8 +39,24 @@ from ai_psi.domain.exceptions import (
     ProviderError,
     ScopeViolationError,
 )
+from ai_psi.infrastructure.security_audit import record_rejected_request
 
-__all__ = ["HTTP_STATUS_BY_EXCEPTION", "register_error_handlers"]
+__all__ = [
+    "HTTP_STATUS_BY_EXCEPTION",
+    "INVALID_REQUEST_CODE",
+    "register_error_handlers",
+]
+
+#: 请求体/参数未通过 Schema 校验时的错误码。
+#:
+#: 🔴 **与 :class:`~ai_psi.domain.exceptions.InvalidRequestError` 的
+#: ``code`` 保持同一个值。**
+#:
+#: 两者都表示"这次请求的输入不合法"，区别只在**哪一层发现的**：
+#: 一个是 FastAPI/pydantic 在校验 Schema 时，一个是服务层在语义上。
+#: 给它们两个不同的码，会让客户端必须知道"服务端把这类校验放在哪一层"
+#: 才能正确处理错误——而那是一个实现细节，不该泄漏到契约里。
+INVALID_REQUEST_CODE = InvalidRequestError.default_code
 
 #: 异常类型到 HTTP 状态码的映射。
 #:
@@ -100,6 +117,42 @@ def register_error_handlers(app: FastAPI) -> None:
             payload = {"code": exc.code, "message": _UNEXPECTED_MESSAGE}
         return JSONResponse(status_code=status, content=payload)
 
+    @app.exception_handler(RequestValidationError)
+    async def _handle_validation_error(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        """把 Schema 校验失败映射成**带机器可读错误码**的 422。
+
+        🔴 **FastAPI 的默认响应没有 ``code``。**
+
+        它返回 ``{"detail": [...]}``——于是客户端要区分
+        "字段缺失"与"值非法"只能去解析那句英文消息，
+        而那句消息会随 pydantic 版本变化。阶段 6.5 §三.2 要求
+        "客户端输入错误统一返回明确 4xx + 机器可读 error_code"。
+
+        ⚠️ **响应里只回字段路径与错误类型，不回输入的值。**
+        pydantic 默认的 ``detail`` 含 ``input``——那是**用户原文**。
+        把它原样回显给客户端会把一次"格式错误"变成一次
+        XSS/日志注入的载体，而且服务端的错误响应是最容易被
+        完整记录下来的东西之一。
+        """
+        fields = [_field_path(item.get("loc", ())) for item in exc.errors()]
+        record_rejected_request(
+            path=request.url.path,
+            method=request.method,
+            code=INVALID_REQUEST_CODE,
+            reason="请求未通过 Schema 校验",
+            field_paths=fields,
+        )
+        return JSONResponse(
+            status_code=422,
+            content={
+                "code": INVALID_REQUEST_CODE,
+                "message": "请求格式或取值不合法",
+                "fields": sorted(set(fields)),
+            },
+        )
+
     @app.exception_handler(Exception)
     async def _handle_unexpected(request: Request, exc: Exception) -> JSONResponse:
         """兜底处理器。
@@ -112,6 +165,16 @@ def register_error_handlers(app: FastAPI) -> None:
             status_code=500,
             content={"code": "internal_error", "message": _UNEXPECTED_MESSAGE},
         )
+
+
+def _field_path(location: object) -> str:
+    """把 pydantic 的 ``loc`` 元组拼成一个点分路径。
+
+    形如 ``body.evidence.0`` —— **只有路径，没有值**（见处理器文档）。
+    """
+    if not isinstance(location, (list, tuple)):  # pragma: no cover - pydantic 恒给序列
+        return str(location)
+    return ".".join(str(item) for item in location)
 
 
 def _log_server_error(request: Request, exc: AIPsiError) -> None:
