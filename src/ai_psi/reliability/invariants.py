@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Final
@@ -41,6 +42,7 @@ from ai_psi.domain.improvement_proposals import (
 
 __all__ = [
     "EXPECTED_PROPOSAL_STATUSES",
+    "PROPOSAL_ESCALATION_THRESHOLD",
     "RUNTIME_CHECKED_INVARIANTS",
     "InvariantCheck",
     "assert_structural_invariants",
@@ -239,10 +241,37 @@ def _check_i10() -> InvariantCheck:
     # 之后自检照样报绿，detail 还在宣称"拒绝低于 2 的取值"——
     # 它给出了一条**自己没验证过**的断言。
     #
+    # 🔴 **先确认三个"门槛"指的是同一个数。**
+    #
+    # `meets_escalation_threshold` 的默认参数是
+    # `threshold: int = PROPOSAL_ESCALATION_THRESHOLD`，它在 **def 时**
+    # 求值并绑定。于是存在两个可以各自被改走的数：运行期的常量，
+    # 与那个绑死的默认值。
+    #
+    # 下面的探针**一律显式传参**，因为自检要证明的是「这个常量对应的
+    # 门槛在生效」。但显式传参本身会让「默认值被改坏」这件事变得看不见
+    # ——默认值比常量**大**时尤其危险：探针拿常量问，答案全对，
+    # 而生产路径若吃了默认值就会永远判不达标。
+    #
+    # 所以这里把默认值单独钉住。这一条不能省：它是显式传参的代价。
+    default_threshold = _default_escalation_threshold()
+    if default_threshold != PROPOSAL_ESCALATION_THRESHOLD:
+        return InvariantCheck(
+            invariant_id="I10",
+            statement=_statement_of("I10"),
+            ok=False,
+            detail=(
+                f"meets_escalation_threshold 的默认门槛是 {default_threshold}，"
+                f"而 PROPOSAL_ESCALATION_THRESHOLD 是 {PROPOSAL_ESCALATION_THRESHOLD}"
+                "——两者必须指向同一个数，否则不吃默认值的调用方与吃默认值的"
+                "调用方会按不同的门槛判断"
+            ),
+        )
+
     # 现在三问缺一不可：
     #   1) 单条经验 + threshold=1 → 必须抛（守卫在）；
-    #   2) 单条经验 + 默认门槛 → 必须为 False（门槛是 3，不是说 1 会被拒就完事）；
-    #   3) 三条经验 + 默认门槛 → 必须为 True（正向路径真的通）。
+    #   2) 单条经验 + 当前门槛 → 必须为 False（不是"1 会被拒"就完事）；
+    #   3) 门槛条经验 + 当前门槛 → 必须为 True（正向路径真的通）。
     one = _probe_proposal(1)
     three = _probe_proposal(PROPOSAL_ESCALATION_THRESHOLD)
 
@@ -258,7 +287,13 @@ def _check_i10() -> InvariantCheck:
             detail="meets_escalation_threshold 接受了 threshold=1，单次经验可被推广",
         )
 
-    if one.meets_escalation_threshold():
+    # 🔴 **门槛显式传，不吃默认值。** 决定探针条数的是运行期那个常量，
+    # 判定也必须用同一个数，否则常量被合法改小（3 → 2，`< 2` 那道守卫
+    # 明确允许）之后，探针只造 2 条而默认门槛还是绑死的 3，`three` 判为
+    # 不达标，自检会对一个**没被改坏**的守卫报红并让进程起不来。
+    # —— 假警报比没有警报更坏：它会逼着人去关掉自检。
+    # 默认值与常量的一致性由上面那条单独负责。
+    if one.meets_escalation_threshold(threshold=PROPOSAL_ESCALATION_THRESHOLD):
         return InvariantCheck(
             invariant_id="I10",
             statement=_statement_of("I10"),
@@ -269,7 +304,7 @@ def _check_i10() -> InvariantCheck:
             ),
         )
 
-    if not three.meets_escalation_threshold():
+    if not three.meets_escalation_threshold(threshold=PROPOSAL_ESCALATION_THRESHOLD):
         return InvariantCheck(
             invariant_id="I10",
             statement=_statement_of("I10"),
@@ -289,6 +324,21 @@ def _check_i10() -> InvariantCheck:
             f"单条不达标，{PROPOSAL_ESCALATION_THRESHOLD} 条达标"
         ),
     )
+
+
+def _default_escalation_threshold() -> object:
+    """``meets_escalation_threshold`` 默认参数**在 def 时**绑定的那个值。
+
+    单独抽出来是因为它读的是**函数对象上的默认值**，而不是
+    模块常量——两者可以各自被改走，而自检必须能看见这件事。
+    """
+    method = getattr(ImprovementProposal, "meets_escalation_threshold", None)
+    if not callable(method):
+        # 鸭子类型的替身没有这个方法，也就没有"默认值"可比。
+        # 真实类永远有它；真被删掉的话，下面 `one.meets_escalation_threshold`
+        # 的调用会抛 AttributeError 并被 `_guarded` 报成"检查跑不起来"。
+        return PROPOSAL_ESCALATION_THRESHOLD
+    return inspect.signature(method).parameters["threshold"].default
 
 
 def _probe_proposal(experience_count: int) -> ImprovementProposal:

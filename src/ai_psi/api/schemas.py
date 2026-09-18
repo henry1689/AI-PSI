@@ -451,9 +451,7 @@ class CorrectMemoryRequest(BaseModel):
     model_config = _STRICT_TRIMMED
 
     user_id: UUID = Field(description="发起纠正的用户；必须与记忆的作用域一致")
-    new_content: str = Field(
-        min_length=1, max_length=_FREE_TEXT_MAX, description="新的内容"
-    )
+    new_content: str = Field(min_length=1, max_length=_FREE_TEXT_MAX, description="新的内容")
 
     @field_validator("new_content")
     @classmethod
@@ -841,9 +839,7 @@ class LearningRunResponse(BaseModel):
                 SuppressedObservation.from_entry(pattern, reasons)
                 for pattern, reasons in run.suppressed
             ],
-            comparison_available=(
-                False if comparison is None else comparison.comparison_available
-            ),
+            comparison_available=(False if comparison is None else comparison.comparison_available),
             evaluation_reasons=[] if comparison is None else list(comparison.reasons),
             summary=run.summary(),
         )

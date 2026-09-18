@@ -216,9 +216,7 @@ class RoundRepositoryContract:
     async def test_get_unknown_returns_none(self, round_repository) -> None:
         assert await round_repository.get(uuid4()) is None
 
-    async def test_list_all_is_empty_when_there_are_no_rounds(
-        self, round_repository
-    ) -> None:
+    async def test_list_all_is_empty_when_there_are_no_rounds(self, round_repository) -> None:
         assert await round_repository.list_all() == []
 
     async def test_list_all_returns_rounds_in_time_order(self, round_repository) -> None:
@@ -232,9 +230,7 @@ class RoundRepositoryContract:
         """
         base = datetime(2026, 1, 1, tzinfo=UTC)
         earliest = _round()
-        earliest = earliest.model_copy(
-            update={"created_at": base, "updated_at": base}
-        )
+        earliest = earliest.model_copy(update={"created_at": base, "updated_at": base})
         latest = _round()
         latest = latest.model_copy(
             update={
@@ -251,9 +247,7 @@ class RoundRepositoryContract:
             latest.id,
         ]
 
-    async def test_list_all_respects_limit_from_the_earliest_end(
-        self, round_repository
-    ) -> None:
+    async def test_list_all_respects_limit_from_the_earliest_end(self, round_repository) -> None:
         """``limit`` 取的是**最早**的 N 条——与升序顺序一致，不是另一套语义。"""
         base = datetime(2026, 1, 1, tzinfo=UTC)
         rounds = []

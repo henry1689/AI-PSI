@@ -27,9 +27,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -100,6 +101,45 @@ async def _correct(client: httpx.AsyncClient, round_id: str) -> httpx.Response:
     )
 
 
+async def _write_a_memory(client: httpx.AsyncClient, *, user_id: UUID, content: str) -> None:
+    """让 ``user_id`` 名下**真的**落一条长期记忆，落不下就报错。
+
+    🔴 **发消息不会写记忆**——记忆走的是反馈链路（``allow_memory_update``）。
+
+    这一点曾经让用户隔离那两条用例**空过**：alice 名下压根什么都没有，
+    于是「bob 看不到 alice 的」与「bob 看不到任何东西」是同一件事，
+    用例实际证明的是后者。而它对任何实现都成立，包括完全不做作用域
+    过滤的实现——只要没人往里写东西。
+
+    所以这里在返回前**先确认写入发生了**。做不到就当场红，
+    而不是把一条没有信息量的绿留给读者。
+    """
+    conversation = await client.post(f"{API_PREFIX}/conversations")
+    conversation_id = conversation.json()["conversation_id"]
+    sent = await client.post(
+        f"{API_PREFIX}/conversations/{conversation_id}/messages",
+        json={"content": _QUESTION, "user_id": str(user_id)},
+    )
+    assert sent.status_code == 201, sent.text
+    round_id = sent.json()["cognitive_round_id"]
+
+    feedback = await client.post(
+        f"{API_PREFIX}/cognitive-rounds/{round_id}/feedback",
+        json={
+            "feedback_type": "correction",
+            "content": content,
+            "allow_memory_update": True,
+        },
+    )
+    assert feedback.status_code == 201, feedback.text
+
+    listing = await client.get(f"{API_PREFIX}/users/{user_id}/memories")
+    assert listing.json()["memories"], (
+        f"{user_id} 名下没有记忆（反馈返回 {feedback.text}）——"
+        "后面的隔离断言会因为它本来就是空的而空过"
+    )
+
+
 async def _learn(client: httpx.AsyncClient, **body: Any) -> dict[str, Any]:
     """跑一次学习链路。"""
     response = await client.post(f"{API_PREFIX}/learning/runs", json=body)
@@ -121,9 +161,7 @@ class TestTheLearningChainIsReachableThroughTheApi:
     这条用例证明它现在是一条约 200 能跑通的路由。
     """
 
-    async def test_the_endpoint_runs_and_reports_why(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_the_endpoint_runs_and_reports_why(self, client: httpx.AsyncClient) -> None:
         """没有经验时不生成提案——而**必须说清为什么**。
 
         🔴 一份只说"生成了 0 条提案"的报告无法回答"为什么没有"。
@@ -152,9 +190,7 @@ class TestTheLearningChainIsReachableThroughTheApi:
         assert second["created_proposal_ids"] == []
         assert set(second["created_proposal_ids"]) & set(first["created_proposal_ids"]) == set()
 
-    async def test_the_endpoint_cannot_approve_anything(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_the_endpoint_cannot_approve_anything(self, client: httpx.AsyncClient) -> None:
         """🔴 **这条路由上没有通往"生效"的参数**（不变量 11）。
 
         传任何看起来像"直接批准"的字段都会被 Schema 拒绝——
@@ -176,9 +212,7 @@ class TestTheLearningChainIsReachableThroughTheApi:
 class TestOfflineEvaluationIsReachableAndHonest:
     """🔴 §七.15–16：退化要判得出来，**未评估不得自动判成未退化**。"""
 
-    async def test_no_candidate_data_means_not_assessed(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_no_candidate_data_means_not_assessed(self, client: httpx.AsyncClient) -> None:
         """🔴 **§七.16**：没有对照时 ``comparison_available`` 必须是 false。
 
         把它默认成"没有退化"会让"没评估"冒充"没问题"——
@@ -199,15 +233,11 @@ class TestOfflineEvaluationIsReachableAndHonest:
         baseline = [await _run_round(client) for _ in range(2)]
         candidate = [await _run_round(client) for _ in range(2)]
 
-        body = await _learn(
-            client, baseline_round_ids=baseline, candidate_round_ids=candidate
-        )
+        body = await _learn(client, baseline_round_ids=baseline, candidate_round_ids=candidate)
 
         assert body["comparison_available"] is True
 
-    async def test_lower_is_better_regression_is_detected(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_lower_is_better_regression_is_detected(self, client: httpx.AsyncClient) -> None:
         """🔴 **§七.15**：lower-is-better 指标从 0 上升到 1 必须判为退化。
 
         ⚠️ **本文件无法在 Mock Provider 下构造出这个退化**——
@@ -223,9 +253,7 @@ class TestOfflineEvaluationIsReachableAndHonest:
         baseline = [await _run_round(client)]
         candidate = [await _run_round(client)]
 
-        body = await _learn(
-            client, baseline_round_ids=baseline, candidate_round_ids=candidate
-        )
+        body = await _learn(client, baseline_round_ids=baseline, candidate_round_ids=candidate)
 
         # 能算出对照，且原因可读——至于方向判定，见上面的说明
         assert body["comparison_available"] is True
@@ -282,7 +310,7 @@ class TestIllegalStatesCannotBeWritten:
         """
         listing = await client.get(f"{API_PREFIX}/improvement-proposals")
         assert listing.status_code == 200
-        for item in listing.json()["items"]:
+        for item in listing.json()["proposals"]:
             assert item["can_become_active"] is False
             assert item["status"] not in {"active", "enabled", "live"}
 
@@ -313,9 +341,7 @@ class TestAtomicityAndConcurrency:
 
         assert await _count_events(engine) == before
 
-    async def test_concurrent_feedback_only_one_succeeds(
-        self, client: httpx.AsyncClient
-    ) -> None:
+    async def test_concurrent_feedback_only_one_succeeds(self, client: httpx.AsyncClient) -> None:
         """§七.14：两个并发请求**只允许一个成功**，失败方零副作用。
 
         ⚠️ 这条在内存后端上**测不出来**（工作单元的方法没有 await 点，
@@ -328,9 +354,7 @@ class TestAtomicityAndConcurrency:
         """
         round_id = await _run_round(client)
 
-        first, second = await asyncio.gather(
-            _correct(client, round_id), _correct(client, round_id)
-        )
+        first, second = await asyncio.gather(_correct(client, round_id), _correct(client, round_id))
 
         # 两条反馈各自独立成功——它们不是同一件事
         assert first.status_code == 201, first.text
@@ -386,45 +410,40 @@ class TestUserIsolationHoldsThroughTheApi:
     ) -> None:
         """记忆检索按 ``user_id`` 硬隔离（不变量 14）。"""
         alice, bob = uuid4(), uuid4()
-        conversation = await client.post(f"{API_PREFIX}/conversations")
-        conversation_id = conversation.json()["conversation_id"]
-
-        response = await client.post(
-            f"{API_PREFIX}/conversations/{conversation_id}/messages",
-            json={
-                "content": "我喜欢简洁的回答，别啰嗦",
-                "user_id": str(alice),
-                "allow_long_term_memory": True,
-            },
-        )
-        assert response.status_code == 201, response.text
+        await _write_a_memory(client, user_id=alice, content="我喜欢简洁的回答，别啰嗦")
 
         alice_view = await client.get(f"{API_PREFIX}/users/{alice}/memories")
         bob_view = await client.get(f"{API_PREFIX}/users/{bob}/memories")
 
         assert alice_view.status_code == 200 and bob_view.status_code == 200
-        assert bob_view.json()["items"] == []
+        # 🔴 两半缺一不可：先证明**确实有东西可泄漏**，再证明它没有泄漏。
+        assert len(alice_view.json()["memories"]) == 1
+        assert bob_view.json()["memories"] == []
+        assert bob_view.json()["count"] == 0
 
     async def test_a_users_export_never_contains_another_users_data(
         self, client: httpx.AsyncClient
     ) -> None:
         """导出同样按作用域隔离——它是**数据访问**，泄漏的后果更直接。"""
         alice, bob = uuid4(), uuid4()
-        conversation = await client.post(f"{API_PREFIX}/conversations")
-        conversation_id = conversation.json()["conversation_id"]
-        await client.post(
-            f"{API_PREFIX}/conversations/{conversation_id}/messages",
-            json={
-                "content": "我住在杭州",
-                "user_id": str(alice),
-                "allow_long_term_memory": True,
-            },
-        )
+        await _write_a_memory(client, user_id=alice, content="我住在杭州")
 
-        exported = await client.post(f"{API_PREFIX}/users/{bob}/export")
+        own = await client.post(f"{API_PREFIX}/users/{alice}/export")
+        other = await client.post(f"{API_PREFIX}/users/{bob}/export")
 
-        assert exported.status_code == 200
-        assert exported.json()["memories"] == []
+        assert own.status_code == 200 and other.status_code == 200
+        # 🔴 正向：alice 的导出包里**确实有**一条记忆。没有这半句，
+        #    "bob 的包里没有 alice" 对任何实现都成立。
+        assert own.json()["export"]["memory_count"] == 1
+
+        # 反向：载荷整体属于 bob——不只"记忆列表是空的"，而是**整包里
+        # 没有一个 alice 的痕迹**。只查列表长度的话，一个把别人的记忆
+        # 挂到别的键下的实现照样能通过。
+        bundle = other.json()["export"]
+        assert bundle["user_id"] == str(bob)
+        assert bundle["memory_count"] == 0
+        assert bundle["memories"] == []
+        assert str(alice) not in json.dumps(bundle)
 
 
 # ---------------------------------------------------------------------------

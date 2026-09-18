@@ -280,8 +280,7 @@ class Experience(EntityMetadata):
     independence_group: str = Field(
         min_length=1,
         description=(
-            "独立性分组。🔴 同组经验**不是**彼此的独立证据。"
-            "见 :func:`independence_group_for`"
+            "独立性分组。🔴 同组经验**不是**彼此的独立证据。见 :func:`independence_group_for`"
         ),
     )
     canonical_key: str = Field(

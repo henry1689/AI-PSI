@@ -96,9 +96,7 @@ class ExperienceReader:
             读取结果。
         """
         async with self._uow_factory() as uow:
-            created = await uow.events.read_by_event_type(
-                event_type=EventType.EXPERIENCE_CREATED
-            )
+            created = await uow.events.read_by_event_type(event_type=EventType.EXPERIENCE_CREATED)
             evaluated = await uow.events.read_by_event_type(
                 event_type=EventType.EXPERIENCE_EVALUATED
             )

@@ -332,9 +332,7 @@ class LearningService:
     # 读
     # ------------------------------------------------------------------
 
-    async def _evaluate_offline(
-        self, window: EvaluationWindow | None
-    ) -> EvaluationComparison:
+    async def _evaluate_offline(self, window: EvaluationWindow | None) -> EvaluationComparison:
         """在历史回合上做一次离线评测。
 
         🔴 **这接通了 §11.3 条件三，而它此前在系统里永远无法成立。**
@@ -359,12 +357,8 @@ class LearningService:
             return self._evaluator.compare(baseline_rounds=observed)
 
         baseline = await self._metrics.load(window.baseline)
-        candidate = (
-            None if window.candidate is None else await self._metrics.load(window.candidate)
-        )
-        return self._evaluator.compare(
-            baseline_rounds=baseline, candidate_rounds=candidate
-        )
+        candidate = None if window.candidate is None else await self._metrics.load(window.candidate)
+        return self._evaluator.compare(baseline_rounds=baseline, candidate_rounds=candidate)
 
     async def _negative_feedback_by_signature(self, load: ExperienceLoad) -> dict[str, int]:
         """统计每个情境签名下收到过否定反馈的**不同回合数**。

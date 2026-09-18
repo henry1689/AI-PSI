@@ -100,9 +100,7 @@ class TestI01AndI13CannotBeBrokenByConstruction:
     强制实际为零，它们只在类型层成立。
     """
 
-    def test_the_hypothesis_properties_are_constants(
-        self, make_hypothesis: Factory
-    ) -> None:
+    def test_the_hypothesis_properties_are_constants(self, make_hypothesis: Factory) -> None:
         """无论假设长什么样，两个属性都恒为 ``False``。
 
         遍历若干种构造（包括状态各异、类别各异的），证明它们
@@ -181,9 +179,7 @@ class TestI06AndI14MemoryScope:
     证明被削弱的那个还在守了。
     """
 
-    def test_i14_a_memory_from_another_user_is_refused(
-        self, make_memory: Factory
-    ) -> None:
+    def test_i14_a_memory_from_another_user_is_refused(self, make_memory: Factory) -> None:
         """**只破坏 I14**：作用域越界。记忆本身状态正常。"""
         owner = uuid4()
         memory = make_memory(user_id=owner, status=MemoryStatus.ACTIVE)
@@ -237,9 +233,7 @@ class TestI07ResponseNotStrongerThanJudgment:
             judgment=judgment, response_allows_strong_conclusion=False
         )
 
-    def test_a_judgment_that_allows_strong_conclusions_passes(
-        self, make_judgment: Factory
-    ) -> None:
+    def test_a_judgment_that_allows_strong_conclusions_passes(self, make_judgment: Factory) -> None:
         """反方向：判据说"可以下强结论"时，强表述不该被拦。"""
         strong = make_judgment(recommended_epistemic_action=EpistemicAction.ANSWER)
         assert_response_not_stronger_than_judgment(

@@ -46,8 +46,11 @@ fmt:
 	$(UV) run ruff check --fix .
 	$(UV) run ruff format .
 
+# mutation/ 也要检查：它是 §六 的测量工具，而**测量工具自己出错时
+# 报出来的是一个漂亮的分数**（实测过一次：104 个被杀的变异体被记成
+# incompetent，分数从 100% 掉到 7.7%）。工具不能没有类型网。
 typecheck:
-	$(UV) run mypy src tests scripts
+	$(UV) run mypy src tests scripts mutation
 
 test:
 	$(UV) run pytest $(COV)

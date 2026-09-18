@@ -169,8 +169,7 @@ class _Trace:
 
     def describe(self) -> str:
         return "\n".join(
-            f"  {status.value} --{op}--> "
-            f"{'拒绝' if result is None else result.value}"
+            f"  {status.value} --{op}--> {'拒绝' if result is None else result.value}"
             for status, op, result in self.steps
         )
 
@@ -235,8 +234,7 @@ class TestTheServiceAgreesWithTheReferenceModel:
 
             if accepted is None:
                 assert after.status is current, (
-                    f"{current.value} 下的 {operation} 被拒绝了，"
-                    f"但状态变成了 {after.status.value}"
+                    f"{current.value} 下的 {operation} 被拒绝了，但状态变成了 {after.status.value}"
                 )
                 assert after.version == before_version
             else:
@@ -315,9 +313,7 @@ class TestEveryEdgeIsActuallyReachable:
         proposal = await subject.new_proposal(start)
         assert await subject.apply(proposal.id, operation) is target
 
-    async def test_the_model_has_no_extra_edges_within_a_status(
-        self, subject: _Subject
-    ) -> None:
+    async def test_the_model_has_no_extra_edges_within_a_status(self, subject: _Subject) -> None:
         """模型对每个状态允许的操作集合，必须**恰好**是服务允许的那些。
 
         随机序列证明不了这一点：它只覆盖走过的路径。这条把每个

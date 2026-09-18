@@ -48,3 +48,8 @@ Thumbs.db
 # ---- 评测产物 ----
 evals/reports/*
 !evals/reports/.gitkeep
+
+# ---- 变异测试 ----
+# 会话库是一次性中间产物（`run.py` 正常结束时会自己删掉）；
+# `report.md` 相反，它是**要提交的交付物**，因此只忽略工作目录。
+mutation/.work/

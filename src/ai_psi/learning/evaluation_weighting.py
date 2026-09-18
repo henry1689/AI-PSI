@@ -49,9 +49,7 @@ class EvaluationWeighting:
         Raises:
             ValueError: 缺少某个评价状态，或权重随次序下降。
         """
-        missing = sorted(
-            item.value for item in ExperienceEvaluation if item not in self.weights
-        )
+        missing = sorted(item.value for item in ExperienceEvaluation if item not in self.weights)
         if missing:
             msg = (
                 f"权重表缺少评价状态：{'、'.join(missing)}。"

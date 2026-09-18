@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from uuid import UUID
 
 import pytest
 
@@ -329,6 +330,29 @@ class TestTheCheckCanActuallyFail:
             assert_structural_invariants()
         assert excinfo.value.context["invariant_id"] == "I10"
 
+    def test_the_named_invariant_does_not_move_with_the_tail(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """🔴 变异测试发现：**同时坏两条**时，报出来的是哪一条没有被钉住。
+
+        ``failures[0]`` 取的是第一条失败的。改成 ``failures[-1]`` 之后，
+        只坏一条的用例照样通过（此时首尾同一个），而实际报出的编号
+        变成了**列表末尾**那一条——于是"坏得越多，报出来的越靠后"，
+        审计记录的头条随条数漂移。
+
+        ``msg`` 里按同样的顺序列出了全部失败项，结构化字段必须与它
+        指向同一处，否则告警路由拿到的编号与消息正文对不上。
+        """
+        monkeypatch.setattr(selfcheck, "PROPOSAL_ESCALATION_THRESHOLD", 1)  # I10
+        monkeypatch.setattr(selfcheck, "ProposalStatus", _ShrunkProposalStatus)  # I11
+
+        with pytest.raises(ConstitutionViolationError) as excinfo:
+            assert_structural_invariants()
+        assert excinfo.value.context["invariant_id"] == "I10", excinfo.value.context
+        # 两条都要出现在正文里——只报一条等于把另一条吞了
+        message = str(excinfo.value)
+        assert "I10" in message and "I11" in message, message
+
     def test_failing_checks_lists_only_the_broken_ones(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -428,3 +452,263 @@ class TestTheProbeUsesExactlyTheCountItClaims:
         """重复的 id 会让"三条经验"实际只有一条——门槛形同虚设。"""
         probe = selfcheck._probe_proposal(3)
         assert len(set(probe.supporting_experience_ids)) == 3
+
+    def test_the_probe_ids_are_genuine_uuids(self) -> None:
+        """🔴 变异测试发现：探针的 id 是不是**合法 UUID**，之前没有任何断言。
+
+        把 ``index + 1`` 改成 ``index / 1`` 之后，``uuid.UUID`` 会**照收**
+        浮点数：``UUID(int=0.0)`` 构造成功，``.int`` 是 ``float``，
+        而 ``.hex`` 在使用时抛 ``TypeError``。这个模块里的探针对象
+        不参与持久化，所以它当场不炸——但一个"产出 UUID"的函数
+        产出的是**读不出十六进制**的东西，就是坏的。
+        """
+        for item in selfcheck._probe_proposal(3).supporting_experience_ids:
+            assert isinstance(item.int, int), item
+            assert UUID(int=item.int) == item
+
+    def test_the_probe_ids_never_collide_with_the_fixed_probe_id(self) -> None:
+        """🔴 ``index + 1`` 的 ``+1`` 不是装饰：它把全零 UUID 挡在外面。
+
+        去掉它（``+0`` / ``*1`` / ``//1`` / ``**1``）、或者换成
+        ``<< 1`` / ``^ 1``，都会让 id 里出现 ``UUID(int=0)``——
+        而那是本模块自己的固定探针标识 ``_PROBE_UUID``。
+        同一个自检里两个不同的东西共用一个标识，报告就没法读了。
+        """
+        ids = selfcheck._probe_proposal(3).supporting_experience_ids
+        assert selfcheck._PROBE_UUID not in ids
+
+
+class TestTheGuardBoundaryIsTwo:
+    """🔴 变异测试发现：``PROPOSAL_ESCALATION_THRESHOLD < 2`` 的**边界值
+    本身**没有被断言。
+
+    已有用例覆盖了 1（报"守卫被改坏"）和 3（默认值），唯独漏了 **2**。
+    而 2 恰恰是这条守卫声称的最小合法值——它是边界。
+
+    把 ``< 2`` 改成 ``<= 2``：门槛为 2 时走进"门槛被改坏"那一支，
+    仍然报 ``ok=False``，而"1 会失败"这条断言对它照样成立。
+    """
+
+    @staticmethod
+    def _change_the_threshold(monkeypatch: pytest.MonkeyPatch, threshold: int) -> None:
+        """模拟**一次合法的门槛改动**——两处一起改。
+
+        🔴 必须两处都改，这不是测试的方便，而是真实改动的样子：
+        常量 ``PROPOSAL_ESCALATION_THRESHOLD`` 既被自检读来算探针条数，
+        又被用作 ``meets_escalation_threshold`` 的默认值。只改前者是
+        **改了一半**，自检会（正确地）报出两者分叉。
+        """
+        monkeypatch.setattr(selfcheck, "PROPOSAL_ESCALATION_THRESHOLD", threshold)
+        monkeypatch.setattr(selfcheck, "_default_escalation_threshold", lambda: threshold)
+
+    def test_a_threshold_of_two_is_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._change_the_threshold(monkeypatch, 2)
+        result = selfcheck._check_i10()
+        assert result.ok is True, result.detail
+
+    def test_the_boundary_moves_with_the_constant(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """🔴 自检不能只对**写死的那一个取值**成立。
+
+        改这个常量是合法操作（只要不低于 2）。改到 2 之后自检必须**跟着**
+        变成"门槛为 2、两条达标"。
+
+        实测过一次它做不到：`meets_escalation_threshold` 的默认参数是
+        **def 时**绑定到旧值的，探针条数却按运行期常量算——两者分叉，
+        自检对着一个**没被改坏**的守卫报红，进程起不来。
+        假警报比没有警报更坏：它会逼着人去关掉自检。
+        """
+        # 🔴 1000 不是凑数：`-5..256` 之外的整数**不被 CPython 缓存**，
+        #    因此只有在这个量级上，「两处指向同一个数」才真的要求
+        #    **相等**而不是「恰好是同一个对象」。少了它，把一致性判据
+        #    写成 `is not` 的实现照样能过——那在小整数上只是碰巧对。
+        for threshold in (2, 3, 4, 1000):
+            self._change_the_threshold(monkeypatch, threshold)
+            result = selfcheck._check_i10()
+            assert result.ok is True, (threshold, result.detail)
+            assert str(threshold) in result.detail
+
+    def test_changing_only_the_constant_is_reported(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """反方向：**只改一处**必须报出来，而不是当成一次合法改动。
+
+        这正是"两处必须一起改"这句话的可执行版本：默认值还绑在旧门槛上，
+        于是不吃默认值的调用方与吃默认值的调用方会按两个数判断。
+        """
+        monkeypatch.setattr(selfcheck, "PROPOSAL_ESCALATION_THRESHOLD", 2)
+        result = selfcheck._check_i10()
+        assert result.ok is False
+        assert "默认门槛" in result.detail
+
+
+class TestTheCheckProbesTheInputsItClaims:
+    """🔴 变异测试发现：``_check_i10`` 的**探针参数**没有任何测试。
+
+    ``one = _probe_proposal(1)`` 与 ``three = _probe_proposal(门槛)``
+    里的两个数字，正是这条检查**声称在做的事**：它说"单条不达标、
+    三条达标"，那就必须真的拿 1 条和 3 条去试。
+
+    改成 ``0`` 或 ``2`` 之后三条断言全部照样成立（0 和 2 都低于门槛 3），
+    于是细节信息变成了假的：报告里写着"单条不达标"，实际试的是别的条数。
+    """
+
+    def test_i10_probes_with_one_and_with_the_threshold(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: list[int] = []
+        real = selfcheck._probe_proposal
+
+        def _spy(count: int) -> object:
+            seen.append(count)
+            return real(count)
+
+        monkeypatch.setattr(selfcheck, "_probe_proposal", _spy)
+        selfcheck._check_i10()
+        assert seen == [1, selfcheck.PROPOSAL_ESCALATION_THRESHOLD]
+
+    def test_i10_asks_the_guard_about_the_boundary(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """被问的那个门槛值同样不能变。
+
+        ``meets_escalation_threshold(threshold=1)`` 问的是"1 会被拒吗"。
+        改成 0 之后答案一样是"会"，但它证明的东西弱了：一个只在
+        ``threshold < 1`` 时才拒绝的守卫能让 0 通过检查。
+        """
+        asked: list[int] = []
+
+        class _Recording:
+            def meets_escalation_threshold(self, *, threshold: int = 3) -> bool:
+                asked.append(threshold)
+                if threshold < 2:
+                    msg = "提案门槛不得低于 2"
+                    raise ValueError(msg)
+                return False
+
+        monkeypatch.setattr(selfcheck, "ImprovementProposal", lambda **_: _Recording())
+        selfcheck._check_i10()
+        # 三问：先是边界那一问（1 会不会被拒），后两问是「探针达标了吗」
+        # ——它们必须用**当前**门槛去问，而不是某个写死的值。
+        #
+        # ⚠️ 断言写成有序的全等而不是 set：`asked[1]` 曾经来自一次
+        # **吃默认值**的调用（作者只改了其中一处），于是这条用例在
+        # 常量 ≠ 3 时反而变红——而常量改成 2 本身是合法的。
+        threshold = selfcheck.PROPOSAL_ESCALATION_THRESHOLD
+        assert asked == [1, threshold, threshold], asked
+
+
+class TestTheDefaultThresholdIsPinnedToTheConstant:
+    """🔴 评审发现：把探针改成**显式传参**，代价是「默认值被改坏」不再可见。
+
+    ``meets_escalation_threshold`` 的默认参数在 **def 时**绑定。
+    显式传参之后，探针拿常量去问，答案全对——哪怕那个默认值已经被改成
+    别的数。默认值比常量**大**时最危险：不吃默认值的调用方与吃默认值的
+    调用方会按两个不同的门槛判断，而自检全绿。
+
+    所以显式传参必须配一条单独的、盯住默认值的检查。
+    """
+
+    @pytest.mark.parametrize("default", [5, 1])
+    def test_a_default_that_disagrees_with_the_constant_is_reported(
+        self, monkeypatch: pytest.MonkeyPatch, default: int
+    ) -> None:
+        """🔴 **两个方向都要**。
+
+        默认值比常量**大**：不吃默认值的调用方按 3 判、吃默认值的按 5 判，
+        永远少产生提案；比常量**小**：反过来，门槛形同虚设。
+        只断言"大"的那一边，把判据写成 `>` 的实现照样能过。
+        """
+        monkeypatch.setattr(selfcheck, "_default_escalation_threshold", lambda: default)
+        result = selfcheck._check_i10()
+        assert result.ok is False
+        assert str(default) in result.detail and "默认门槛" in result.detail
+
+    def test_the_shipped_default_agrees_with_the_constant(self) -> None:
+        """正向：真实代码里两者本来就是同一个数。"""
+        assert selfcheck._default_escalation_threshold() == (
+            selfcheck.PROPOSAL_ESCALATION_THRESHOLD
+        )
+
+    def test_a_value_equal_but_distinct_object_is_not_a_mismatch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """🔴 判据必须是**相等**，不是「同一个对象」。
+
+        变异测试发现：把 ``!=`` 改成 ``is not`` 之后自检照样全绿——
+        因为 ``-5..256`` 的整数被 CPython 缓存，而更大的字面量在同一个
+        编译单元里也常常是同一个常量对象。**那是碰巧，不是契约。**
+
+        真实世界里门槛完全可能来自配置解析（``int("1000")`` 每次都是
+        新对象），那时 `is not` 会把一个**正确**的配置报成不一致，
+        而自检的失败意味着进程起不来——又是一次假警报。
+        """
+        monkeypatch.setattr(selfcheck, "PROPOSAL_ESCALATION_THRESHOLD", 1000)
+        monkeypatch.setattr(selfcheck, "_default_escalation_threshold", lambda: int("1000"))
+        assert selfcheck._check_i10().ok is True
+
+
+class TestTheI10GuardIsCheckedBeyondItsEntrance:
+    """🔴 变异测试发现：I10 的"单条经验被判达标"那一支从未被执行过。
+
+    已有用例里的 ``_Permissive`` 替身**永远返回 True**，因此
+    ``threshold=1`` 那一问根本不抛，检查在**第一支**就返回了，
+    写着 ``ok=False`` 的那一行永远走不到——把它改成 ``ok=True``
+    没有任何用例会红。
+
+    这一支的意义是：守卫**只做形式**。它挡住了字面上的 1，
+    但真正决定达标的门槛没生效。
+    """
+
+    def test_i10_notices_a_guard_that_only_rejects_the_literal_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _FormalOnlyGuard:
+            def meets_escalation_threshold(self, *, threshold: int = 3) -> bool:
+                if threshold < 2:
+                    msg = "提案门槛不得低于 2"
+                    raise ValueError(msg)
+                return True  # 任何门槛都达标——"三条"与"一条"没有区别
+
+        monkeypatch.setattr(selfcheck, "ImprovementProposal", lambda **_: _FormalOnlyGuard())
+        result = selfcheck._check_i10()
+        assert result.ok is False
+        assert "真正的门槛没有生效" in result.detail
+
+
+class TestStatementLookupFallsBack:
+    """🔴 变异测试发现：``_statement_of`` 的**未命中**这一支没有测试。
+
+    ``item.invariant_id == invariant_id`` 里的 ``==`` 改成 ``>=`` 之后，
+    按登记顺序排在目标**前面**的任何一条都会被当成本条返回。
+    查询三个真实编号时恰好都先命中自己，所以三条自查全是绿的——
+    而报告里会挂上**另一条不变量**的陈述。
+    """
+
+    def test_an_unknown_id_gets_the_placeholder(self) -> None:
+        assert selfcheck._statement_of("I00") == "（宪法中未登记）"
+
+    def test_a_lower_id_does_not_borrow_an_earlier_statement(self) -> None:
+        """``I00`` 在字典序上低于全部登记项——``>=`` 会把它判成 ``I01``。"""
+        borrowed = {item.statement for item in INVARIANTS}
+        assert selfcheck._statement_of("I00") not in borrowed
+
+
+class TestTheReportSaysWhichDirectionTheEnumMoved:
+    """🔴 变异测试发现：报告只说「变了」，**没有断言是往哪个方向变**。
+
+    ``actual - EXPECTED`` 与 ``EXPECTED - actual`` 是两个**方向**。
+    把其中任意一个改成对称差 ``^`` 之后，被删掉的那个成员会跑进
+    「多出」那一支里，而 ``ok is False`` 与「成员名出现在 detail 里」
+    两条断言照样成立——报告于是在**指错方向**。
+
+    这不是措辞问题：读到「多出了一个状态」和读到「少了一个状态」，
+    修复动作完全不同——一个是去查谁加的，一个是去查谁删的。
+    """
+
+    def test_an_added_status_is_reported_as_added(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(selfcheck, "ProposalStatus", _ExtendedProposalStatus)
+        detail = selfcheck._check_i11().detail
+        assert "多出" in detail
+        assert "少了" not in detail
+
+    def test_a_removed_status_is_reported_as_removed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(selfcheck, "ProposalStatus", _ShrunkProposalStatus)
+        detail = selfcheck._check_i11().detail
+        assert "少了" in detail
+        assert "多出" not in detail

@@ -37,18 +37,54 @@ cosmic-ray 的工作方式是把变异写进文件、跑测试、再还原。
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Final
 
 REPO = Path(__file__).resolve().parent.parent
 WORK = REPO / "mutation" / ".work"
 REPORT = REPO / "mutation" / "report.md"
 
-__all__ = ["MODULES", "Module"]
+#: 传给 cosmic-ray（以及它派生出来的 pytest）的环境变量。
+#:
+#: 🔴 **少了它们，变异分数会被系统性压低——而且是在最坏的方向上。**
+#:
+#: cosmic-ray 在 ``cosmic_ray/testing.py`` 里用 UTF-8 解码被测命令的
+#: stdout。Windows 中文区域下，被 spawn 的 pytest 默认按 **GBK** 写管道，
+#: `stdout.decode("utf-8")` 直接抛 ``UnicodeDecodeError``；那个异常被
+#: `run_tests` 的兜底 `except Exception` 接住，该变异体被记成
+#: ``INCOMPETENT``。
+#:
+#: 要害在 ``INCOMPETENT`` 的判定条件——下面是**逐字读源码**得来的，不是推测：
+#:
+#: * ``returncode != 0`` → **KILLED**（测试失败、语法错误、收集失败都走这条）
+#: * ``returncode == 0`` → SURVIVED
+#: * 超时 → KILLED
+#: * **只有 `run_tests` 自己抛异常** → INCOMPETENT
+#:
+#: 也就是说，「变异之后代码跑不起来」**根本不会进这个桶**（它走
+#: ``returncode != 0``）。能进来的只有两种：**输出解码失败**，
+#: 和**命令根本没启动起来**（``FileNotFoundError`` / ``shlex`` 解析失败）。
+#: 两者都是**度量故障**，不是测试强度。
+#:
+#: 而中文 traceback 只在测试失败时才打印——所以被吞掉的恰好是
+#: 「本来会被杀死」的那些。实测（``invariants`` 模块，修复前）：
+#: 130 个变异体里 104 个 incompetent、只报 2 个 killed，分数 **7.7%**。
+#: 补上这两个变量后 incompetent 归零，同一份测试的真实分数是 **100%**。
+#:
+#: ⚠️ 副作用：被测进程跑在 UTF-8 模式下。已 grep 过 ``src/`` 与 ``tests/``
+#: 全部 ``open`` / ``read_text`` / ``write_text``，没有隐式依赖区域编码的调用。
+_SUBPROCESS_ENV: Final[dict[str, str]] = {
+    "PYTHONUTF8": "1",
+    "PYTHONIOENCODING": "utf-8",
+}
+
+__all__ = ["MODULES", "Incompetent", "Module"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +190,28 @@ class Equivalent:
     module: str
     operator: str
     line: int
+    mutation: str
+    """变异后那一行里的片段，用来指出这条登记覆盖**哪一族**变异体。
+
+    🔴 **少了它，登记等价会连带放行没被论证过的变异体。** 同一行上常常
+    有一族变异体，例如 ``UUID(int=index + 1)`` 会同时产出 ``index + 0``
+    和 ``index + 2``。只按（模块, 算子, 行号）匹配的话，为 ``+ 2`` 登记
+    一条等价，``+ 0`` 也跟着不算分了——而后者**真的能被测出来**。
+
+    片段要不要带上被改的值，取决于这条登记的论证覆盖到哪里：
+
+    * 只论证了**某一个**取值 → 片段必须含被改的值（如 ``index + 2``），
+      否则同行的其它取值被顺带放行；
+    * 论证覆盖了**整族**（例如那一行上所有 NumberReplacer 变体都等价）
+      → 刻意用一个不含值的片段（如 ``forbidden[``）让它一次覆盖全族，
+      **并且理由里必须写明为什么整族都成立**。
+
+    ⚠️ 无论哪种，片段都必须按**变异后**的样子写：NumberReplacer 把
+    ``index + 1`` 改成 ``index + 2``（单空格），写 ``index + 1`` 永远不命中。
+
+    报告里会列出每条登记实际放行了几条变异体，覆盖太宽时看得见。
+    """
+
     reason: str
 
 
@@ -167,6 +225,7 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
         module="write_policy",
         operator="core/ReplaceComparisonOperator_Is_Eq",
         line=65,
+        mutation="self == WriteDecision.APPROVED",
         reason=(
             "枚举属性 `WriteDecision.allows_write` 里 `self` 恒为一个 "
             "WriteDecision 成员。枚举成员是单例，`==` 与 `is` 对成员输入"
@@ -179,6 +238,7 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
         module="write_policy",
         operator="core/ReplaceComparisonOperator_Is_LtE",
         line=65,
+        mutation="self <= WriteDecision.APPROVED",
         reason=(
             "同上，且 `self <= WriteDecision.APPROVED` 依赖 StrEnum 的 "
             "字典序：四个成员的值是 approved / requires_user_confirmation "
@@ -190,19 +250,201 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
             "_the_decision` 会立刻变红"
         ),
     ),
+    Equivalent(
+        module="invariants",
+        operator="core/NumberReplacer",
+        line=198,
+        mutation="forbidden[",
+        reason=(
+            "`forbidden` 的四个词（confirmed / verified / established / "
+            "canonical）**没有一个**能构造出 `HypothesisStatus`，这一点由 "
+            "`test_i11...` 之前的 `constructible` 分支与 "
+            "`TestCheckInventory` 的正向用例各自验证过。因此 `forbidden[0]`、"
+            "`[1]`、`[-1]` 取到的都是**一个同样不可构造的词**，"
+            "detail 里那句「构造 X 会失败」对四个取值**同为真**。"
+            "被改的只有那句说明文字举的例子，而没有任何代码读这句话——"
+            "它只出现在人看的报告里"
+        ),
+    ),
+    Equivalent(
+        module="invariants",
+        operator="core/NumberReplacer",
+        line=403,
+        mutation="probe = _probe_proposal(",
+        reason=(
+            "`_check_i11` 拿到这个探针**只读一个属性**：`can_become_active`。"
+            "它是 `ImprovementProposal` 上的类级属性，与支撑经验条数无关；"
+            "0 条、1 条、2 条的提案在该分支上行为完全相同"
+            "（实测 `ImprovementProposal(supporting_experience_ids=[])` "
+            "构造成功且 `can_become_active` 仍为 False）。"
+            "⚠️ 与 `_check_i10` 的同名写法不同：那里的 1 与门槛是"
+            "**被 spy 用例钉住的**（`TestTheCheckProbesTheInputsItClaims`），"
+            "因为 `_check_i10` 的 detail 会声称自己验了「单条」和「三条」"
+        ),
+    ),
+    Equivalent(
+        module="invariants",
+        operator="core/NumberReplacer",
+        line=353,
+        mutation="index + 2",
+        reason=(
+            "探针的契约是一条三合一的话：**n 个互异、非全零、且构造合法**"
+            "的 UUID。`+1` 给出 1,2,3，`+2` 给出 2,3,4——两条都满足全部三项，"
+            "而具体取值没有第二类观察者（`meets_escalation_threshold` 只做 "
+            "`len(set(...))`），所以 `+2` 改不出任何可观察差异。"
+            "⚠️ 同一行上的另外七个 NumberReplacer 变体**不是**等价："
+            "`+ 0` / `* 1` / `// 1` / `** 1` 给出 0,1,2，`<< 1` 给出 0,2,4，"
+            "`^ 1` 给出 1,0,3——**三个集合都含 `UUID(int=0)`**，也就是本模块"
+            "自己的固定探针标识 `_PROBE_UUID`；`/ 1` 给出浮点，`uuid.UUID` "
+            "照收而 `.hex` 会抛 TypeError。"
+            "🔴 杀掉它们的**不是** count/distinct 那两条用例——"
+            "`{0,1,2}`、`{0,2,4}`、`{1,0,3}` 全都互异、条数也对，那两条对它们"
+            "全部通过；真正杀掉的是 `test_the_probe_ids_are_genuine_uuids` "
+            "与 `test_the_probe_ids_never_collide_with_the_fixed_probe_id`"
+        ),
+    ),
+    Equivalent(
+        module="invariants",
+        operator="core/ReplaceTrueWithFalse",
+        line=54,
+        mutation="frozen=True, slots=False",
+        reason=(
+            "`frozen=True` **本身**就拒绝一切属性赋值（`FrozenInstanceError`），"
+            "与 `slots` 无关——实测在一个只有 `frozen=True` 的 dataclass 上"
+            "`obj.y = 2` 同样抛 `FrozenInstanceError`。`slots` 改的是内存布局"
+            "与 `__dict__` 是否存在，而本仓库没有任何代码读 `__dict__`，"
+            "所以这条变异在所有可达输入上行为一致。"
+            "⚠️ 同族还有一条 `frozen=True → False`，**那一条是真变异**"
+            "（它让检查结果可以被事后改写），由 `test_checks_are_frozen` 杀掉"
+        ),
+    ),
+    Equivalent(
+        module="invariants",
+        operator="core/ReplaceComparisonOperator_Eq_Is",
+        line=74,
+        mutation="is invariant_id",
+        reason=(
+            "`_statement_of` 的实参只有三个**字面量**（I01 / I10 / I11），"
+            "而 `INVARIANTS` 里的 `invariant_id` 也是字面量。CPython 会把"
+            "形如标识符的字符串字面量intern 到同一张表里，因此两个对象"
+            "**是同一个**，`is` 与 `==` 对全部可达输入答案相同。"
+            "⚠️ **这是一个实现细节上的侥幸等价**，与 `write_policy` 的 "
+            "`<=` 那条同类：换一个 Python 实现（或改成从数据里读编号）"
+            "它立刻变成真变异。之所以仍登记为等价而不是补测试，是因为"
+            "能杀掉它的只有「拿拼接出来的字符串去查」那种断言——"
+            "那测的是「别对字符串用 is」这条代码风格，"
+            "而不是本模块对外的任何保证"
+        ),
+    ),
 )
 
 
-def _is_equivalent(module_name: str, operator: str, line: int) -> Equivalent | None:
-    """该变异是否登记为等价变异。"""
+def _stale_equivalents(selected: list[Module], outcomes: list[Outcome]) -> list[Equivalent]:
+    """本轮**一条变异体都没匹配上**的等价登记。
+
+    🔴 **存在的理由：等价登记会随着源码编辑悄悄失效。**
+
+    登记里带行号，而在被登记的那一行**上面**加任何东西（注释、空行、
+    一个新分支）都会让行号整体下移，这条登记从此匹配不到任何人。
+    它的症状是分数**无缘无故掉下来**，而报告里只有一条"存活"，
+    看不出"这条其实早就登记过了"。
+
+    实测过两次，其中一次就是引入这个检查的那个提交自己：
+
+    * 给 `_check_i10` 补了 8 行注释 → `invariants` 的两条登记（353 / 303）
+      双双失配，分数从 95.3% 掉到 93.7%；
+    * 往 `__all__` 里插了一行 → 另外四条（196 / 364 / 314 / 72）整体下移
+      一位，全部失配。
+
+    两次的症状都一样：分数无缘无故掉下来，而报告上只是多了几个看不出
+    所以然的存活变异体。
+
+    ⚠️ **只覆盖正向失效。** 反方向——行号漂到**另一个**变异体所在的行——
+    这里看不出来。所幸匹配是（模块, 算子, 行号, 片段）四元组，行号漂移
+    通常会被算子或片段挡住；但**不含被改值的片段挡不住**（例如
+    `forbidden[` 落在同行任何 NumberReplacer 上都命中）。真的发生了
+    只需要一次 `git log -p` 就能查清，因此这里不假装能自动发现它。
+    """
+    matched = {entry for outcome in outcomes for _, entry in outcome.equivalents}
+    names = {item.name for item in selected}
+    return [entry for entry in EQUIVALENTS if entry.module in names and entry not in matched]
+
+
+def _stale_hint(entry: Equivalent, outcomes: list[Outcome]) -> str:
+    """失配登记的自诊断：**这个模型里到底有哪些行/算子**。
+
+    🔴 「失配了，自己去找」把成本推给了下一个人，而这是这套机制里
+    最常发生的一种故障——光作者自己就撞了两次（补注释、往 `__all__`
+    插一行），每次都表现成"分数无缘无故掉了几个点"。
+
+    所以这里直接把候选摆出来：同一个算子在哪些行有变异体、最接近的
+    那一行差多少。
+    """
+    outcome = next((item for item in outcomes if item.module.name == entry.module), None)
+    if outcome is None:
+        return "（本轮没有跑这个模块）"
+
+    same_operator = [spec for spec in outcome.specs if spec.operator == entry.operator]
+    if not same_operator:
+        return f"本模块没有任何 `{entry.operator}` 变异体——算子名也可能写错了"
+
+    # 🔴 先按**片段**精确找，而不是按"最近的行号"猜。
+    #    一个算子在本模块里可能有十几行，最近的往往不是它——
+    #    用片段命中就直接给出了确定答案。
+    exact = sorted(
+        {spec.line for spec in same_operator if entry.mutation in _added_lines(spec.diff)}
+    )
+    if exact:
+        where = "、".join(f"**{line}**" for line in exact)
+        extra = (
+            "（命中多行说明这条登记覆盖的是整族，那是**正常的**，前提是理由里论证了整族）"
+            if len(exact) > 1
+            else ""
+        )
+        return f"片段 `{entry.mutation}` 命中的实际行是 {where} —— 把 line 改成它。{extra}"
+
+    rows = sorted({spec.line for spec in same_operator})
+    where = "、".join(str(line) for line in rows[:8])
+    more = "" if len(rows) <= 8 else f" …（共 {len(rows)} 行）"
+    return (
+        f"这个片段在本模块**一处也没命中**。`{entry.operator}` 在以下行有变异体："
+        f"{where}{more}。⚠️ 片段必须按**变异后**的样子写"
+        f"（例如 `index + 2`，不是 `index + 1`）"
+    )
+
+
+def _added_lines(diff: str) -> str:
+    """取出 diff 里**变异后**的那些行（去掉 ``+++`` 文件头）。"""
+    return "\n".join(
+        text for text in diff.splitlines() if text.startswith("+") and not text.startswith("+++")
+    )
+
+
+def _is_equivalent(module_name: str, operator: str, line: int, diff: str) -> Equivalent | None:
+    """该变异是否登记为等价变异。
+
+    🔴 **必须带上变异后那一行的内容一起比对**：``(模块, 算子, 行号)``
+    三元组区分不了同一行上的多个变异体。见 :class:`Equivalent`。
+    """
+    added = _added_lines(diff)
     for item in EQUIVALENTS:
-        if item.module == module_name and item.operator == operator and item.line == line:
+        if (
+            item.module == module_name
+            and item.operator == operator
+            and item.line == line
+            and item.mutation in added
+        ):
             return item
     return None
 
 
 def _run(command: list[str], *, timeout: int) -> subprocess.CompletedProcess[str]:
-    """跑一条命令，工作目录固定为仓库根。"""
+    """跑一条命令，工作目录固定为仓库根。
+
+    🔴 环境里强行注入 :data:`_SUBPROCESS_ENV`：见那个常量上的说明，
+    少了它，被测命令的中文输出会让 cosmic-ray 自己崩在解码上，
+    而崩出来的结果是**看起来像测试不够强**的 ``INCOMPETENT``。
+    """
     return subprocess.run(
         command,
         cwd=REPO,
@@ -210,6 +452,7 @@ def _run(command: list[str], *, timeout: int) -> subprocess.CompletedProcess[str
         text=True,
         encoding="utf-8",
         errors="replace",
+        env={**os.environ, **_SUBPROCESS_ENV},
         timeout=timeout,
         check=False,
     )
@@ -244,16 +487,48 @@ class Survivor:
 
 
 @dataclass(frozen=True, slots=True)
+class Incompetent:
+    """一个 ``INCOMPETENT`` 变异体，**连同它为什么如此**。
+
+    🔴 **在这个配置下，它几乎只能是「度量坏了」。** 判定条件见
+    :data:`_SUBPROCESS_ENV`：``returncode != 0`` 一律 KILLED，
+    只有 ``run_tests`` 自己抛异常才进这里——而被测命令跑不起来
+    （语法错误、构造失败）走的正是 ``returncode != 0``。
+
+    记 ``output`` 是因为这个分类**曾经骗过人**：中文输出让
+    ``stdout.decode("utf-8")`` 抛 ``UnicodeDecodeError``，
+    于是「这个变异体被杀死」被记成了「这个变异体无所谓」。
+    只报一个计数的话，报告里看到的是「104 个 incompetent」，
+    看不到任何一句 ``Traceback``——于是没人会去查。
+    """
+
+    operator: str
+    line: int
+    output: str
+
+
+@dataclass(frozen=True, slots=True)
 class Outcome:
     """一个模块的变异测试结果。"""
 
     module: Module
     killed: int
     survived: tuple[Survivor, ...]
-    incompetent: int
+    incompetent: tuple[Incompetent, ...]
     total: int
-    equivalents: tuple[tuple[Survivor, str], ...] = ()
-    """登记为等价变异、因此**不计分**的存活者（连同理由）。"""
+    equivalents: tuple[tuple[Survivor, Equivalent], ...] = ()
+    """登记为等价变异、因此**不计分**的存活者（连同它匹配到的那条登记）。
+
+    ⚠️ 存的是**整条登记**而不是理由字符串：跑完之后要反过来核对
+    "这一轮到底有哪几条登记真的匹配上了"，见 :func:`_stale_equivalents`。
+    """
+    specs: tuple[Survivor, ...] = ()
+    """本模块**全部**变异体（不只存活的）。
+
+    🔴 存全量是为了让等价登记失配时能自报诊断：告诉人「第 197 行没有
+    变异体，同一个算子在 198 行有」。行号漂移是这套机制最常见的故障，
+    而「失配了，自己去找」把成本推给了下一个人。
+    """
     annotation_filtered: int = 0
     """落在类型标注范围内、因此被**排除**的变异条数。
 
@@ -267,8 +542,13 @@ class Outcome:
     def scored(self) -> int:
         """参与计分的变异体数——``INCOMPETENT`` 不算。
 
-        ``INCOMPETENT`` 是"变异之后代码根本跑不起来"（例如把文档字符串
-        换成数字），它不反映测试强度，被 cosmic-ray 单列。
+        ⚠️ **``INCOMPETENT`` 不是「变异之后代码跑不起来」**，
+        它走的是 ``returncode != 0`` → KILLED（见 :data:`_SUBPROCESS_ENV`
+        里的逐字判定表）。能进这个桶的只有解码失败与命令起不来，
+        两者都是度量故障。
+
+        因此 ``incompetent`` 非零时**这一行的分数没有意义**——
+        `main` 会因此 fail-closed（退出码非 0），而不是放它过去。
         """
         return self.killed + len(self.survived)
 
@@ -364,7 +644,7 @@ def _filter_annotations(module: Module, session: Path) -> int:
             job_id
             for job_id, row, column in rows
             if any(
-                (start_row, start_col) <= (row, column) <= (end_row, end_col)  # type: ignore[arg-type]
+                (start_row, start_col) <= (row, column) <= (end_row, end_col)
                 for start_row, start_col, end_row, end_col in spans
             )
         ]
@@ -379,6 +659,18 @@ def _filter_annotations(module: Module, session: Path) -> int:
 
 def _execute(module: Module) -> Outcome:
     """跑一个模块的变异测试。"""
+    # 🔴 cosmic-ray 用 `shlex.split` 切测试命令，Windows 上反斜杠会被当转义
+    #    吃掉，命令于是根本起不来 —— 而那正好落进 INCOMPETENT 桶，
+    #    整个模块的分数会变成「0/0 = 100%」。宁可在这里当场红。
+    if "\\" in module.tests:
+        msg = (
+            f"模块 {module.name} 的测试命令里有反斜杠：{module.tests!r}。"
+            "cosmic-ray 用 shlex.split 解析，反斜杠会被吃掉，命令起不来，"
+            "而结果会被记成清一色的 INCOMPETENT（0/0 会被算成 100%）。"
+            "请改用正斜杠"
+        )
+        raise ValueError(msg)
+
     session = WORK / f"{module.name}.sqlite"
     session.unlink(missing_ok=True)
     config = WORK / f"{module.name}.toml"
@@ -401,32 +693,42 @@ def _execute(module: Module) -> Outcome:
     try:
         rows = connection.execute(
             """
-            SELECT ms.operator_name, ms.start_pos_row, wr.test_outcome, wr.diff
+            SELECT ms.operator_name, ms.start_pos_row, wr.test_outcome,
+                   wr.diff, wr.output
             FROM work_results wr JOIN mutation_specs ms ON ms.job_id = wr.job_id
             """
         ).fetchall()
     finally:
         connection.close()
 
-    killed = sum(1 for _, _, outcome, _ in rows if outcome == "KILLED")
-    incompetent = sum(1 for _, _, outcome, _ in rows if outcome == "INCOMPETENT")
+    killed = sum(1 for _, _, outcome, _, _ in rows if outcome == "KILLED")
     survivors: list[Survivor] = []
-    equivalents: list[tuple[Survivor, str]] = []
-    for operator, line, outcome, diff in rows:
+    equivalents: list[tuple[Survivor, Equivalent]] = []
+    incompetents: list[Incompetent] = []
+    for operator, line, outcome, diff, output in rows:
+        if outcome == "INCOMPETENT":
+            # 🔴 记下**为什么**。这个分类曾经把 104 个真·被杀的变异体
+            # 装了进去（cosmic-ray 解码中文输出失败），只留一个计数的话
+            # 报告里看不出任何异常。见 `_SUBPROCESS_ENV`。
+            incompetents.append(Incompetent(operator=operator, line=line, output=output))
+            continue
         if outcome != "SURVIVED":
             continue
         entry = Survivor(operator=operator, line=line, diff=diff)
-        registered = _is_equivalent(module.name, operator, line)
+        registered = _is_equivalent(module.name, operator, line, diff)
         if registered is None:
             survivors.append(entry)
         else:
-            equivalents.append((entry, registered.reason))
+            equivalents.append((entry, registered))
     return Outcome(
         module=module,
         killed=killed,
         survived=tuple(survivors),
         equivalents=tuple(equivalents),
-        incompetent=incompetent,
+        incompetent=tuple(incompetents),
+        specs=tuple(
+            Survivor(operator=operator, line=line, diff=diff) for operator, line, _, diff, _ in rows
+        ),
         total=len(rows) + filtered,
         annotation_filtered=filtered,
     )
@@ -462,9 +764,17 @@ def main(argv: list[str]) -> int:
             outcomes.append(outcome)
             print(
                 f"   {outcome.killed}/{outcome.scored} = {outcome.score:.1%}"
-                f"（另有 {outcome.incompetent} 个 incompetent）",
+                f"（另有 {len(outcome.incompetent)} 个 incompetent）",
                 flush=True,
             )
+            if outcome.incompetent:
+                # 🔴 不静默。这个分类曾经吞掉 104 个「会被杀死」的变异体，
+                # 屏幕上却只有一行无害的计数。详见 `_SUBPROCESS_ENV`。
+                print(
+                    f"   ⚠️ {len(outcome.incompetent)} 个变异体被记为 incompetent，"
+                    f"全部不可计分——先看报告里的样本，别直接接受这个分数",
+                    flush=True,
+                )
     finally:
         # 🔴 **必须还原。** cosmic-ray 是就地改写的，而一次超时或
         # Ctrl-C 会把一个**语法都不成立**的变异留在源码里
@@ -474,25 +784,87 @@ def main(argv: list[str]) -> int:
 
     total_killed = sum(item.killed for item in outcomes)
     total_scored = sum(item.scored for item in outcomes)
+    total_incompetent = sum(len(item.incompetent) for item in outcomes)
     overall = total_killed / total_scored if total_scored else 1.0
 
-    report = _render(outcomes, overall)
+    # 🔴 等价登记会随源码编辑行号漂移而**静默失效**——症状是分数无缘无故
+    #    掉下来。跑完必须反过来核对"有哪几条登记一条都没匹配上"。
+    stale = _stale_equivalents(selected, outcomes)
+    if stale:
+        print(
+            f"\n⚠️ {len(stale)} 条等价登记没有匹配到任何变异体（行号多半已漂移）：",
+            file=sys.stderr,
+        )
+        for item in stale:
+            print(
+                f"    {item.module} {item.operator} @ 第 {item.line} 行"
+                f"（片段 {item.mutation!r}）—— {_stale_hint(item, outcomes)}",
+                file=sys.stderr,
+            )
+
+    report = _render(outcomes, overall, stale)
     REPORT.write_text(report, encoding="utf-8")
     print(f"\n报告已写入 {REPORT.relative_to(REPO)}", flush=True)
-    print(json.dumps({"overall": overall}, ensure_ascii=False))
+    print(
+        json.dumps(
+            {
+                "overall": overall,
+                "stale_equivalents": len(stale),
+                "incompetent": total_incompetent,
+            },
+            ensure_ascii=False,
+        )
+    )
 
     if WORK.exists():
         shutil.rmtree(WORK, ignore_errors=True)
-    return 0 if overall >= 0.9 else 1
+
+    # 🔴 **度量坏了就当失败，而不是报一个漂亮的分数。**
+    #
+    # `overall` 在 `total_scored == 0` 时是 1.0——那正是"被测命令根本起不来"
+    # 的样子：每个变异体都 INCOMPETENT，一个都不计分，于是 0/0 被算成 100%
+    # 并且绿灯放行。告警可以被人忽略，**绿灯不会**。
+    #
+    # 同理，incompetent 非零意味着有变异体的结果**没被测量**，
+    # 而按 `_SUBPROCESS_ENV` 里的判定表，那几乎只可能是度量故障。
+    if total_incompetent or total_scored == 0:
+        print(
+            f"\n🔴 结果不可信：incompetent={total_incompetent}、计分变异体={total_scored}。"
+            "看报告里的样本节定位原因（解码失败 / 命令起不来），"
+            "**不要**按这个分数下结论。",
+            file=sys.stderr,
+        )
+        return 1
+    return 0 if overall >= 0.9 and not stale else 1
 
 
-def _render(outcomes: list[Outcome], overall: float) -> str:
+def _render(outcomes: list[Outcome], overall: float, stale: list[Equivalent]) -> str:
     """把结果渲染成一份**可直接提交的** Markdown 报告。"""
     lines: list[str] = [
         "# 变异测试报告（阶段 6.5 §六）",
         "",
         "> 由 `uv run python mutation/run.py` 生成。**不要手工编辑。**",
         "",
+    ]
+    if stale:
+        lines += [
+            "## 🔴 等价登记失配（先修这个）",
+            "",
+            f"有 **{len(stale)}** 条登记本轮**一条变异体都没匹配上**。",
+            "登记里带行号，在被登记的那一行**上面**加任何东西都会让它整体下移，",
+            "于是分数无缘无故掉下来、而报告里只看得到「多了几个存活变异体」。",
+            "行号也可能漂到**另一个**变异体上，把真变异当等价放行——",
+            "所以这一节非空时，下面的分数**不可信**。",
+            "",
+        ]
+        for item in stale:
+            lines.append(
+                f"- `{item.module}` · **{item.operator}** @ 第 {item.line} 行"
+                f"（片段 `{item.mutation}`）"
+            )
+            lines.append(f"  - {_stale_hint(item, outcomes)}")
+        lines.append("")
+    lines += [
         "## 逐模块分数",
         "",
         "| 模块 | 杀死 | 计分总数 | 分数 | 存活 | incompetent | 标注等价物 | 登记等价物 |",
@@ -502,7 +874,7 @@ def _render(outcomes: list[Outcome], overall: float) -> str:
         lines.append(
             f"| `{outcome.module.path}` | {outcome.killed} | {outcome.scored} "
             f"| **{outcome.score:.1%}** | {len(outcome.survived)} "
-            f"| {outcome.incompetent} | {outcome.annotation_filtered} "
+            f"| {len(outcome.incompetent)} | {outcome.annotation_filtered} "
             f"| {len(outcome.equivalents)} |"
         )
     lines += [
@@ -510,47 +882,127 @@ def _render(outcomes: list[Outcome], overall: float) -> str:
         f"**合计：{sum(item.killed for item in outcomes)}/"
         f"{sum(item.scored for item in outcomes)} = {overall:.1%}**",
         "",
-        "⚠️ `incompetent` 是「变异之后代码根本跑不起来」（例如把文档字符串",
-        "换成数字），它不反映测试强度，因此**不计分**。",
+        "🔴 `incompetent` **不是**「变异之后代码跑不起来」——那是 KILLED。",
+        "cosmic-ray 的 `run_tests` 只在**它自己抛异常**时才返回这个值：",
+        "被测命令的 `returncode != 0`（测试失败、语法错误、收集失败）一律算",
+        "KILLED，超时也是。所以能进这个桶的只有两种——**输出解码失败**、",
+        "**命令根本没启动起来**。两者都是**度量故障**，不是测试不够强。",
+        "",
+        "实测过一次：Windows 中文区域下被 spawn 的 pytest 按 GBK 写管道，",
+        "`stdout.decode('utf-8')` 抛 `UnicodeDecodeError`，**104 个本来会被",
+        "杀死**的变异体被记成了 incompetent，模块分数从 100% 掉到 7.7%。",
+        "判定表见 `run.py` 的 `_SUBPROCESS_ENV`。",
+        "",
+        "因此：**`incompetent` 非零，或某个模块计分变异体为 0，都直接判失败**"
+        "（退出码非 0），不看分数。0/0 会被算成 100%，那是必须堵死的。",
         "",
         "⚠️ `标注等价物` 是落在**类型标注**范围内的变异。被测模块全部启用",
         "`from __future__ import annotations`（PEP 563），标注在运行期",
         "只是一段字符串——改动它**必然**不改变行为。排除它们是去掉噪声，",
         "不是把分数调上去；前提由 `_assert_pep563_is_active` 逐个模块核对。",
         "",
-        "## 存活变异体（逐条）",
-        "",
     ]
-    if not any(item.survived for item in outcomes):
-        lines.append("（无）")
+
+    # 🔴 先列 incompetent 的样本，再列存活变异体。
+    #   顺序是有意的：incompetent 非零说明**这个分数本身可能不可信**，
+    #   读到存活清单之前就该先看到它。
+    _render_incompetents(lines, outcomes)
+
     for outcome in outcomes:
         if not outcome.equivalents:
             continue
         lines.append(f"### 登记等价物 · `{outcome.module.path}`")
         lines.append("")
-        for item, reason in outcome.equivalents:
-            lines.append(f"- **{item.operator}** @ 第 {item.line} 行")
-            lines.append("  ```diff")
-            lines.extend(f"  {line}" for line in _summarise(item.diff).splitlines())
-            lines.append("  ```")
-            lines.append(f"  **等价理由**：{reason}")
+        lines.append(
+            "每条后面的「覆盖 N 条」是它**实际放行**的变异体数。"
+            "N > 1 不一定是坏事——整族都等价时本来就该一条登记覆盖全族——"
+            "但它必须与理由的论证范围相符：理由只论证了某一个取值，"
+            "却在覆盖多个，那就是放行了没被论证过的东西。"
+        )
         lines.append("")
-    lines.append("")
+        for survivor, entry in outcome.equivalents:
+            covered = sum(
+                1
+                for other_survivor, other_entry in outcome.equivalents
+                if other_entry is entry and other_survivor.line == entry.line
+            )
+            lines.append(f"- **{survivor.operator}** @ 第 {survivor.line} 行（覆盖 {covered} 条）")
+            lines.append("  ```diff")
+            lines.extend(f"  {line}" for line in _summarise(survivor.diff).splitlines())
+            lines.append("  ```")
+            lines.append(f"  **等价理由**：{entry.reason}")
+        lines.append("")
     lines.append("## 存活变异体（逐条）")
     lines.append("")
+    if not any(outcome.survived for outcome in outcomes):
+        lines.append("（无）")
+        lines.append("")
     for outcome in outcomes:
         if not outcome.survived:
             continue
         lines.append(f"### `{outcome.module.path}`")
         lines.append("")
-        for item in outcome.survived:
-            lines.append(f"- **{item.operator}** @ 第 {item.line} 行")
+        for survivor in outcome.survived:
+            lines.append(f"- **{survivor.operator}** @ 第 {survivor.line} 行")
             lines.append("  ```diff")
-            lines.extend(f"  {line}" for line in _summarise(item.diff).splitlines())
+            lines.extend(f"  {line}" for line in _summarise(survivor.diff).splitlines())
             lines.append("  ```")
         lines.append("")
-    lines.append("")
     return "\n".join(lines)
+
+
+#: 报告里最多列出几个 incompetent 样本。
+#:
+#: 样本是用来**归因**的，不是用来穷举的：同一类故障（编码、构造失败、
+#: 语法错误）的 traceback 长得一模一样，列 200 条只会把报告淹掉。
+#: 计数仍然在表格里，一条都不少。
+_MAX_INCOMPETENT_SAMPLES = 5
+
+
+def _render_incompetents(lines: list[str], outcomes: list[Outcome]) -> None:
+    """把 ``INCOMPETENT`` 的样本写进报告。
+
+    🔴 存在的理由：这个分类**曾经把一个度量故障伪装成「测试不够强」**。
+    只留一个计数时，报告上是「104 个 incompetent」，看不出任何异常；
+    而其中 104 个的 ``output`` 全是同一句 ``UnicodeDecodeError``。
+
+    ⚠️ 这一节非空时，**这个分数不可信**——按 `_SUBPROCESS_ENV` 里的判定表，
+    能进这个桶的只有解码失败与命令起不来，没有第三种可能。
+    """
+    total = sum(len(item.incompetent) for item in outcomes)
+    if not total:
+        return
+
+    lines.append("## 🔴 incompetent 样本（分数不可信，先看这里）")
+    lines.append("")
+    lines.append(
+        f"共 **{total}** 条。它们**不计分**，而 `run.py` 会因此 fail-closed。"
+        "判定表：`returncode != 0` 一律 KILLED（跑不起来也是它），"
+        "**只有 cosmic-ray 自己抛异常才进这个桶**——所以这里出现的东西，"
+        "要么是输出解码失败，要么是被测命令根本没启动。"
+    )
+    lines.append("")
+    for outcome in outcomes:
+        if not outcome.incompetent:
+            continue
+        shown = outcome.incompetent[:_MAX_INCOMPETENT_SAMPLES]
+        lines.append(f"### `{outcome.module.path}`（{len(outcome.incompetent)} 条）")
+        lines.append("")
+        if len(outcome.incompetent) > len(shown):
+            lines.append(
+                f"（只列前 {len(shown)} 条；同类故障的 traceback 相同，重复列出来只会淹没报告）"
+            )
+            lines.append("")
+        for entry in shown:
+            lines.append(f"- **{entry.operator}** @ 第 {entry.line} 行")
+            output = entry.output.strip()
+            lines.append("  ```text")
+            if output:
+                lines.extend(f"  {line}" for line in output.splitlines()[-12:])
+            else:
+                lines.append("  （cosmic-ray 没有留下输出）")
+            lines.append("  ```")
+        lines.append("")
 
 
 if __name__ == "__main__":

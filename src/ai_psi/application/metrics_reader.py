@@ -91,9 +91,7 @@ class RoundMetricsReader:
                 for item in selected
             }
 
-        return tuple(
-            _metrics_of(round_, events_by_round[round_.id]) for round_ in selected
-        )
+        return tuple(_metrics_of(round_, events_by_round[round_.id]) for round_ in selected)
 
 
 def _metrics_of(round_: CognitiveRound, events: Sequence[Event]) -> RoundMetrics:

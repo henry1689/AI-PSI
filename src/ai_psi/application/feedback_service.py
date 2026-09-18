@@ -116,7 +116,6 @@ EVALUATION_BY_FEEDBACK_TYPE: Final[dict[FeedbackType, ExperienceEvaluation]] = {
 EVALUATOR_VERSION: Final[str] = "user-correction/1"
 
 
-
 #: 能够带出一条记忆的反馈类型。
 #:
 #: 🔴 白名单，不是黑名单。新增反馈类型时默认**不允许**带出记忆——
@@ -475,9 +474,7 @@ class FeedbackService:
             )
 
         experiences = [
-            item
-            for item in (experience_from_event(event) for event in created)
-            if item is not None
+            item for item in (experience_from_event(event) for event in created) if item is not None
         ]
         current = await self._current_evaluations(uow, experiences)
 
@@ -546,8 +543,7 @@ class FeedbackService:
             and record.experience_id in known
         ]
         return {
-            item.experience.id: item.evaluation
-            for item in assess_experiences(experiences, records)
+            item.experience.id: item.evaluation for item in assess_experiences(experiences, records)
         }
 
     @staticmethod

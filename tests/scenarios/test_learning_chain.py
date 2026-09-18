@@ -269,9 +269,7 @@ class TestThreeRealRoundsCanProduceAProposal:
         assert run.patterns == ()
         assert run.created == ()
 
-    async def test_an_adjudicated_pattern_is_not_proposed_again(
-        self, harness_factory
-    ) -> None:
+    async def test_an_adjudicated_pattern_is_not_proposed_again(self, harness_factory) -> None:
         """🔴 被驳回过的模式**不会**在下一次运行里重新递上来。
 
         阶段 6.5 §四 修正了一处与自身文档矛盾的行为：

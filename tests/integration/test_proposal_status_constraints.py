@@ -125,9 +125,7 @@ class TestForbiddenStatusesAreRejectedByTheDatabase:
         del clean_tables
         async with engine.begin() as conn:
             found = await conn.scalar(
-                text(
-                    "SELECT count(*) FROM pg_constraint WHERE conname = :name"
-                ),
+                text("SELECT count(*) FROM pg_constraint WHERE conname = :name"),
                 {"name": _STATUS_CONSTRAINT},
             )
         assert found == 1, f"约束 {_STATUS_CONSTRAINT} 在数据库里不存在"

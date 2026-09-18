@@ -271,13 +271,9 @@ class TestConfirmationRequiredTypesAlwaysExplainTheRightReason:
         "memory_type",
         [MemoryType.USER_CONFIRMED_FACT, MemoryType.USER_GOAL],
     )
-    def test_already_confirmed_gets_the_whitelist_reason(
-        self, memory_type: MemoryType
-    ) -> None:
+    def test_already_confirmed_gets_the_whitelist_reason(self, memory_type: MemoryType) -> None:
         """🔴 已经确认过的请求**不该**被要求再确认一次。"""
-        decision = WritePolicy().decide(
-            _proposal(memory_type=memory_type, user_confirmed=True)
-        )
+        decision = WritePolicy().decide(_proposal(memory_type=memory_type, user_confirmed=True))
         joined = " ".join(decision.reasons)
         assert "白名单" in joined, decision.reasons
         assert "需要用户明确确认" not in joined, decision.reasons
@@ -288,9 +284,7 @@ class TestConfirmationRequiredTypesAlwaysExplainTheRightReason:
     )
     def test_unconfirmed_gets_the_confirmation_reason(self, memory_type: MemoryType) -> None:
         """反方向——两个方向一起才把那个 `not` 钉住。"""
-        decision = WritePolicy().decide(
-            _proposal(memory_type=memory_type, user_confirmed=False)
-        )
+        decision = WritePolicy().decide(_proposal(memory_type=memory_type, user_confirmed=False))
         assert "需要用户明确确认" in " ".join(decision.reasons), decision.reasons
 
 
