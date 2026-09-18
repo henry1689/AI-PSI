@@ -76,7 +76,11 @@ class InMemoryRoundRepository:
                 expected_version=expected_version,
                 actual_version=current.version,
             )
-        self._uow.stage_round(round_)
+        # 🔴 期望版本一并交给暂存区，**提交时还要再复核一次**。
+        # 这一次检查读的是"可见版本"，而并发冲突恰恰发生在
+        # 暂存之后、提交之前：两个事务都读到 v1、都过得了这一关，
+        # 后提交的那个静默覆盖前一个（见 `InMemoryStore.apply`）。
+        self._uow.stage_round(round_, expected_version=expected_version)
 
     async def find_by_idempotency_key(self, key: str) -> CognitiveRound | None:
         """按幂等键查找既有回合。"""

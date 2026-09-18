@@ -77,7 +77,8 @@ class InMemoryProposalRepository:
                 expected_version=expected_version,
                 actual_version=current.version,
             )
-        self._uow.stage_proposal(proposal)
+        # 🔴 与回合仓储同理：期望版本交给暂存区，提交时在锁内复核。
+        self._uow.stage_proposal(proposal, expected_version=expected_version)
 
     async def list_all(
         self,

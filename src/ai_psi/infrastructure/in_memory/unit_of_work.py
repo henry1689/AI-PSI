@@ -39,6 +39,10 @@ from ai_psi.infrastructure.in_memory.repositories import (
     InMemoryRoundRepository,
 )
 from ai_psi.infrastructure.in_memory.store import (
+    MEMORY_KIND,
+    PROPOSAL_KIND,
+    ROUND_KIND,
+    ExpectedVersions,
     IdempotencyRecord,
     InMemoryStore,
     MemoryIndexEntry,
@@ -102,6 +106,12 @@ class InMemoryUnitOfWork:
         #: 值为 ``None`` 表示"删除该索引项"。
         self._staged_index: dict[UUID, MemoryIndexEntry | None] = {}
 
+        #: 事务开始时观察到的版本，提交时由 store 复核（见
+        #: :meth:`InMemoryStore.apply`）。🔴 **少了它，内存后端的
+        #: 乐观锁只是在 `save()` 那一刻成立**——两个事务都读到 v1、
+        #: 都通过检查、都提交，后一个静默覆盖前一个。
+        self._expected_versions: ExpectedVersions = {}
+
         self.events: EventStore = InMemoryEventStore(self)
         self.rounds: RoundRepository = InMemoryRoundRepository(self)
         self.idempotency: IdempotencyStore = InMemoryIdempotencyStore(self)
@@ -138,6 +148,7 @@ class InMemoryUnitOfWork:
             memories=self._staged_memories,
             index=self._staged_index,
             proposals=self._staged_proposals,
+            expected_versions=self._expected_versions,
         )
         self._committed = True
         self.discard()
@@ -159,6 +170,7 @@ class InMemoryUnitOfWork:
         self._staged_memories = {}
         self._staged_index = {}
         self._staged_proposals = {}
+        self._expected_versions = {}
 
     # ------------------------------------------------------------------
     # 暂存与可见性（供本包的仓储使用）
@@ -168,25 +180,45 @@ class InMemoryUnitOfWork:
         """暂存一个事件并分配序号。"""
         self._staged_events.append((self._store.next_sequence(), event))
 
-    def stage_round(self, round_: CognitiveRound) -> None:
-        """暂存一个回合（新增或更新）。"""
+    def stage_round(self, round_: CognitiveRound, *, expected_version: int | None = None) -> None:
+        """暂存一个回合（新增或更新）。
+
+        🔴 ``expected_version`` 只在**更新**时给。它记录的是
+        "本事务开始看到的是哪一版"，提交时由 store 复核。
+        用 ``setdefault`` 而不是直接赋值：同一事务里对同一实体
+        多次 `save` 时，**第一次**观察到的版本才是这个事务的起点。
+        """
         self._staged_rounds[round_.id] = round_
+        if expected_version is not None:
+            self._expected_versions.setdefault((ROUND_KIND, round_.id), expected_version)
 
     def stage_reservation(self, record: IdempotencyRecord) -> None:
         """暂存一条幂等占位。"""
         self._staged_reservations[record.key] = record
 
-    def stage_memory(self, memory: Memory) -> None:
-        """暂存一条记忆（新增或更新）。"""
+    def stage_memory(self, memory: Memory, *, expected_version: int | None = None) -> None:
+        """暂存一条记忆（新增或更新）。
+
+        ``expected_version`` 的语义与 :meth:`stage_round` 完全一致。
+        """
         self._staged_memories[memory.id] = memory
+        if expected_version is not None:
+            self._expected_versions.setdefault((MEMORY_KIND, memory.id), expected_version)
 
     def stage_index(self, memory_id: UUID, entry: MemoryIndexEntry | None) -> None:
         """暂存一次索引变更；``entry`` 为 ``None`` 表示删除。"""
         self._staged_index[memory_id] = entry
 
-    def stage_proposal(self, proposal: ImprovementProposal) -> None:
-        """暂存一条改进提案（新增或更新）。"""
+    def stage_proposal(
+        self, proposal: ImprovementProposal, *, expected_version: int | None = None
+    ) -> None:
+        """暂存一条改进提案（新增或更新）。
+
+        ``expected_version`` 的语义与 :meth:`stage_round` 完全一致。
+        """
         self._staged_proposals[proposal.id] = proposal
+        if expected_version is not None:
+            self._expected_versions.setdefault((PROPOSAL_KIND, proposal.id), expected_version)
 
     def visible_events(self) -> list[tuple[int, Event]]:
         """返回"已提交 + 本事务暂存"的全部事件。"""

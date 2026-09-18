@@ -300,11 +300,30 @@ class RoundRepositoryContract:
 
         乐观锁冲突是正常业务路径，必须被明确报告——
         静默覆盖是并发场景下最难排查的一类数据损坏（ADR-0002）。
+
+        🔴 **用的是"真实存在过"的旧版本号，不是凭空造一个。**
+
+        阶段 6.5 §八 评审 C 指出：本用例此前传的是
+        ``round_.version + 5``——一个**从未存在过**的版本。
+        它当然也会被拒，但它证明的是"某个够大的数被拒绝了"，
+        而不是"判断是**相等**"。把它改成真实旧版本之后，
+        ``!=`` 被改成 ``>`` 这类变异体才会真的被杀死
+        （``1 > 2`` 为假 → 不抛 → 红灯）。
+
+        ``ProposalRepositoryContract`` 早就改成了这个形状，
+        同一份文件里另外两处没跟上——这正是"教训只修了一处"。
         """
         round_ = _round()
         await round_repository.add(round_)
+
+        # 先做一次**成功**的写入，让库里真的推进到 v2
+        latest = await round_repository.get(round_.id)
+        assert latest is not None
+        await round_repository.save(latest.bumped(), expected_version=latest.version)
+
+        # 现在拿"上一次真实存在过的" v1 再写一次
         with pytest.raises(OptimisticLockError):
-            await round_repository.save(round_.bumped(), expected_version=round_.version + 5)
+            await round_repository.save(round_.bumped(), expected_version=round_.version)
 
     async def test_save_unknown_round_raises_not_found(self, round_repository) -> None:
         with pytest.raises(NotFoundError):
@@ -439,10 +458,20 @@ class MemoryRepositoryContract:
         assert len(await memory_repository.retrieve(user_id=user, query="偏好", limit=2)) == 2
 
     async def test_stale_save_raises(self, memory_repository) -> None:
+        """与 `RoundRepositoryContract` 的那条同理（阶段 6.5 §八 评审 C）。
+
+        此前传的是 ``memory.version + 3``——一个**从未存在过**的版本。
+        改成真实旧版本之后，判据才真的是"相等"而不是"够大"。
+        """
         memory = _memory()
         await memory_repository.add(memory)
+
+        latest = await memory_repository.get(memory.id)
+        assert latest is not None
+        await memory_repository.save(latest.bumped(), expected_version=latest.version)
+
         with pytest.raises(OptimisticLockError):
-            await memory_repository.save(memory.bumped(), expected_version=memory.version + 3)
+            await memory_repository.save(memory.bumped(), expected_version=memory.version)
 
 
 def _proposal(**overrides: object) -> ImprovementProposal:

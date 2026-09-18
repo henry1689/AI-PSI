@@ -17,10 +17,33 @@ from uuid import UUID
 
 from ai_psi.domain.cognitive_rounds import CognitiveRound
 from ai_psi.domain.events import Event
+from ai_psi.domain.exceptions import OptimisticLockError
 from ai_psi.domain.improvement_proposals import ImprovementProposal
 from ai_psi.domain.memories import Memory
 
-__all__ = ["IdempotencyRecord", "InMemoryStore", "MemoryIndexEntry"]
+__all__ = [
+    "MEMORY_KIND",
+    "PROPOSAL_KIND",
+    "ROUND_KIND",
+    "ExpectedVersions",
+    "IdempotencyRecord",
+    "InMemoryStore",
+    "MemoryIndexEntry",
+]
+
+#: 乐观锁复核用到的实体类别。
+#:
+#: 🔴 用字符串而不是类型对象：这三个类别是 `apply()` 在**已提交表**里
+#: 查版本时的分派键，而分派本身需要一次判断——用类型对象既不能免掉
+#: 那次判断，又会让映射的键在断言与报错里显示成 `<class '...'>`。
+ROUND_KIND = "round"
+MEMORY_KIND = "memory"
+PROPOSAL_KIND = "proposal"
+
+#: "``(类别, 实体 id)`` → **事务开始时**观察到的版本"。
+#:
+#: `apply()` 在提交时按它复核，见 :meth:`InMemoryStore.apply`。
+ExpectedVersions = dict[tuple[str, UUID], int]
 
 
 @dataclass
@@ -106,12 +129,26 @@ class InMemoryStore:
         memories: dict[UUID, Memory],
         index: dict[UUID, MemoryIndexEntry | None],
         proposals: dict[UUID, ImprovementProposal],
+        expected_versions: ExpectedVersions | None = None,
     ) -> None:
         """把一次事务的暂存区合并进共享数据。
 
         **这是内存实现里唯一的写入口**，且只在 ``commit()`` 时被调用。
         把它放在 store 上（而不是让工作单元直接改字段）有两个好处：
         锁的边界清楚，且"未提交的写入不可见"这条规则只有一处需要保证。
+
+        🔴 **乐观锁必须在锁内、在写入之前复核一遍。**
+
+        ``save()`` 里的版本检查读的是**可见版本**（已提交 + 本事务暂存），
+        而并发冲突恰恰发生在"暂存之后、提交之前"那一段：
+        两个事务都读到 v1、都通过检查、都提交，后提交的那个
+        **静默覆盖**前一个——没有任何异常，一次写入凭空消失。
+        PostgreSQL 不会这样，因为 ``UPDATE ... WHERE version = ?``
+        是原子的。
+
+        所以这里按 :data:`ExpectedVersions` 再查一次**已提交**版本。
+        检查在**任何写入之前**完成：失败时什么都没改，
+        与 SQL 版本"语句失败、事务回滚"的结果一致。
 
         Args:
             events: 待追加的 ``(sequence, event)``。
@@ -122,8 +159,14 @@ class InMemoryStore:
             proposals: 待写入的改进提案。**值为 ``None`` 表示删除该索引项**——
                 用 ``None`` 而不是"从字典里去掉"来表达删除，
                 是因为"没改过它"与"要删掉它"必须能区分开。
+            expected_versions: 事务开始时观察到的版本；``None`` 表示不复核
+                （只有测试夹具会这么用，生产路径恒传）。
+
+        Raises:
+            OptimisticLockError: 有实体在暂存之后、提交之前被别的写入者改过。
         """
         with self._lock:
+            self._assert_versions_still_hold(expected_versions or {})
             self.events.extend(events)
             self.rounds.update(rounds)
             self.idempotency.update(reservations)
@@ -134,6 +177,50 @@ class InMemoryStore:
                 else:
                     self.index[memory_id] = entry
             self.proposals.update(proposals)
+
+    def _assert_versions_still_hold(self, expected_versions: ExpectedVersions) -> None:
+        """提交前的乐观锁复核。**调用方必须已经持有锁。**
+
+        ⚠️ 已提交表里**没有**这个实体 → 跳过。那不是冲突，是
+        "本事务刚创建了它"：`add()` 不记录期望版本，而 `save()`
+        记录的期望版本只在实体已被提交过时才有意义。
+        """
+        for (kind, entity_id), expected in expected_versions.items():
+            actual = self._committed_version(kind, entity_id)
+            if actual is None or actual == expected:
+                continue
+            msg = (
+                f"乐观锁冲突：{kind} {entity_id} 在提交前被其他写入者改过"
+                f"（期望版本 {expected}，已提交版本 {actual}）。"
+                "🔴 内存实现在这里必须与 PostgreSQL 的 "
+                "`UPDATE ... WHERE version = ?` 表现一致——"
+                "少了这条复核，后提交的事务会**静默覆盖**前一个，"
+                "没有任何异常，一次写入凭空消失"
+            )
+            raise OptimisticLockError(
+                msg,
+                entity_type=kind,
+                entity_id=str(entity_id),
+                expected_version=expected,
+                actual_version=actual,
+            )
+
+    def _committed_version(self, kind: str, entity_id: UUID) -> int | None:
+        """**已提交**数据里该实体的版本；不存在则 ``None``。
+
+        🔴 只读已提交，不读"可见"。两者的差别正是这个缺陷本身：
+        可见 = 已提交 + 本事务暂存，而并发冲突发生在暂存之后。
+        """
+        entity: CognitiveRound | Memory | ImprovementProposal | None
+        if kind == ROUND_KIND:
+            entity = self.rounds.get(entity_id)
+        elif kind == MEMORY_KIND:
+            entity = self.memories.get(entity_id)
+        elif kind == PROPOSAL_KIND:
+            entity = self.proposals.get(entity_id)
+        else:  # pragma: no cover - 类别由本模块的三个常量封闭
+            return None
+        return None if entity is None else entity.version
 
     def clear(self) -> None:
         """清空全部数据（测试夹具用）。"""

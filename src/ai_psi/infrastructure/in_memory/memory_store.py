@@ -111,7 +111,10 @@ class InMemoryMemoryRepository:
                 actual_version=current.version,
             )
 
-        self._uow.stage_memory(memory)
+        # 🔴 与回合仓储同理：`save()` 的检查读的是"可见版本"，
+        # 而并发冲突发生在暂存之后、提交之前。期望版本交给暂存区，
+        # 由 `InMemoryStore.apply` 在锁内、写入之前复核。
+        self._uow.stage_memory(memory, expected_version=expected_version)
         await self._sync_index(memory)
 
     async def delete(self, memory_id: UUID) -> None:
