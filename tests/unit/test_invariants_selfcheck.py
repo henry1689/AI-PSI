@@ -348,3 +348,83 @@ class TestNoProbeLeaks:
 
         assert not inspect.signature(check_structural_invariants).parameters
         assert not inspect.signature(assert_structural_invariants).parameters
+
+
+class TestEachCheckQuotesItsOwnStatement:
+    """🔴 变异测试发现的**真实缺口**：陈述可以"张冠李戴"。
+
+    原有用例只断言了 ``statement != "（宪法中未登记）"``——
+    它挡得住"取不到"，挡不住"取错了"。
+
+    `_statement_of` 的匹配条件被改成 ``!=`` / ``>=`` / ``>`` 之后，
+    它返回的是**另一条**不变量的陈述（或占位符），
+    而上述断言对"另一条的陈述"照样为真。
+
+    后果是自检报告里 I10 的检查结果会挂着 I01 的陈述——
+    一份**看起来完整、实际指错了**的审计记录。
+    """
+
+    def test_the_three_statements_are_pairwise_distinct(self) -> None:
+        statements = [item.statement for item in check_structural_invariants()]
+        assert len(set(statements)) == len(statements) == 3
+
+    def test_each_statement_belongs_to_its_own_invariant(self) -> None:
+        """逐条对照宪法里登记的那一句。"""
+        expected = {item.invariant_id: item.statement for item in INVARIANTS}
+        for check in check_structural_invariants():
+            assert check.statement == expected[check.invariant_id], check.invariant_id
+
+
+class TestTheI10GuardItselfIsAsserted:
+    """🔴 变异测试发现：**门槛守卫的边界**没有被断言。
+
+    `_check_i10` 开头是：
+
+    ```
+    if PROPOSAL_ESCALATION_THRESHOLD < 2:
+        return ... ok=False ...（detail 写明"低于 2 等于允许单次经验推广"）
+    ```
+
+    把 `< 2` 改成 `< 1` 之后，门槛为 1 时的结果仍然是"不通过"——
+    只是**走的是另一条分支**（探针那条），detail 里不再有那句话。
+    原有用例断言了 ``ok is False`` 与 ``"1" in detail``，两者都仍然成立。
+
+    区别在**理由**：一条说"门槛本身被改坏了"，另一条说"某条经验
+    在门槛 1 下被判为达标"。它们指向完全不同的修复动作。
+    """
+
+    def test_threshold_one_is_reported_as_a_broken_guard(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(selfcheck, "PROPOSAL_ESCALATION_THRESHOLD", 1)
+        result = selfcheck._check_i10()
+        assert result.ok is False
+        assert "低于 2" in result.detail, result.detail
+
+    def test_the_intact_guard_says_so_in_its_detail(self) -> None:
+        """正向：门槛正常时，detail 要写明"拒绝低于 2 的取值"。"""
+        result = selfcheck._check_i10()
+        assert result.ok is True
+        assert "低于 2" in result.detail, result.detail
+
+
+class TestTheProbeUsesExactlyTheCountItClaims:
+    """🔴 变异测试发现：探针**构造参数**没有任何测试。
+
+    `_probe_proposal(n)` 造出 n 条支撑经验，`_check_i10` 用
+    `_probe_proposal(1)` 与 `_probe_proposal(PROPOSAL_ESCALATION_THRESHOLD)`
+    分别验证"单条不达标"与"三条达标"。
+
+    把 `1` 改成 `2` 之后，"单条不达标"这半句变成"两条不达标"——
+    仍然为真（2 < 3），因此原有断言照样通过。**探针不再证明它声称的事。**
+    """
+
+    def test_the_probe_builds_the_requested_number(self) -> None:
+        for count in (1, 2, 3):
+            probe = selfcheck._probe_proposal(count)
+            assert len(probe.supporting_experience_ids) == count
+
+    def test_the_probe_ids_are_distinct(self) -> None:
+        """重复的 id 会让"三条经验"实际只有一条——门槛形同虚设。"""
+        probe = selfcheck._probe_proposal(3)
+        assert len(set(probe.supporting_experience_ids)) == 3

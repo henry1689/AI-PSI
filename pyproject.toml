@@ -37,6 +37,7 @@ dev = [
     "hypothesis>=6.115",
     "mypy>=1.13",
     "ruff>=0.8",
+    "cosmic-ray>=8.7.0",
 ]
 
 [build-system]

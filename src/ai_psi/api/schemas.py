@@ -722,3 +722,128 @@ class RejectProposalRequest(BaseModel):
     def _reason_must_say_something(cls, value: str) -> str:
         """🔴 一条"看不见理由"的驳回，等于把"不想做"记成了"做不了"。"""
         return _reject_if_blank(value)
+
+
+# ---------------------------------------------------------------------------
+# 学习链路（任务书 §11，阶段 6.5 §四/§七）
+# ---------------------------------------------------------------------------
+
+
+class LearningRunRequest(BaseModel):
+    """跑一次学习链路的输入。
+
+    🔴 **全部字段可选，且没有任何一个是"批准"。**
+
+    这条路径能做的只有"跑一次链路、生成 DRAFT 草案"。
+    批准与驳回在 `improvement-proposals/*` 那几条路由上，
+    而且必须先评估（不变量 11）。
+    """
+
+    model_config = _STRICT_TRIMMED
+
+    fix_direction: str | None = Field(
+        default=None,
+        max_length=_NOTE_MAX,
+        description="严重错误的明确修复方向（若有）。⚠️ 只影响理由与条件二，不影响次数门槛",
+    )
+    baseline_round_ids: list[UUID] | None = Field(
+        default=None,
+        max_length=_LIST_MAX,
+        description=(
+            "离线评测的基线回合。``None`` 表示只算全部回合的基线快照——"
+            "那仍然是一次真实评测，只是**没有对照**（§11.3 条件三记为「未评估」）"
+        ),
+    )
+    candidate_round_ids: list[UUID] | None = Field(
+        default=None,
+        max_length=_LIST_MAX,
+        description="对照用的候选回合；``None`` 表示没有候选数据，**不等于**「没有退化」",
+    )
+    actor_id: str = Field(default="learning_service", min_length=1, max_length=_ACTOR_ID_MAX)
+
+
+class SuppressedObservation(BaseModel):
+    """一个**没有被放行**的观察，连同理由。
+
+    🔴 它必须出现在响应里。一份只说"生成了 0 条提案"的报告
+    无法回答"为什么没有"——而那正是下一次运行时最需要知道的事。
+    """
+
+    model_config = _STRICT
+
+    error_class: str | None = None
+    situation_signature: str | None = None
+    reasons: list[str] = Field(default_factory=list)
+
+    @classmethod
+    def from_entry(cls, pattern: object, reasons: tuple[str, ...]) -> SuppressedObservation:
+        """从 ``LearningRun.suppressed`` 的一项构造。
+
+        🔴 **情境签名必须带上。** 只说"某个模式没过门禁"是不够的——
+        运维要知道的是**哪一个**模式，否则这份清单无法指导任何动作。
+        `LearningRun.suppressed` 的第一项在"未达模式门槛"那一支里是
+        ``None``（那时连模式都没形成），因此这里两栏都可为 ``None``，
+        而理由里会写清是哪一种。
+        """
+        from ai_psi.learning.pattern_detector import ErrorPattern
+
+        typed = pattern if isinstance(pattern, ErrorPattern) else None
+        return cls(
+            error_class=None if typed is None else typed.error_type.value,
+            situation_signature=None if typed is None else typed.situation_signature,
+            reasons=list(reasons),
+        )
+
+
+class LearningRunResponse(BaseModel):
+    """一次学习链路运行的结果。
+
+    🔴 ``comparison_available`` 必须回传，**包括它为 false 的时候**。
+    单侧数据不能作为"改动没有退化"的证据——两者的区别要能从
+    响应里读出来，而不是靠调用方去猜。
+    """
+
+    model_config = _STRICT
+
+    experiences_considered: int = Field(ge=0)
+    unreadable_experiences: int = Field(ge=0)
+    unreadable_evaluations: int = Field(ge=0)
+    patterns_found: int = Field(ge=0)
+    gate_approved: int = Field(ge=0)
+    created_proposal_ids: list[UUID] = Field(default_factory=list)
+    already_covered: int = Field(ge=0)
+    suppressed: list[SuppressedObservation] = Field(default_factory=list)
+    comparison_available: bool = Field(
+        description=(
+            "离线评测是否真的做了对照。🔴 **false 不等于「没有退化」**——"
+            "它表示没有候选数据，条件三因此记为「未评估」而不是「不成立」"
+        )
+    )
+    evaluation_reasons: list[str] = Field(default_factory=list)
+    summary: str
+
+    @classmethod
+    def from_run(cls, run: object) -> LearningRunResponse:
+        """从 ``LearningRun`` 构造响应。"""
+        from ai_psi.application.learning_service import LearningRun
+
+        assert isinstance(run, LearningRun)
+        comparison = run.offline_evaluation
+        return cls(
+            experiences_considered=run.experiences_considered,
+            unreadable_experiences=run.unreadable_experiences,
+            unreadable_evaluations=run.unreadable_evaluations,
+            patterns_found=len(run.patterns),
+            gate_approved=len(run.candidates),
+            created_proposal_ids=[item.proposal.id for item in run.created],
+            already_covered=len(run.already_covered),
+            suppressed=[
+                SuppressedObservation.from_entry(pattern, reasons)
+                for pattern, reasons in run.suppressed
+            ],
+            comparison_available=(
+                False if comparison is None else comparison.comparison_available
+            ),
+            evaluation_reasons=[] if comparison is None else list(comparison.reasons),
+            summary=run.summary(),
+        )
