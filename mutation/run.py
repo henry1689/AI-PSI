@@ -165,7 +165,9 @@ MODULES: tuple[Module, ...] = (
     Module(
         "experiences",
         "src/ai_psi/domain/experiences.py",
-        "pytest tests/unit/test_experiences_proposals.py tests/unit/test_pattern_detector.py",
+        "pytest tests/unit/test_experiences_proposals.py"
+        " tests/unit/test_experiences_semantics.py"
+        " tests/unit/test_pattern_detector.py",
     ),
 )
 
@@ -335,6 +337,145 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
             "那测的是「别对字符串用 is」这条代码风格，"
             "而不是本模块对外的任何保证"
         ),
+    ),
+    # ------------------------------------------------------------------
+    # domain/experiences.py：**枚举比较**与**派生字段长度**两族。
+    #
+    # 🔴 这一族数量不少，但它们的成立条件是**同一个**，所以理由写在一起：
+    #
+    # 《枚举比较》：本仓库一律用 `is` 比较枚举成员。`is` 与
+    # `==` / `!=` / `is not` 在所有可达输入上同答案，因为
+    # (1) 枚举成员是单例；(2) 调用方**只传成员**——字段的类型标注是
+    # `ExperienceEvaluator`，pydantic 会把 JSON 里的字符串**强制转换**
+    # 成成员，所以到达比较时它已经是成员了。
+    # ⚠️ 这条理由的边界值得记住：**传裸字符串**会让 `is` 与 `==` 分家，
+    # 而那时 `is` 会把一个裸的 "internal_metacognition" 判成
+    # 「不是内部元认知」——**静默地放行自我确认**。当前不可达，
+    # 已记入 docs/risks.md（R59），不是靠"测不出来"糊过去的。
+    #
+    # 《StrEnum 的字典序》：少数几条是 `<` / `>=` 落在同一个枚举上。
+    # StrEnum 的排序比的是**字符串**，而这些成员的字面量恰好使答案与
+    # `is` / `is not` 相同——**侥幸等价**。守它的用例是
+    # `TestTheEnumLiteralsSomeEquivalencesRestOn`：改任何一个成员的字面量，
+    # 那条会先红，而不是让这里的登记悄悄开始放行真变异。
+    # ------------------------------------------------------------------
+    Equivalent(
+        module="experiences",
+        operator="core/NumberReplacer",
+        line=287,
+        mutation="min_length= 0",
+        reason=(
+            "`canonical_key` 由 `_check_canonical_identity` 钉死为**派生值**"
+            "（与 (回合, 评价对象, 种类, 抽取器版本) 逐字一致），而派生值"
+            "最短也有 42 个字符。把下界从 1 降到 0，**没有任何输入**能"
+            "走到那条长度检查——一致性校验先拒绝了它。"
+            "⚠️ 这依赖「派生值永远不短」这个事实，而它由 `canonical_key_for` "
+            "的拼接方式保证（四段用 `|` 连接，含 36 字符的 UUID）"
+        ),
+    ),
+    Equivalent(
+        module="experiences",
+        operator="core/NumberReplacer",
+        line=287,
+        mutation="min_length= 2",
+        reason=(
+            "同上，方向反过来：把下界抬到 2 也不会拒掉任何东西——"
+            "派生值同样是 42 字符起步。两半都要登记，因为"
+            "「没有输入能走到这里」对**两侧**都成立"
+        ),
+    ),
+    Equivalent(
+        module="experiences",
+        operator="core/ReplaceTrueWithFalse",
+        line=470,
+        mutation="slots=False",
+        reason=(
+            "`ExperienceAssessment` 的 `frozen=True` **本身**就拒绝一切属性"
+            "赋值（由 `test_it_cannot_be_mutated` 钉住），`slots` 只影响"
+            "内存布局与 `__dict__` 是否存在，而没有任何代码读 `__dict__`。"
+            "与 `invariants` @54 同族。⚠️ 同族的 `frozen=True → False` "
+            "**是真变异**，已经被同一条用例杀掉"
+        ),
+    ),
+    Equivalent(
+        module="experiences",
+        operator="core/ReplaceComparisonOperator_Gt_GtE",
+        line=539,
+        mutation="rank >= evaluation.rank",
+        reason=(
+            "`ExperienceEvaluation` 四档的 `rank` **互异**（0/1/2/3，"
+            "由 `test_the_ranks_are_distinct` 钉住）。等秩 ⟹ 它们是"
+            "**同一个成员**，于是 `evaluation = record.evaluation` 是一次"
+            "空操作。`>` 与 `>=` 只在等秩时分叉，而那时分叉不可观察"
+        ),
+    ),
+    Equivalent(
+        module="experiences",
+        operator="core/ReplaceComparisonOperator_IsNot_Lt",
+        line=580,
+        mutation="evaluation < ExperienceEvaluation.UNASSESSED",
+        reason=(
+            "StrEnum 的 `<` 比**字符串**。实测：suspected / supported / "
+            'confirmed 三个值都 `< "unassessed"`，而 unassessed 不 `<` 自己'
+            "——于是 `x < UNASSESSED` 与 `x is not UNASSESSED` 对全部四个成员"
+            "答案相同。⚠️ **侥幸等价**，见本段的《StrEnum 的字典序》"
+        ),
+    ),
+    Equivalent(
+        module="experiences",
+        operator="core/ReplaceComparisonOperator_IsNot_NotEq",
+        line=580,
+        mutation="evaluation != ExperienceEvaluation.UNASSESSED",
+        reason="《枚举比较》：同段说明。`!=` 与 `is not` 对成员输入同答案",
+    ),
+    Equivalent(
+        module="experiences",
+        operator="core/ReplaceComparisonOperator_Is_GtE",
+        line=588,
+        mutation="evaluation >= ExperienceEvaluation.UNASSESSED",
+        reason=(
+            "《StrEnum 的字典序》的另一半：除 unassessed 之外的三个值都"
+            '`< "unassessed"`，因此 `x >= UNASSESSED` 只在 x 就是'
+            "unassessed 时为真——与 `x is UNASSESSED` 同答案。⚠️ 侥幸等价"
+        ),
+    ),
+    Equivalent(
+        module="experiences",
+        operator="core/ReplaceComparisonOperator_Is_Eq",
+        line=588,
+        mutation="evaluation == ExperienceEvaluation.UNASSESSED",
+        reason="《枚举比较》：同段说明",
+    ),
+    Equivalent(
+        module="experiences",
+        operator="core/ReplaceComparisonOperator_Is_Eq",
+        line=596,
+        mutation="evaluator == ExperienceEvaluator.INTERNAL_METACOGNITION",
+        reason=(
+            "《枚举比较》：同段说明。⚠️ 这一条尤其要记住它的边界——"
+            "`is` 与 `==` 的分叉点正是「来了一个非成员」，而那时 `is` 会"
+            "**静默放行**自我确认（见 R59）"
+        ),
+    ),
+    Equivalent(
+        module="experiences",
+        operator="core/ReplaceComparisonOperator_Gt_IsNot",
+        line=597,
+        mutation="rank is not ExperienceEvaluation.SUSPECTED.rank",
+        reason=(
+            "`_EXPERIENCE_EVALUATION_RANK` 的取值是 0/1/2/3，全部落在 CPython "
+            "的小整数缓存里，因此 `rank is not 1` 与 `rank != 1` 同答案。"
+            "而 `rank == 0`（unassessed）在那之前已经被 588 那一问拦掉，"
+            "到不了这里。⚠️ 同样是**侥幸等价**：门槛一旦超过 256，"
+            "`is not` 立刻变成真变异"
+        ),
+    ),
+    Equivalent(
+        module="experiences",
+        operator="core/ReplaceComparisonOperator_Gt_NotEq",
+        line=597,
+        mutation="rank != ExperienceEvaluation.SUSPECTED.rank",
+        reason="同上：rank 的四个取值互异且都在小整数缓存内，`!=` 与 `>` 同答案",
     ),
 )
 
