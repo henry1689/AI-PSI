@@ -259,6 +259,45 @@ class TestThreeRealRoundsCanProduceAProposal:
         assert run.patterns == ()
         assert run.created == ()
 
+    async def test_one_round_with_one_correction_is_still_one_occurrence(
+        self, harness_factory
+    ) -> None:
+        """🔴 §八 评审 B 的反例：**1 个回合 + 1 次真实纠正**凑不出提案。
+
+        修复前，评选用这条从**正式学习入口**落库过一条提案：
+        同一个回合被抽取三次，每次填一个不同的 ``independence_group``，
+        门禁就看到"独立发生 3 次"，而 ``data_quality``、经验条数、
+        评价档位**全都正常**——那条路径上没有任何地方看得出来。
+
+        修复后分组是派生值（``round:<回合>``）：同一回合的任意多次抽取
+        落在同一个分组里，塌缩成一次发生。
+
+        ⚠️ 本用例与单元层的"伪造的分组构造不出来"**不重复**。
+        单元层证明的是对象建不出来；这里证明的是**正式入口那一侧
+        也算不出三次**——两条链路的失败模式完全不同，
+        一条挡住构造、一条挡住计数，缺任何一条，另一条都是纸糊的。
+        """
+        harness: Harness = harness_factory(responses=_scripted_round(missing_counterexample=True))
+        round_ids = await _rounds_with_correction(harness, count=1, correction=True)
+
+        # 前提一：这一回合**确实**产出了经验，而且它的分组就是那个回合。
+        # 少了这条断言，「没有提案」会被"压根没有经验"冒充。
+        experiences = await _experiences_from(harness, round_ids[0])
+        assert len(experiences) == 1, [item.canonical_key for item in experiences]
+        assert experiences[0].independence_group == f"round:{round_ids[0]}"
+
+        run = await harness.learning_service.review()
+
+        assert run.patterns == ()
+        assert run.created == ()
+        # 前提二：门禁看到的**发生次数是 1，不是 3**。
+        # 一条真实纠正已经把这条经验抬到计权的档位（加权计数 1），
+        # 所以这里唯一能挡下它的就是次数——而那句措辞里带着门禁
+        # 实际数出来的数字，正是修复前会是 3 的那个位置。
+        reasons = [reason for _, items in run.suppressed for reason in items]
+        assert any("发生 1 次" in reason for reason in reasons), reasons
+        assert not any("发生 3 次" in reason for reason in reasons), reasons
+
     async def test_unattributed_rounds_never_reach_the_threshold(self, harness_factory) -> None:
         """判不了的经验不参与计数——跑多少次、纠正多少次都不会"凑"出一个模式。"""
         harness: Harness = harness_factory(responses=_scripted_round(missing_counterexample=False))

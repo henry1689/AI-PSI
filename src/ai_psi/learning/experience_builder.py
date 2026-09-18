@@ -179,10 +179,15 @@ class ExperienceBuilder:
             evaluation_target=target,
             origin_event_ids=list(record.origin_event_ids),
             extractor_version=EXTRACTOR_VERSION,
+            # 🔴 分组与它的**输入**一起写进经验。只写分组的话，
+            # ``Experience`` 上的校验器拿不到幂等键，重算不出期望值——
+            # 那条校验就会退化成"校验器相信调用方填的东西"
+            # （阶段 6.5 §八 评审 B 实测：伪造分组可从正式入口落库提案）。
             independence_group=independence_group_for(
                 idempotency_key=record.idempotency_key,
                 cognitive_round_id=record.cognitive_round_id,
             ),
+            idempotency_key=record.idempotency_key,
             canonical_key=canonical_key_for(
                 cognitive_round_id=record.cognitive_round_id,
                 evaluation_target=target,

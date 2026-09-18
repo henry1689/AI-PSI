@@ -47,14 +47,14 @@ pytestmark = pytest.mark.unit
 
 #: 身份字段——都由 ``min_length=1`` 约束，且都参与某种"这是谁"的判定。
 #:
-#: ⚠️ ``canonical_key`` **不在**这张表里：它由一致性校验钉死成派生值，
-#: 而派生值最短也有 42 个字符，因此它的 ``min_length`` 改不出行为差异
+#: ⚠️ ``canonical_key`` 与 ``independence_group`` **不在**这张表里：
+#: 两者都由一致性校验钉死成派生值，而派生值最短也有好几十个字符，
+#: 因此它们的 ``min_length`` 改不出行为差异
 #: （登记为等价变异，见 ``mutation/run.py``）。
 _IDENTITY_FIELDS = (
     "situation_signature",
     "inquiry_type",
     "evaluation_target",
-    "independence_group",
     "extractor_version",
 )
 
@@ -181,6 +181,69 @@ class TestTheValidatorsActuallyRefuseThings:
             ),
         )
         assert built.canonical_key.endswith(EXTRACTOR_VERSION)
+
+    # ------------------------------------------------------------------
+    # 🔴 §八 评审 B 的 B0：``independence_group`` 曾经是一个
+    # **没有任何校验**的自由字符串，而它才是门槛的计量单位。
+    # 评审用"1 个回合 + 1 次真实纠正"从正式入口落库了一条提案。
+    # ------------------------------------------------------------------
+
+    def test_a_hand_written_independence_group_is_refused(self, make_experience) -> None:
+        """🔴 分组是**派生值**，不是自由字段。
+
+        它是门槛的计量单位——"这件事发生过几次"就是数它有几个不同取值。
+        允许随手填，等于让**调用方**决定门槛有没有被跨过，
+        而下游（门禁、提案、审计数字）看不出任何异常。
+        """
+        with pytest.raises(ValidationError, match="independence_group"):
+            make_experience(independence_group="idem:我自己编的")
+
+    def test_the_group_follows_the_round(self, make_experience) -> None:
+        """事实改了、分组没跟着改，同样要拒绝——与 ``canonical_key`` 对称。
+
+        上一条只证明"乱填会被拒"，这一条证明的是**精确一致**：
+        拿着**另一个回合**算出来的分组来构造，也必须炸。
+        """
+        experience = make_experience()
+        with pytest.raises(ValidationError, match="independence_group"):
+            make_experience(
+                cognitive_round_id=uuid4(),
+                independence_group=experience.independence_group,
+            )
+
+    def test_the_idempotency_key_is_what_moves_the_group(self, make_experience) -> None:
+        """正向对照：没有它，上面两条对"一律拒绝"的实现也成立。
+
+        ⚠️ 造键要传 ``idempotency_key``，**不能**传 ``independence_group``——
+        这正是 ``Experience`` 必须**同时**存下幂等键的原因：
+        只存分组的话，校验器没有重算的输入，那条校验就等于没有。
+        """
+        round_id = uuid4()
+        without_key = make_experience(cognitive_round_id=round_id, judgment_id=uuid4())
+        assert without_key.independence_group == f"round:{round_id}"
+
+        with_key = make_experience(
+            cognitive_round_id=uuid4(), judgment_id=uuid4(), idempotency_key="client-retry-1"
+        )
+        assert with_key.independence_group == "idem:client-retry-1"
+
+    def test_the_group_ignores_the_judgment_but_the_key_does_not(self, make_experience) -> None:
+        """🔴 同一回合的**不同判断**共用分组，但它们的 ``canonical_key`` 不同。
+
+        两件事都要钉住：
+
+        * 分组的输入里**没有** ``judgment_id`` —— 同一回合的不同判断
+          共享同一份证据、同一次模型调用、同一段推理上下文，因此
+          **不是**彼此的独立证据（§二.12 有意反转了阶段 6 的结论）；
+        * ``canonical_key`` 里有 —— 它们确实是不同的认知产物，
+          不该被唯一约束当成同一条。
+        """
+        round_id = uuid4()
+        first = make_experience(cognitive_round_id=round_id, judgment_id=uuid4())
+        second = make_experience(cognitive_round_id=round_id, judgment_id=uuid4())
+        assert first.judgment_id != second.judgment_id
+        assert first.canonical_key != second.canonical_key
+        assert first.independence_group == second.independence_group
 
     def test_internal_metacognition_cannot_self_confirm_at_extraction_time(
         self, make_experience

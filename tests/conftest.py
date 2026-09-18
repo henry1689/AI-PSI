@@ -202,16 +202,23 @@ def make_experience() -> Factory:
             "extractor_version": EXTRACTOR_VERSION,
         }
         payload.update(overrides)
-        # 身份字段按**最终**值派生：调用方覆盖了回合或判断 id 之后，
-        # 键必须跟着走，否则会撞上 ``canonical_key`` 的一致性校验
-        # （那条校验是有意的——它拦的正是"改了事实却忘了改键"）。
+        # 身份字段按**最终**值派生：调用方覆盖了回合、判断 id 或幂等键
+        # 之后，键必须跟着走，否则会撞上 ``canonical_key`` /
+        # ``independence_group`` 的一致性校验（那两条校验是有意的——
+        # 它们拦的正是"改了事实却忘了改键"）。
+        #
+        # ⚠️ 反过来也成立：**显式传** ``independence_group``（或
+        # ``canonical_key``）就是在伪造身份，校验器会拒绝。想构造
+        # "分组对不对"的用例，请传 ``cognitive_round_id`` 与
+        # ``idempotency_key``，让键自己长出来。
         payload.setdefault(
             "evaluation_target", evaluation_target_for_judgment(payload["judgment_id"])
         )
         payload.setdefault(
             "independence_group",
             independence_group_for(
-                idempotency_key=None, cognitive_round_id=payload["cognitive_round_id"]
+                idempotency_key=payload.get("idempotency_key"),
+                cognitive_round_id=payload["cognitive_round_id"],
             ),
         )
         payload.setdefault(

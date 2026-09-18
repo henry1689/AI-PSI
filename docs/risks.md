@@ -81,6 +81,19 @@
 | **R58** | **归因判据里仍有四条在生产上不可达** | `_from_failure`（失败回合不构经验）、`_from_budget`（刻意不喂）、`_from_memory_rejection`（无生产者）、`_from_user_feedback`（反馈在回合之后到达，无回流路径） | 与 R46/R50 同源。阶段 6.5 §二 接通了"反馈抬高评价"这条路径，但**没有**给归因回路加新输入——那需要失败回合产生经验（R50）与记忆拒绝回流，两者都是阶段 7 的显式待办 |
 | **R59** | 🔴 **§二.4 那条硬线依赖"调用方传的是枚举成员"** | `assert_evaluator_may_produce` 用 `evaluator is ExperienceEvaluator.INTERNAL_METACOGNITION` 判断。**如果**一个非成员值（例如从 JSON 直接取出的裸字符串 `"internal_metacognition"`）到达这里，`is` 会判为「不是内部元认知」——于是**静默放行自我确认**，而 `==` 会正确拦住 | **当前不可达**：该函数的两个调用点都来自 pydantic 模型字段（`ExperienceEvaluator` 标注，pydantic 会把 JSON 字符串**强制转换**成成员），mypy 也在调用点强制类型。它被记下来是因为失效方式是**静默地反向**——类型纪律一旦在某处松动（例如将来加一个绕过 pydantic 的适配器），这条不变量不是"失效"而是"变成放行"。加固只要三行（进来先 `isinstance` 断言），但没有真实路径触发它，因此留作显式残余风险而不是现在就加一个不可达分支 |
 
+> **以下 R60–R65 来自阶段 6.5 §八 的独立评审。** 它们全部是
+> **评审主动构造出反例之后**才被记下来的——也就是说，在记录它们之前，
+> 每条都有一个可运行的攻击路径。
+
+| # | 风险 | 影响 | 缓解 |
+|---|---|---|---|
+| **R60** | 🔴 **PostgreSQL 上声称的 `canonical_key` 部分唯一索引从未建立** | ADR-0020 §2 与 ADR-README 的 G19 都写了 `CREATE UNIQUE INDEX ... ON events ((payload->'experience'->>'canonical_key'))`，**读起来像已经建好了**。实测 dev/test 两个库该索引数均为 0，迁移链 head 里没有任何一个迁移提到它 | 处置是**把文档降级为设计意向**（ADR-0020 §2），而不是补建索引。理由：门槛的计量单位是 `independence_group` 而非 `canonical_key`（同键必同组，在计数端已经塌缩），而 PG-only 约束会让两个后端在 `tests/contract/` 的同一组断言上分家。后果限于**存储冗余**：同一回合的经验可被写入两次，`experience_count` 与 `occurrence_count` 的差会变大——系统把两者都报出来正是为了让冗余可见 |
+| **R61** | 🔴 **`GateVerdict` 的"第二道防线"只挡随手构造，不挡进程内伪造** | ADR-0022 §3 称真正的防线是"必须同时伪造一份达标的 `ErrorPattern` 与准许的 `PromotionDecision`"。评审实测：`dataclasses.replace`（**把 `_token` 原样带过来**，且是**正常库调用**）、`object.__new__`、`copy.copy`、`deepcopy`、`pickle`、子类化——**全部绕过**。而 `ErrorPattern` / `PromotionDecision` 是零校验的裸 frozen dataclass，"达标"退化成手打一个数字 | 进程内防伪在 Python 里**做不到**，因此不假装做到：ADR-0022 §3 已按实测逐条更正。真正的保证是调用纪律（落库必须携带 `GateVerdict`，且它只能由 `ProposalGate.review()` 从仓储重查重算后产出）加上可复核的审计数字。**能在进程内执行任意 Python 的主体，已经越过了本系统的边界** |
+| **R62** | **仅靠伪造事件流即可走完学习链路** | 6 条伪造事件（3 条 `experience.created` + 3 条伪造的"用户纠正"评价，全部引用同一个幽灵 UUID）→ 正式学习入口 → 生成并落库提案。全程没有伪造 `GateVerdict`，也没有任何真实用户参与 | 比 R61 **更难被代码评审拦住**：它用的全是**合法的写入原语**。唯一可能的防线是"事件流里的经验必须能追到真实的回合"，而 `origin_event_ids` 虽然存了锚点，**没有任何东西去核对它**（与 R63 同源）。V0.1 不引入跨事件核对（代价与误拒风险需单独评估），按残余风险记录 |
+| **R63** | **`evidence_refs` 从不与事件流核对** | `ExperienceEvaluationRecord._check_confirmation_needs_evidence` 只拦**空列表**。引用一个不存在的证据 uuid 照样被接受，于是"SUPPORTED / CONFIRMED 只能来自系统之外"这句话在数据层**没有可证伪的落点** | 与 R62 互为表里：两者都是"事件流里的断言没有被交叉核对"。真正的核验要遍历事件存储逐条比对，代价是每次学习运行多一遍全量读；误拒风险（保留策略裁剪掉早期证据）尚未评估。V0.1 记风险 |
+| **R64** | **`ProposalGate` 的权重表是公开构造参数** | `ProposalGate(reader, weighting=…)` 接受任意权重表，而校验只有"非负 + 非递减"。注入一张 `SUSPECTED = 1` 的表即可让**内部怀疑**参与计权，绕过 §二.6–7 那条"内部怀疑不是证据"的规则 | 这是**依赖注入的固有代价**，不是缺陷：生产路径上唯一被注入的是 `DEFAULT_WEIGHTING`（组合根固定），`tests/unit/test_evaluation_weighting.py` 对默认表逐项断言。记下来是因为"默认值是对的"与"改成别的会被拦"是两件事——**后者不成立** |
+| **R65** | **`extractor_version` 是自由字符串，同一回合可产出无限多个 `canonical_key`** | `Experience` 的一致性校验器逐字核对 `canonical_key` 与四个来源，但 `extractor_version` 本身没有上界——传 `"v1"` 与 `"v2"` 就能让同一回合同一判断得到两个不同的键 | ⚠️ **它不抬高门槛计数**：门槛数的是 `independence_group`（由幂等键 / 回合 id 决定，与 `extractor_version` 无关），两条不同键的经验仍落在同一分组里、仍塌缩成一次发生。钉死版本号会让"版本升级后回放旧事件"**全部读不回来**，代价远大于收益。等真的需要"一条经验只有唯一一份"时，再引入历史版本登记表 |
+
 ---
 
 ## 4. 范围风险

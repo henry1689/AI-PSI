@@ -96,12 +96,13 @@
 
 ### 决策
 
-`Experience` 增加五个字段：
+`Experience` 增加六个字段：
 
 ```
 evaluation_target     形如 "judgment:<uuid>"，本经验评价的是**什么**
 experience_kind       ROUND_OUTCOME（V0.1 唯一一种）
 origin_event_ids      产生本经验的**事件**（回放重建的锚点）
+idempotency_key       该回合的客户端幂等键（与 CognitiveRound 同值）
 independence_group    独立性分组
 canonical_key         规范标识
 extractor_version     抽取逻辑的版本
@@ -121,6 +122,42 @@ independence_group = "idem:<幂等键>"  若该回合有幂等键
 `canonical_key` 写在模型校验器里逐字核对：允许调用方随手填一个字符串，
 等于允许"两条不同的经验共用一个键"（被唯一约束静默拒绝）
 或"同一条经验换一个键"（被重复计数），两者都是无声的。
+
+### 🔴 `independence_group` 同样必须逐字核对（阶段 6.5 §八 评审 B 补）
+
+**初版只核对了 `canonical_key`，而那是核错了对象。**
+
+`canonical_key` 只决定唯一约束；真正决定"这件事发生过几次"的是
+`independence_group`（见下节）。初版里它是一个 `min_length=1` 的
+**自由字符串**，`Experience` 上**没有**任何东西把它绑到回合或幂等键。
+
+评审构造出的反例，端到端跑通了整条链路：
+
+> **1 个回合 + 1 次真实用户纠正** → 同一个回合抽取三次、各填一个不同的
+> `independence_group` → 门禁 `authorised=True 发生=3 加权=3 门槛=3`
+> → 经**正式学习入口**生成并落库提案。
+>
+> 而 `data_quality`、经验条数、评价档位**全都正常**——
+> 那条路径上没有任何地方看得出来。
+
+既有测试 `test_same_round_different_judgments_are_one_occurrence` 是绿的，
+因为 fixture 与 `ExperienceBuilder` 都**正确派生**了分组：
+它证明的是"分组正确时会塌缩"，从未证明"分组错误时会被拦"。
+
+**两条修正：**
+
+1. `Experience` 增加 `idempotency_key` 字段。校验器要能**重算**分组，
+   就必须先拿得到它的输入；只存分组的话，那条校验等于没有。
+   它可以从 `CognitiveRound` 读，而经验一旦写进事件流，回合就不在手上了。
+2. 增加 `Experience._check_independence_group`，逐字比对重算结果，
+   与 `_check_canonical_identity` 对称。
+
+**这是"派生值必须由事实算出"这条规则的完整形态**：不是"两个派生值里
+挑一个核对"，而是**每一个被下游当作事实用的派生值都要核对**。
+
+⚠️ 这条校验拦的是"分组与它声称的事实不符"，**不是**"事实本身不够好"。
+客户端不带幂等键地重发（下面的已知边界）仍然会得到新回合、新分组——
+那是语义问题，本校验管不着，也不该假装管得着。
 
 ### `independence_group` 的语义与它的边界
 
@@ -159,24 +196,55 @@ independence_group = "idem:<幂等键>"  若该回合有幂等键
 历史上已写入的 `experience.created` 负载用的是这个名字——
 **改字段名是一次数据迁移，不是一次重命名。**
 
-### 唯一约束落在哪里
+### 唯一约束落在哪里 —— ⚠️ **设计与实现状态不一致，此处如实更正**
 
-要求是"在真实 PostgreSQL 建立必要唯一约束，
+阶段 6.5 的要求是"在真实 PostgreSQL 建立必要唯一约束，
 防止同一回合重复抽取冒充独立经验"。
 
-本 ADR 选择**不建 `experiences` 表**，而是在 `events` 上建
-**部分唯一索引**：
+本 ADR 初版在这里写了一段 SQL，读起来像**已经建好了**：
 
 ```sql
 CREATE UNIQUE INDEX ... ON events ((payload -> 'experience' ->> 'canonical_key'))
 WHERE event_type = 'experience.created';
 ```
 
-理由：ADR-0018 决定"经验不建表"（README 索引里的 G17）的依据是
-它**不可变、不需要乐观锁**，而"同回合重复抽取"要挡的是**写入**
-这件事，不是读取。
-建表会在事件流之外多出一份真相来源，而它要回答的问题
-（这条经验是不是已经记过了）恰恰由事件流自己回答。
+🔴 **它从来不存在。** 阶段 6.5 §八 评审 F4 实测：
+
+```
+dev / test 两个库：canonical 索引数 = 0
+events 表上现有索引：pk_events、uq_events_sequence、ix_events_correlation_id、
+                    ix_events_round_sequence、ix_events_type_recorded、ix_events_user_sequence
+迁移链 head：没有任何一个迁移提到 canonical
+```
+
+**处置：这一段从"已实现"降级为"设计意向"，并写明为什么最终没建。**
+
+#### 为什么最终没有建它
+
+不是因为"忘了"，也不是因为"没必要"，而是因为**它挡的东西已经
+在更靠前、且对两个后端都生效的地方被挡住了**：
+
+1. **门槛的计量单位是 `independence_group`，不是 `canonical_key`。**
+   两条 `canonical_key` 相同的经验必然来自同一个回合，因此必然落在
+   同一个分组里，在
+   `learning.pattern_detector.distinct_occurrences` 那里塌缩成一次发生。
+   索引挡的是**存储冗余**，不是**计数虚高**。
+2. **PG-only 的约束会让两个后端在契约测试上分家。**
+   `tests/contract/` 要求内存实现与 PostgreSQL 实现通过**同一组**断言
+   （CLAUDE.md 质量闸门）。一个只在 PostgreSQL 上拒绝写入的约束，
+   会让"重复写一条经验"在两个后端上得到不同结果——
+   而分家的那一边不报错，只是行为不同。
+3. **真正该做的那条校验落点在领域对象上**（见本节 §2 的
+   `_check_independence_group`）。它同时覆盖两个后端，且拦的是
+   "分组被伪造"这个**会真的抬高计数**的路径。
+
+#### 残余风险（不是"已覆盖"）
+
+没有这个索引，**同一个回合的经验可以被写进事件流两次**。
+后果是有限的：计数不受影响（分组去重），但
+`ErrorPattern.experience_count` 与 `occurrence_count` 的差会变大——
+系统把两者都报出来，正是为了让这种冗余**可见**（见
+`ErrorPattern` 的字段说明）。风险登记见 `docs/risks.md` R60。
 
 ---
 

@@ -190,6 +190,10 @@ async def seed_learning_evidence(
             experience_kind=ExperienceKind.ROUND_OUTCOME,
             evaluation_target=target,
             extractor_version=EXTRACTOR_VERSION,
+            # 🔴 幂等键与分组**一起**给：分组是派生值，而它的输入
+            # 必须能被 ``Experience`` 上的校验器重算（§八 评审 B）。
+            # 这里恒为 ``None``——本辅助函数造的回合都没有幂等键。
+            idempotency_key=None,
             independence_group=independence_group_for(
                 idempotency_key=None, cognitive_round_id=round_id
             ),

@@ -361,6 +361,39 @@ cognitive_round.completed    cognitive_round.suspended   cognitive_round.failed
 **"当时判断错了"** 与 **"当时信息本就不足"**。
 没有它，系统会把信息缺失误判为推理错误。
 
+#### 4.2.1 规范身份与评价（阶段 6.5 §二）
+
+| 字段 | 说明 |
+|---|---|
+| `experience_kind` | 经验种类 |
+| `evaluation_target` | 本条评价的是**什么**，形如 `judgment:<uuid>` |
+| `extractor_version` | 抽取逻辑版本，参与 `canonical_key` |
+| `origin_event_ids` | 产生本经验的事件——回放重建的锚点 |
+| `idempotency_key` | 该回合的客户端幂等键（与 `CognitiveRound` 同值） |
+| **`independence_group`** | **门槛的计量单位**——见下 |
+| `canonical_key` | 规范标识，由 (回合, 评价对象, 种类, 抽取器版本) 决定 |
+| `evaluation` / `evaluator_type` / `evaluator_version` | **抽取时刻**的评价（最多 `SUSPECTED`） |
+| `evaluation_evidence_refs` | 支撑该评价的证据引用 |
+
+> 🔴 **`independence_group` 与 `canonical_key` 都是派生值，不是自由字段。**
+> 两者各有一条 `@model_validator` 逐字核对它们与事实来源是否一致，
+> 不一致直接拒绝构造。
+>
+> 区别在于**它们各自决定什么**：
+>
+> * `canonical_key` 决定"这是不是同一条经验"（唯一约束）；
+> * `independence_group` 决定**"这件事发生过几次"**——门槛数的是它。
+>
+> 后者因此是安全边界：分组由 (幂等键优先、否则回合 id) 唯一决定，
+> 而幂等键**必须与分组一起存下来**，否则校验器没有重算的输入。
+> 允许调用方随手填分组，等于让调用方决定门槛有没有被跨过，
+> 而下游（门禁、提案、审计数字）看不出任何异常
+> （阶段 6.5 §八 评审 B 实测构造过整条链路 → ADR-0020 §2）。
+
+⚠️ **已知边界**：客户端**不带幂等键**地重发同一句话仍是新回合、
+新分组。要让它塌缩只能靠比较消息正文，而那是语义判断
+（ADR-0018 §1）。这条写在 risks R53，不是遗漏。
+
 ### 4.3 `ImprovementProposal`（`domain/improvement_proposals.py`）
 
 `target_component` / `observed_problem` / `error_class` /

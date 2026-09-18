@@ -277,10 +277,20 @@ class Experience(EntityMetadata):
             "「这条经验到底读的是哪几个事件」只能靠时间和 payload 猜"
         ),
     )
+    idempotency_key: str | None = Field(
+        default=None,
+        description=(
+            "该回合的客户端幂等键（与 ``CognitiveRound.idempotency_key`` 同值）。"
+            "🔴 它**只为** :attr:`independence_group` 而存：分组是门槛的计量单位，"
+            "而校验器要能重算它，就必须先拿得到它的输入"
+        ),
+    )
     independence_group: str = Field(
         min_length=1,
         description=(
-            "独立性分组。🔴 同组经验**不是**彼此的独立证据。见 :func:`independence_group_for`"
+            "独立性分组。🔴 同组经验**不是**彼此的独立证据。"
+            "见 :func:`independence_group_for`。"
+            "⚠️ 本栏是**派生值**，由 (幂等键, 回合) 唯一决定"
         ),
     )
     canonical_key: str = Field(
@@ -376,6 +386,48 @@ class Experience(EntityMetadata):
                 f"canonical_key 与它的事实来源不一致："
                 f"收到 {self.canonical_key!r}，按 "
                 f"(回合, 评价对象, 种类, 抽取器版本) 应为 {expected!r}"
+            )
+            raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def _check_independence_group(self) -> Self:
+        """🔴 ``independence_group`` 必须与它的事实来源逐字一致。
+
+        与 :meth:`_check_canonical_identity` 对称，但**更要紧**。
+
+        ``canonical_key`` 只用于唯一约束；``independence_group`` 是
+        **门槛的计量单位**（见
+        :func:`~ai_psi.learning.pattern_detector.distinct_occurrences`）——
+        "这件事发生过几次"就是数它有几个不同的取值。
+
+        少了这条校验，分组是一个 ``min_length=1`` 的自由字符串：
+        **一个回合加一次真实纠正**，只要三次抽取各填一个不同的分组，
+        门禁就会算成"独立发生三次"，一路生成提案并落库。
+        而下游看到的 ``data_quality``、经验条数、评价档位**全都正常**——
+        那条路径上没有任何地方能把这件事看出来
+        （阶段 6.5 §八 评审 B 实测构造过整条链路）。
+
+        ⚠️ **校验器只能重算，不能推断。** 因此 ``idempotency_key``
+        必须与分组一起存下来：它是分组的输入之一，而回合本身已经
+        不在手上（经验只活在事件流里）。少了它，
+        "这个分组到底对不对"连复核都无从谈起。
+
+        💡 客户端的**重放**（不带幂等键地重发同一句话）仍然会得到
+        不同的回合、不同的分组——那是 :data:`~ai_psi.domain.experiences.
+        independence_group_for` 里写明的已知边界，不是这里能拦的。
+        本校验拦的是"分组与它声称的事实不符"，不是"事实本身不够好"。
+        """
+        expected = independence_group_for(
+            idempotency_key=self.idempotency_key,
+            cognitive_round_id=self.cognitive_round_id,
+        )
+        if self.independence_group != expected:
+            msg = (
+                f"independence_group 与它的事实来源不一致："
+                f"收到 {self.independence_group!r}，按 (幂等键, 回合) 应为 {expected!r}。"
+                "🔴 分组是门槛的计量单位，随手填等于让调用方决定"
+                "「这件事发生过几次」（阶段 6.5 §二.12）"
             )
             raise ValueError(msg)
         return self

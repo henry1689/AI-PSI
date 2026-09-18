@@ -226,11 +226,14 @@ class TestOccurrenceAccounting:
         """
         key = "client-retry-key"
         retried = [
+            # ⚠️ 传 ``idempotency_key``，**不**传 ``independence_group``：
+            # 分组是派生值，显式传它会被一致性校验拒掉——
+            # 那正是阶段 6.5 §八 补上的那条校验。
             _experience(
                 make_experience,
                 cognitive_round_id=uuid4(),
                 judgment_id=uuid4(),
-                independence_group=f"idem:{key}",
+                idempotency_key=key,
             )
             for _ in range(3)
         ]
