@@ -12,7 +12,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from ai_psi.api.errors import register_error_handlers
-from ai_psi.api.routes import cognitive_rounds, conversations, health, memories, replay
+from ai_psi.api.routes import (
+    cognitive_rounds,
+    conversations,
+    feedback,
+    health,
+    memories,
+    replay,
+)
 from ai_psi.config import Settings, get_settings
 from ai_psi.container import build_container
 from ai_psi.infrastructure.logging import configure_logging, get_logger
@@ -75,6 +82,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(conversations.router, prefix=API_PREFIX)
     app.include_router(cognitive_rounds.router, prefix=API_PREFIX)
     app.include_router(memories.router, prefix=API_PREFIX)
+    app.include_router(feedback.router, prefix=API_PREFIX)
     app.include_router(replay.router, prefix=API_PREFIX)
     app.include_router(health.router, prefix=API_PREFIX)
 

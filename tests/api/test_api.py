@@ -335,12 +335,17 @@ class TestOpenApiContract:
         assert f"{API_PREFIX}/users/{{user_id}}/export" in paths
         assert f"{API_PREFIX}/users/{{user_id}}/data" in paths
 
-    async def test_stage6_routes_are_absent(self, client: httpx.AsyncClient) -> None:
-        """🔴 不建空壳：阶段 6 的接口现在**不该存在**（ADR-0012）。"""
+    async def test_stage6_routes_land_one_group_at_a_time(self, client: httpx.AsyncClient) -> None:
+        """🔴 不建空壳（ADR-0012）：每组接口随它的服务一起出现。
+
+        阶段 6 先落 §12.2 的反馈（它有 FeedbackService 撑着），
+        §12.4 的提案路由要等 ProposalService——在那之前它**不该存在**。
+        这条断言让"还没做"是一个可见的状态，而不是一组返回 500 的空壳。
+        """
         schema = (await client.get("/openapi.json")).json()
         paths = set(schema["paths"])
+        assert any("feedback" in path for path in paths)
         assert not any("improvement-proposals" in path for path in paths)
-        assert not any("feedback" in path for path in paths)
 
     async def test_beliefs_route_is_not_shipped_in_stage5(self, client: httpx.AsyncClient) -> None:
         """``GET /users/{user_id}/beliefs``（§12.3 第一条）**本阶段不做**。

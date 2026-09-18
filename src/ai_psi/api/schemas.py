@@ -20,10 +20,12 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ai_psi.application.feedback_service import MemoryEffect
 from ai_psi.domain.enums import (
     CognitiveDepth,
     ConfidenceBand,
     EpistemicAction,
+    FeedbackType,
     MemoryStatus,
     MemoryType,
     RetentionPolicy,
@@ -38,6 +40,8 @@ __all__ = [
     "CorrectMemoryResponse",
     "DeleteMemoryResponse",
     "DimensionStatus",
+    "FeedbackRequest",
+    "FeedbackResponse",
     "HealthResponse",
     "JudgmentView",
     "MemoryListResponse",
@@ -407,3 +411,55 @@ class UserDataDeletionResponse(BaseModel):
     deleted_count: int = Field(ge=0)
     memory_ids: list[UUID] = Field(default_factory=list)
     audit_event_ids: list[UUID] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# 反馈（任务书 §12.2）
+# ---------------------------------------------------------------------------
+
+
+class FeedbackRequest(BaseModel):
+    """对某个认知回合的反馈。"""
+
+    model_config = _STRICT
+
+    feedback_type: FeedbackType = Field(description="反馈类型")
+    content: str = Field(min_length=1, description="反馈正文")
+    related_claim: str | None = Field(
+        default=None,
+        description="用户指出的、被纠正的具体说法",
+    )
+    allow_memory_update: bool = Field(
+        default=False,
+        description=(
+            "是否允许本次反馈更新长期记忆。"
+            "🔴 这是「允许提给写入流程」，不是「允许写入」——"
+            "写入仍由记忆写入策略裁决（ADR-0004）"
+        ),
+    )
+
+
+class FeedbackResponse(BaseModel):
+    """反馈处理结果。
+
+    🔴 ``memory_effect`` 必须回传，**包括"什么都没做"的理由**。
+
+    用户打开了 ``allow_memory_update`` 却什么都没发生，
+    与"记下来了"在响应里长得一样的话，调用方只能靠猜。
+    """
+
+    model_config = _STRICT
+
+    round_id: UUID
+    feedback_type: FeedbackType
+    audit_event_id: UUID
+    memory_effect: MemoryEffect = Field(
+        description=(
+            "对长期记忆的实际影响："
+            "none（未请求）/ not_eligible（不满足条件）/ written / "
+            "duplicate（已记过）/ rejected_by_policy"
+        )
+    )
+    memory_id: UUID | None = Field(default=None, description="写入的记忆 id（若有）")
+    memory_written: bool = Field(description="是否真的产生了新记忆")
+    reasons: list[str] = Field(default_factory=list, description="包括「为什么没有写记忆」")
