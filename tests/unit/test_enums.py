@@ -211,7 +211,7 @@ class TestEventType:
     def test_member_count_is_pinned(self) -> None:
         """条数是**刻意钉死**的：多一条少一条都应当是有意的决定。
 
-        任务书 §5.2 列了 31 条，本系统有 36 条，多出的五条各有原因：
+        任务书 §5.2 列了 31 条，本系统有 37 条，多出的六条各有原因：
 
         * ``cognitive_round.cancelled``（ADR-0012）；
         * ``cognition.analysis.completed``（ADR-0015：分析模块的模型调用
@@ -219,9 +219,12 @@ class TestEventType:
         * ``memory.exported``（ADR-0017：导出同样是数据访问，必须有痕迹）；
         * ``improvement_proposal.approved_for_manual_trial`` 与
           ``improvement_proposal.rejected``（ADR-0018：§12.4 要求这两个接口，
-          而**人类做出的那个批准决定本身**必须可追溯——不变量 11）。
+          而**人类做出的那个批准决定本身**必须可追溯——不变量 11）；
+        * ``experience.evaluated``（ADR-0020 / 阶段 6.5 §二：经验不可变，
+          而评价会变。缺了它，生产里能产出的经验永远停在 ``SUSPECTED``，
+          "三次**被支持**的同类错误"这条验收条件就不可能成立）。
         """
-        assert len(EventType) == 36
+        assert len(EventType) == 37
 
     def test_values_are_dotted_namespaced(self) -> None:
         for event_type in EventType:

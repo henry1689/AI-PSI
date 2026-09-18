@@ -19,11 +19,33 @@
 from __future__ import annotations
 
 from typing import Any
+from uuid import UUID, uuid4
 
 import pytest
 from pydantic import BaseModel, ValidationError
 
-__all__ = ["construct", "rejects"]
+from ai_psi.application.artifact_service import ArtifactService, RoundScope
+from ai_psi.application.feedback_service import FeedbackService
+from ai_psi.application.round_service import CognitiveRoundService
+from ai_psi.domain.enums import (
+    CognitiveDepth,
+    ConfidenceBand,
+    ErrorType,
+    EventType,
+    ExperienceEvaluation,
+    ExperienceEvaluator,
+    ExperienceKind,
+    FeedbackType,
+)
+from ai_psi.domain.experiences import (
+    EXTRACTOR_VERSION,
+    Experience,
+    canonical_key_for,
+    evaluation_target_for_judgment,
+    independence_group_for,
+)
+
+__all__ = ["construct", "rejects", "seed_learning_evidence"]
 
 
 def construct[T: BaseModel](model: type[T], /, **fields: Any) -> T:
@@ -67,3 +89,112 @@ def rejects[T: BaseModel](model: type[T], /, **fields: Any) -> ValidationError:
     except ValidationError as exc:
         return exc
     pytest.fail(f"{model.__name__} 接受了本应被拒绝的输入：{sorted(fields)}")
+
+
+async def seed_learning_evidence(
+    *,
+    round_service: CognitiveRoundService,
+    artifact_service: ArtifactService,
+    feedback_service: FeedbackService,
+    rounds: int = 3,
+    error_type: ErrorType | None = None,
+    situation_signature: str = "reasoning|d2|multi_source",
+    confirm: bool = True,
+    user_id: UUID | None = None,
+) -> list[UUID]:
+    """为**不针对学习链路本身**的测试准备一批经验。
+
+    🔴 **这不是一条黑盒路径，用之前请先读这段。**
+
+    它直接用生产写经验的那条调用（``ArtifactService.record`` +
+    ``experience.created``），只是负载是**合成**的——因为它跳过了
+    认知流水线，没有真实回合跑在里面。
+
+    因此它有明确的使用边界：
+
+    * ✅ **可以**用于「提案生命周期」「反馈与记忆」这类测试——
+      它们要的是"已经有三条被确认过的经验"这个**前提**，
+      而不是"经验是怎么产生的"这个结论；
+    * ❌ **不可以**用于学习链路、提案门槛或阶段 6.5 §七 的黑盒验收。
+      那些测试必须让经验从**真实回合**里长出来，
+      否则它们证明的只是"这个辅助函数好使"。
+
+    阶段 6.5 把这条边界写在函数名和文档里，而不是靠约定——
+    因为"测试全绿而结论是假的"正是阶段 6 翻过的那次车。
+
+    ⚠️ 刻意**不接收整个容器**：那样这个辅助函数就会依赖组合根的
+    形状，而它需要的其实只是三个服务。参数列出来，调用方一眼能看出
+    它到底动用了什么。
+
+    Args:
+        round_service: 回合服务（造真实回合）。
+        artifact_service: 产物服务（走生产写经验的那条调用）。
+        feedback_service: 反馈服务（把经验抬到被确认的档位）。
+        rounds: 造几个回合（每个回合一条经验）。
+        error_type: 经验里的错误类别；``None`` 时用 ``REASONING_ERROR``。
+        situation_signature: 情境签名——它决定这些经验是否"同类"。
+        confirm: 是否给每个回合发一条 ``correction`` 反馈。
+            🔴 只有 ``True`` 时经验才会被抬到 ``CONFIRMED``，
+            门槛才可能被跨过（``SUSPECTED`` 的默认权重是 0）。
+        user_id: 归属用户。
+
+    Returns:
+        造出来的经验 id 列表。
+    """
+    resolved_error = error_type if error_type is not None else ErrorType.REASONING_ERROR
+    created: list[UUID] = []
+
+    for _ in range(rounds):
+        started = await round_service.start_round(
+            created_by="test_helper",
+            user_id=user_id,
+            depth_level=CognitiveDepth.D2,
+        )
+        round_id = started.round.id
+        judgment_id = uuid4()
+        target = evaluation_target_for_judgment(judgment_id)
+        experience = Experience(
+            created_by="test_helper",
+            cognitive_round_id=round_id,
+            judgment_id=judgment_id,
+            situation_signature=situation_signature,
+            inquiry_type="factual",
+            error_type=resolved_error,
+            attribution_confidence=ConfidenceBand.MODERATE,
+            # 🔴 抽取时刻最多 SUSPECTED——辅助函数也绕不过这条
+            evaluation=ExperienceEvaluation.SUSPECTED,
+            evaluator_type=ExperienceEvaluator.INTERNAL_METACOGNITION,
+            evaluator_version="test-helper/1",
+            experience_kind=ExperienceKind.ROUND_OUTCOME,
+            evaluation_target=target,
+            extractor_version=EXTRACTOR_VERSION,
+            independence_group=independence_group_for(
+                idempotency_key=None, cognitive_round_id=round_id
+            ),
+            canonical_key=canonical_key_for(
+                cognitive_round_id=round_id,
+                evaluation_target=target,
+                experience_kind=ExperienceKind.ROUND_OUTCOME,
+                extractor_version=EXTRACTOR_VERSION,
+            ),
+        )
+        await artifact_service.record(
+            scope=RoundScope(
+                cognitive_round_id=round_id,
+                correlation_id=started.round.correlation_id or uuid4(),
+                user_id=user_id,
+            ),
+            event_type=EventType.EXPERIENCE_CREATED,
+            payload={"experience": experience.model_dump(mode="json")},
+            actor_id="test_helper",
+        )
+        if confirm:
+            await feedback_service.record(
+                round_id=round_id,
+                feedback_type=FeedbackType.CORRECTION,
+                content="你这里判断错了",
+                actor_id="test_helper",
+            )
+        created.append(experience.id)
+
+    return created

@@ -34,6 +34,13 @@ def _pattern(error_type: ErrorType = ErrorType.REASONING_ERROR, count: int = 3) 
         error_type=error_type,
         situation_signature="d1|with_evidence|h2",
         experience_ids=tuple(uuid4() for _ in range(count)),
+        # 🔴 门槛比的是**加权计数**（阶段 6.5 §二.6–7）。
+        # 本文件的模式一律按"已被外部证据确认"构造，因此两者相等；
+        # 权重本身的行为由 test_pattern_detector 的
+        # TestEvaluationWeighting 与 test_evaluation_weighting 覆盖。
+        occurrence_count=count,
+        weighted_count=count,
+        experience_count=count,
         counterexample_count=0,
     )
 
@@ -262,6 +269,9 @@ class TestDecisionShape:
             error_type=ErrorType.REASONING_ERROR,
             situation_signature="sig",
             experience_ids=(uuid4(), uuid4(), uuid4()),
+            occurrence_count=3,
+            weighted_count=3,
+            experience_count=3,
             counterexample_count=2,
         )
         decision = policy.decide(PromotionEvidence(pattern=pattern))

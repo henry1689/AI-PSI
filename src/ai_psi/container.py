@@ -30,9 +30,12 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from ai_psi.application.artifact_service import ArtifactService
 from ai_psi.application.cognitive_runtime import CognitiveRuntime
+from ai_psi.application.experience_reader import ExperienceReader
 from ai_psi.application.feedback_service import FeedbackService
+from ai_psi.application.learning_service import LearningService
 from ai_psi.application.memory_service import MemoryService
 from ai_psi.application.ports import UnitOfWorkFactory
+from ai_psi.application.proposal_gate import ProposalGate
 from ai_psi.application.proposal_service import ProposalService
 from ai_psi.application.round_service import CognitiveRoundService
 from ai_psi.config import Settings, get_settings
@@ -67,6 +70,9 @@ class Container:
         memory_service: 记忆服务。
         feedback_service: 反馈服务。
         proposal_service: 改进提案服务。
+        experience_reader: 经验读取器（读经验 + 评价）。
+        proposal_gate: 提案门禁（落库前的权威门槛复核）。
+        learning_service: 学习链路入口（从经验到提案草案）。
         runtime: 认知运行时。
         engine: PostgreSQL 引擎（``storage_backend=memory`` 时为 ``None``）。
         http_client: 共享的 HTTP 客户端（真实 Provider 用；Mock 下也存在但不用）。
@@ -82,6 +88,9 @@ class Container:
     memory_service: MemoryService
     feedback_service: FeedbackService
     proposal_service: ProposalService
+    experience_reader: ExperienceReader
+    proposal_gate: ProposalGate
+    learning_service: LearningService
     runtime: CognitiveRuntime
     engine: AsyncEngine | None = field(default=None)
     http_client: httpx.AsyncClient | None = field(default=None)
@@ -149,6 +158,11 @@ def build_container(settings: Settings | None = None) -> Container:
 
     round_service = CognitiveRoundService(uow_factory)
     artifact_service = ArtifactService(uow_factory)
+    # 🔴 **读取经验只有一处实现**（经验与它的评价一起读回）。
+    # 学习链路与提案门禁共用它——门禁"从仓储重新查询"这件事
+    # 只有在用同一段读取代码时才有意义（见 experience_reader 的文档）。
+    experience_reader = ExperienceReader(uow_factory)
+    proposal_gate = ProposalGate(experience_reader)
     # 🔴 一个容器一个 MemoryService：它同时被 API 路由与认知运行时使用，
     # 两个实例会各自持有一份写入策略，策略一旦被局部替换就会分家。
     memory_service = MemoryService(uow_factory, embeddings)
@@ -158,6 +172,11 @@ def build_container(settings: Settings | None = None) -> Container:
     # 提案服务只依赖工作单元：它不碰记忆，也不需要模型——
     # 生成提案的那一步（learning/）是纯函数，由调用方先行完成。
     proposal_service = ProposalService(uow_factory)
+    # 🔴 学习链路拿到的是**同一个**经验读取器与**同一个**门禁实例：
+    # 另造一套不会报错，但会让"门禁复核的是什么"有两种口径。
+    learning_service = LearningService(
+        uow_factory, experience_reader, proposal_gate, proposal_service
+    )
     runtime = CognitiveRuntime(
         uow_factory=uow_factory,
         provider=provider,
@@ -179,6 +198,9 @@ def build_container(settings: Settings | None = None) -> Container:
         memory_service=memory_service,
         feedback_service=feedback_service,
         proposal_service=proposal_service,
+        experience_reader=experience_reader,
+        proposal_gate=proposal_gate,
+        learning_service=learning_service,
         runtime=runtime,
         engine=engine,
         http_client=http_client,

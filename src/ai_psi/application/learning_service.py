@@ -1,29 +1,37 @@
-"""学习链路的**显式入口**（任务书 §11.1–§11.4）。
+"""学习链路的**显式入口**（任务书 §11.1–§11.4，阶段 6.5 §二.13–15）。
 
 🔴 **这里回答的问题：谁、在什么时候，让系统从经验里学到东西？**
 
-`learning/` 的六个模块都是**纯函数**——没有定时器、没有钩子、没有副作用。
+`learning/` 的模块都是**纯函数**——没有定时器、没有钩子、没有副作用。
 那是刻意的（ADR-0018 §10：自动生成提案等于用噪声喂评审）。
 但纯函数库本身不构成能力：在阶段 6 收尾之前，
 `PatternDetector` / `PromotionPolicy` / `ProposalGenerator` 在 `src/` 里
 **零调用者**，"三次同类错误可生成 Proposal"这条验收条件
 只在测试里成立、在系统里不可操作。
 
-本服务把四个纯组件串成一条可执行的链路：
+本服务把纯组件串成一条可执行的链路，**并且中途必须过门禁**：
 
 ```
-事件流里的 Experience
-  → PatternDetector.detect        （同类错误出现了几次）
-  → PromotionPolicy.decide        （够不够格成为提案）
-  → ProposalGenerator.generate    （生成 DRAFT 草案）
-  → ProposalService.create        （落库 + 留审计事件）
+事件流（真相）
+  → ExperienceReader.load()        读经验 + 读评价，合并成有效评价
+  → PatternDetector.detect()       按「独立发生次数 × 评价权重」筛
+  → ProposalGate.review()          🔴 从仓储**重新**读取、重新计算门槛
+  → ProposalGenerator.generate()   生成 DRAFT 草案（用门禁核实过的模式）
+  → ProposalService.create()       落库（必须携带门禁结论）
 ```
+
+🔴 **为什么这里读完还要门禁再读一遍。**
+
+本服务读到的是"要处理哪些模式"（一个**待办清单**），
+门禁读到的才是"这些模式现在够不够格"（一个**授权**）。
+两次读取之间经验还可能增加——而评审批的是**此刻**的证据够不够。
+把待办清单当成授权，正是阶段 6 那个 bug 的形状。
 
 🔴 **提案仍然不会自动生效，本服务也没有任何让它们生效的能力。**
 它只生成 `DRAFT`；评估与批准仍然要人来做（不变量 11）。
 
-⚠️ 本服务**读经验、不写经验**。经验由认知运行时在回合收尾时写入
-（成功路径）与失败路径写入，它们是不可变的观察，留事件流里。
+⚠️ 本服务**读经验、不写经验**。经验由认知运行时在回合收尾时写入，
+评价由反馈路径追加——它们都是不可变的观察，留在事件流里。
 """
 
 from __future__ import annotations
@@ -32,22 +40,17 @@ from dataclasses import dataclass, field
 from typing import Final
 from uuid import UUID, uuid4
 
+from ai_psi.application.experience_reader import ExperienceLoad, ExperienceReader
 from ai_psi.application.ports import UnitOfWorkFactory
+from ai_psi.application.proposal_gate import GateEvidence, ProposalGate
 from ai_psi.application.proposal_service import ProposalService
 from ai_psi.domain.enums import EventType, FeedbackType
 from ai_psi.domain.events import Event
-from ai_psi.domain.experiences import Experience
 from ai_psi.domain.improvement_proposals import ImprovementProposal
 from ai_psi.learning.pattern_detector import ErrorPattern, PatternDetector
-from ai_psi.learning.promotion_policy import (
-    SEVERE_ERROR_TYPES,
-    PromotionDecision,
-    PromotionEvidence,
-    PromotionPolicy,
-)
 from ai_psi.learning.proposal_generator import ProposalGenerator
 
-__all__ = ["LearningRun", "LearningService", "ProposalCandidate"]
+__all__ = ["LearningRun", "LearningService"]
 
 
 #: 被视为"用户表达了否定"的反馈类型。
@@ -60,11 +63,18 @@ NEGATIVE_FEEDBACK_TYPES: Final[frozenset[FeedbackType]] = frozenset(
 
 
 @dataclass(frozen=True, slots=True)
-class ProposalCandidate:
-    """一个达到门槛、可以生成提案的观察。"""
+class CreatedProposal:
+    """一条由本次运行落库的提案，连同**批准它的门禁结论**。
 
-    pattern: ErrorPattern
-    decision: PromotionDecision
+    🔴 把结论一起返回，是因为调用方（CLI、运维端点）需要回答
+    "为什么这条提案被放行了"。只返回 ``ImprovementProposal``
+    会让那个问题只能靠在日志里翻找。
+    """
+
+    proposal: ImprovementProposal
+    weighted_count: int
+    threshold: int
+    data_quality: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,11 +88,6 @@ class LearningRun:
     """
 
     experiences_considered: int = 0
-    patterns: tuple[ErrorPattern, ...] = ()
-    candidates: tuple[ProposalCandidate, ...] = ()
-    created: tuple[ImprovementProposal, ...] = ()
-    already_covered: tuple[ErrorPattern, ...] = ()
-    not_eligible: tuple[tuple[ErrorPattern, tuple[str, ...]], ...] = field(default=())
     unreadable_experiences: int = 0
     """事件负载里读不回来的经验条数。
 
@@ -90,16 +95,31 @@ class LearningRun:
     但必须被计数——否则"只读到 2 条"会被误当成"历史上只有 2 条"。
     """
 
+    unreadable_evaluations: int = 0
+    patterns: tuple[ErrorPattern, ...] = ()
+    candidates: tuple[ErrorPattern, ...] = ()
+    """达到模式门槛、并**被门禁复核过**的观察。"""
+
+    created: tuple[CreatedProposal, ...] = ()
+    already_covered: tuple[ErrorPattern, ...] = ()
+    suppressed: tuple[tuple[ErrorPattern | None, tuple[str, ...]], ...] = field(default=())
+    """未达门槛或未获授权的观察，连同逐条理由。
+
+    ⚠️ 阶段 6 的版本把"未达门槛"与"生成器拒绝"分两处记，
+    而**门禁拒绝**这一支根本不存在（那时还没有门禁）。
+    """
+
     def summary(self) -> str:
         """一行式摘要，给 CLI 用。"""
         return (
             f"读取经验 {self.experiences_considered} 条"
-            f"（无法解析 {self.unreadable_experiences} 条）；"
-            f"发现模式 {len(self.patterns)} 个；"
-            f"达到门槛 {len(self.candidates)} 个；"
+            f"（无法解析 {self.unreadable_experiences} 条，"
+            f"评价无法解析 {self.unreadable_evaluations} 条）；"
+            f"达到模式门槛 {len(self.patterns)} 个；"
+            f"通过门禁 {len(self.candidates)} 个；"
             f"生成提案 {len(self.created)} 条；"
             f"已有提案覆盖 {len(self.already_covered)} 个；"
-            f"未达门槛 {len(self.not_eligible)} 个"
+            f"未通过 {len(self.suppressed)} 个"
         )
 
 
@@ -109,26 +129,36 @@ class LearningService:
     def __init__(
         self,
         uow_factory: UnitOfWorkFactory,
+        reader: ExperienceReader,
+        gate: ProposalGate,
         proposal_service: ProposalService,
         *,
         detector: PatternDetector | None = None,
-        policy: PromotionPolicy | None = None,
         generator: ProposalGenerator | None = None,
     ) -> None:
         """初始化。
 
         Args:
-            uow_factory: 工作单元工厂（读经验、读反馈、读既有提案）。
+            uow_factory: 工作单元工厂（读反馈事件）。
+            reader: 经验读取器。🔴 与门禁**同一个实例**。
+            gate: 提案门禁。🔴 与读取器配套。
             proposal_service: 提案服务。**必须是同一个实例**——
                 另造一个不会出错，但会让"提案从哪来"有两种口径。
-            detector: 模式发现器；``None`` 时用默认门槛。
-            policy: 门槛裁决器；``None`` 时用默认门槛。
+            detector: 模式发现器；``None`` 时用门禁的门槛。
             generator: 提案生成器；``None`` 时用默认模板。
         """
         self._uow_factory = uow_factory
+        self._reader = reader
+        self._gate = gate
         self._proposals = proposal_service
-        self._detector = detector if detector is not None else PatternDetector()
-        self._policy = policy if policy is not None else PromotionPolicy()
+        # 🔴 检测器默认取**门禁的门槛**。两处门槛不一致时，
+        # 本服务会先发现一批模式、再被门禁全部拒掉——症状是
+        # "链路每次都说发现了 N 个模式，却一条提案也没有"。
+        self._detector = (
+            detector
+            if detector is not None
+            else PatternDetector(threshold=gate.threshold, weighting=gate.weighting)
+        )
         self._generator = generator if generator is not None else ProposalGenerator()
 
     # ------------------------------------------------------------------
@@ -159,91 +189,94 @@ class LearningService:
             本次运行的结果。
         """
         correlation = correlation_id or uuid4()
-        experiences, unreadable = await self._load_experiences()
-        feedback_counts = await self._negative_feedback_by_signature()
-
-        patterns = self._detector.detect(experiences)
+        load = await self._reader.load()
+        scan = self._detector.detect(load.assessments)
         covered = await self._covered_keys()
+        corrections = await self._negative_feedback_by_signature(load)
 
-        candidates: list[ProposalCandidate] = []
-        created: list[ImprovementProposal] = []
+        candidates: list[ErrorPattern] = []
+        created: list[CreatedProposal] = []
         already: list[ErrorPattern] = []
-        not_eligible: list[tuple[ErrorPattern, tuple[str, ...]]] = []
+        rejected: list[tuple[ErrorPattern | None, tuple[str, ...]]] = []
 
-        for pattern in patterns:
-            decision = self._policy.decide(
-                PromotionEvidence(
-                    pattern=pattern,
-                    fix_direction=fix_direction
-                    if pattern.error_type in SEVERE_ERROR_TYPES
-                    else None,
-                    user_corrections=feedback_counts.get(pattern.situation_signature),
-                )
+        for pattern in scan.patterns:
+            verdict = await self._gate.review(
+                error_type=pattern.error_type,
+                situation_signature=pattern.situation_signature,
+                evidence=GateEvidence(
+                    fix_direction=fix_direction,
+                    # 🔴 这里给的是**观测到的计数**（含 0），不是 ``None``。
+                    #
+                    # ``None`` 表示"没有接入计数的调用方"——而这里**有**
+                    # 调用方在算它（本方法每次运行都会重算一遍全部反馈事件）。
+                    # 用 ``None`` 会让条件四永远显示"未观测"，
+                    # 那与"数过了，是 0"是两件不同的事（ADR-0018 §3）。
+                    #
+                    # ⚠️ 它是一个**下界**：反馈若落在没有产出经验的回合上
+                    # （失败回合、关掉长期记忆的回合），就归不到任何情境，
+                    # 也就不在计数里。这个口径写在
+                    # :meth:`_negative_feedback_by_signature` 的文档里。
+                    user_corrections=corrections.get(pattern.situation_signature, 0),
+                ),
             )
-            if not decision.allowed:
-                not_eligible.append((pattern, decision.reasons))
+            if not verdict.authorised:
+                rejected.append((pattern, verdict.reasons))
                 continue
 
-            candidates.append(ProposalCandidate(pattern=pattern, decision=decision))
-            if _key_of(pattern) in covered:
+            candidates.append(pattern)
+            if (pattern.error_type.value, pattern.situation_signature) in covered:
                 already.append(pattern)
                 continue
 
             proposal = self._generator.generate(
-                pattern=pattern, decision=decision, fix_direction=fix_direction
+                # 🔴 用**门禁重算并授权过的**那一份，不是本服务自己算的。
+                # 本服务自己算的那份在这里根本不存在——这正是 §二.14 要的：
+                # 生成提案所用的证据，与门禁核实过的证据是同一批。
+                pattern=verdict.verified_pattern,
+                decision=verdict.verified_decision,
+                fix_direction=fix_direction,
             )
             if proposal is None:
-                # 生成器可以拒绝（例如没有支撑证据）——它不是错误，
-                # 但也不能悄悄消失，所以记进"未达门槛"的理由里。
-                not_eligible.append((pattern, ("生成器判定证据不足以构造提案",)))
+                rejected.append((pattern, ("生成器判定证据不足以构造提案",)))
                 continue
+
+            stored = await self._proposals.create(
+                proposal, verdict=verdict, actor_id=actor_id, correlation_id=correlation
+            )
             created.append(
-                await self._proposals.create(
-                    proposal, actor_id=actor_id, correlation_id=correlation
+                CreatedProposal(
+                    proposal=stored,
+                    weighted_count=verdict.recomputed_weighted_count,
+                    threshold=verdict.threshold,
+                    data_quality=verdict.data_quality,
                 )
             )
-            covered.add(_key_of(pattern))
+            covered.add((pattern.error_type.value, pattern.situation_signature))
+
+        for item in scan.suppressed:
+            rejected.append(
+                (
+                    None,
+                    (f"[{item.error_type.value} / {item.situation_signature}] ", *item.reasons),
+                )
+            )
 
         return LearningRun(
-            experiences_considered=len(experiences),
-            patterns=tuple(patterns),
+            experiences_considered=len(load.assessments),
+            unreadable_experiences=load.unreadable_experiences,
+            unreadable_evaluations=load.unreadable_evaluations,
+            patterns=scan.patterns,
             candidates=tuple(candidates),
             created=tuple(created),
             already_covered=tuple(already),
-            not_eligible=tuple(not_eligible),
-            unreadable_experiences=unreadable,
+            suppressed=tuple(rejected),
         )
 
     # ------------------------------------------------------------------
     # 读
     # ------------------------------------------------------------------
 
-    async def _load_experiences(self) -> tuple[list[Experience], int]:
-        """从事件流里读回全部经验。
-
-        Returns:
-            ``(可解析的经验, 无法解析的条数)``。
-
-        ⚠️ **一条坏记录不该让整次运行失败。**
-
-        事件负载是历史数据，而领域对象会演进；用一次异常把整段历史作废，
-        代价是"这个系统再也不能从过去学习"。因此这里逐条 try，
-        把读不回来的**计数**报出去——报告里看得见，而不是悄悄少几条。
-        """
-        async with self._uow_factory() as uow:
-            events = await uow.events.read_by_event_type(event_type=EventType.EXPERIENCE_CREATED)
-
-        restored: list[Experience] = []
-        unreadable = 0
-        for event in events:
-            experience = _experience_from_event(event)
-            if experience is None:
-                unreadable += 1
-            else:
-                restored.append(experience)
-        return restored, unreadable
-
-    async def _negative_feedback_by_signature(self) -> dict[str, int]:
+    async def _negative_feedback_by_signature(self, load: ExperienceLoad) -> dict[str, int]:
         """统计每个情境签名下收到过否定反馈的**不同回合数**。
 
         🔴 **这是 §11.3 条件四的输入，此前没有任何生产者在算它。**
@@ -255,15 +288,19 @@ class LearningService:
         口径说明（为什么是"不同回合数"而不是"反馈条数"）：
         门槛的语义是"这件事发生过几次"，而同一个回合里用户连点三次
         "不对"和三个回合各纠正一次，是完全不同的两件事。
+
+        ⚠️ 阶段 6.5 §三 起，用户纠正还会通过 ``experience.evaluated``
+        抬高对应经验的评价——那条路径影响的是**条件一**的加权计数，
+        与这里统计的条件四是两回事，两者都要有。
         """
         async with self._uow_factory() as uow:
             feedback_events = await uow.events.read_by_event_type(
                 event_type=EventType.USER_FEEDBACK_RECEIVED
             )
-        experiences, _ = await self._load_experiences()
 
         signature_by_round = {
-            item.cognitive_round_id: item.situation_signature for item in experiences
+            item.experience.cognitive_round_id: item.experience.situation_signature
+            for item in load.assessments
         }
         rounds_by_signature: dict[str, set[UUID]] = {}
         for event in feedback_events:
@@ -291,29 +328,6 @@ class LearningService:
         }
 
 
-def _experience_from_event(event: Event) -> Experience | None:
-    """把 ``experience.created`` 的负载还原成领域对象；失败返回 ``None``。"""
-    payload = event.payload.get("experience")
-    if not isinstance(payload, dict):  # pragma: no cover - 负载恒为字典
-        return None
-    cleaned = {
-        key: value for key, value in payload.items() if key not in _AUDIT_ONLY_EXPERIENCE_KEYS
-    }
-    try:
-        return Experience.model_validate(cleaned)
-    except Exception:
-        # ⚠️ 这里**刻意吞掉一切异常**：单条坏记录不该让整段历史作废。
-        # 代价是"读不回来"必须被计数上报（见 LearningRun.unreadable_experiences），
-        # 否则"只读到 2 条"会被误当成"历史上只有 2 条"。
-        return None
-
-
-#: 事件负载里比 ``Experience`` 多出来的审计字段。
-_AUDIT_ONLY_EXPERIENCE_KEYS: Final[frozenset[str]] = frozenset(
-    {"stop_reason", "attribution_reasons"}
-)
-
-
 def _is_negative_feedback(event: Event) -> bool:
     """该反馈事件是否表达了否定。"""
     raw = event.payload.get("feedback_type")
@@ -324,13 +338,3 @@ def _is_negative_feedback(event: Event) -> bool:
     except ValueError:  # pragma: no cover - 枚举白名单由写入侧保证
         return False
     return feedback_type in NEGATIVE_FEEDBACK_TYPES
-
-
-def _key_of(pattern: ErrorPattern) -> tuple[str, str]:
-    """模式在提案侧的对应键：``(错误类别, 情境签名)``。
-
-    生成器把 ``error_class=pattern.error_type``、
-    ``applicability=[pattern.situation_signature]`` 写进提案，
-    因此这两个字段合起来就是"这条提案对应哪个模式"。
-    """
-    return (pattern.error_type.value, pattern.situation_signature)

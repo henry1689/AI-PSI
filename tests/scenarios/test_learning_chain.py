@@ -22,15 +22,14 @@ from typing import Any
 
 import pytest
 
-from ai_psi.domain.enums import CognitiveDepth, ErrorType, EventType
-from ai_psi.domain.experiences import Experience
-from ai_psi.learning.pattern_detector import PatternDetector
-from ai_psi.learning.promotion_policy import (
-    PromotionEvidence,
-    PromotionPolicy,
-    PromotionTrigger,
+from ai_psi.domain.enums import (
+    CognitiveDepth,
+    ErrorType,
+    EventType,
+    ExperienceEvaluation,
+    FeedbackType,
 )
-from ai_psi.learning.proposal_generator import ProposalGenerator
+from ai_psi.domain.experiences import Experience
 from tests.scenarios.conftest import (
     Harness,
     hypotheses_response,
@@ -169,62 +168,128 @@ class TestTheRuntimeProducesAttributableExperiences:
         assert experiences[0].evidence_available_at_time == []
 
 
+async def _rounds_with_correction(harness: Harness, *, count: int, correction: bool) -> list[Any]:
+    """跑 ``count`` 个真实回合，可选地给每个回合一条用户纠正。
+
+    🔴 **纠正不是装饰。** 阶段 6.5 §二.6–7 起，只有被用户纠正、
+    后续证据或独立评测抬到 ``SUPPORTED``/``CONFIRMED`` 的经验才计权；
+    内部元认知单独产出的 ``SUSPECTED`` 权重为 0。
+    因此"三次同类错误 → 提案"这条验收条件**必须**包含纠正这一步，
+    少了它，测试证明的是一个在系统里不会发生的场景。
+    """
+    round_ids: list[Any] = []
+    for _ in range(count):
+        outcome = await harness.run("朋友今天只回复了一个「嗯」，他是不是讨厌我？")
+        round_ids.append(outcome.cognitive_round_id)
+
+    if correction:
+        for round_id in round_ids:
+            await harness.feedback_service.record(
+                round_id=round_id,
+                feedback_type=FeedbackType.CORRECTION,
+                content="你这里判断错了：单一观察不该推出意图",
+                actor_id="test_user",
+            )
+    return round_ids
+
+
 class TestThreeRealRoundsCanProduceAProposal:
     """🔴 **阶段 6 验收条件二，在真实运行数据上的端到端证明。**
 
-    中间不手工构造任何一条经验：三次同类错误全部来自真实回合的
-    ``experience.created`` 事件。
+    中间不手工构造任何一条经验：三个回合全部真实跑过流水线，
+    经验从 ``experience.created`` 事件里长出来，评价从
+    ``experience.evaluated`` 事件里长出来，提案由**门禁**复核后落库。
     """
 
     async def test_end_to_end_from_real_rounds_to_a_draft_proposal(self, harness_factory) -> None:
+        """三个独立回合 + 各自的用户纠正 → DRAFT 提案。"""
         harness: Harness = harness_factory(responses=_scripted_round(missing_counterexample=True))
+        round_ids = await _rounds_with_correction(harness, count=3, correction=True)
 
-        collected: list[Experience] = []
-        for _ in range(3):
-            outcome = await harness.run("朋友今天只回复了一个「嗯」，他是不是讨厌我？")
-            collected += await _experiences_from(harness, outcome.cognitive_round_id)
+        run = await harness.learning_service.review()
 
-        assert len(collected) == 3
-        # 三个不同的回合——门槛的计量单位是"在不同回合里发生过几次"
-        assert len({item.cognitive_round_id for item in collected}) == 3
-
-        # 1) 模式发现认出"同类错误发生了三次"
-        patterns = PatternDetector().detect(collected)
-        assert len(patterns) == 1
-        assert patterns[0].count == 3
-        assert patterns[0].error_type is ErrorType.REASONING_ERROR
-
-        # 2) 门槛裁决放行
-        decision = PromotionPolicy().decide(PromotionEvidence(pattern=patterns[0]))
-        assert decision.allowed is True
-        assert PromotionTrigger.REPEATED_SAME_ERROR in decision.triggers
-
-        # 3) 生成提案——它引用的是**真实回合产出的**那几条经验
-        proposal = ProposalGenerator().generate(pattern=patterns[0], decision=decision)
-        assert proposal is not None
+        assert run.summary()
+        assert len(run.created) == 1, run.summary()
+        proposal = run.created[0].proposal
         assert proposal.status.value == "draft"
-        assert set(proposal.supporting_experience_ids) == {item.id for item in collected}
         assert proposal.error_class is ErrorType.REASONING_ERROR
+        # 门禁复核过的次数就是三个回合，不多不少
+        assert run.created[0].weighted_count == 3
+
+        # 🔴 提案引用的经验必须**正是**那三个回合产出的那几条。
+        # 情境签名不写死：它由深度、证据量、假设量派生，
+        # 写死它会让"规则一改签名就变"变成一次无意义的红灯。
+        expected: set[Any] = set()
+        for round_id in round_ids:
+            expected |= {item.id for item in await _experiences_from(harness, round_id)}
+        assert set(proposal.supporting_experience_ids) == expected
+        assert proposal.applicability == [run.patterns[0].situation_signature]
+
+    async def test_suspected_rounds_alone_never_reach_the_threshold(self, harness_factory) -> None:
+        """🔴 **阶段 6.5 §二.6–7：三次内部怀疑不是三次证据。**
+
+        这是本节最要紧的一条。阶段 6 的实现里，元认知怀疑三次就
+        足以生成一条提案——**系统用自己的假设给自己发了通行证**。
+        """
+        harness: Harness = harness_factory(responses=_scripted_round(missing_counterexample=True))
+        await _rounds_with_correction(harness, count=3, correction=False)
+
+        run = await harness.learning_service.review()
+
+        assert run.patterns == ()
+        assert run.created == ()
+        # 🔴 而且必须说清是**权重**挡下的，不是"经验不够多"——
+        # 否则外部看起来与"历史上压根没这些经验"一模一样。
+        reasons = [reason for _, items in run.suppressed for reason in items]
+        assert any("权重" in reason for reason in reasons), reasons
 
     async def test_two_real_rounds_are_not_enough(self, harness_factory) -> None:
-        """🔴 不变量 10：两次不够。这条与上一条一起，才是门槛的两个方向。"""
+        """🔴 不变量 10：两次不够。这条与第一条一起，才是门槛的两个方向。
+
+        ⚠️ 注意这里是**加了纠正**的两次——如果不加，
+        它测的会是权重而不是次数。
+        """
         harness: Harness = harness_factory(responses=_scripted_round(missing_counterexample=True))
+        await _rounds_with_correction(harness, count=2, correction=True)
 
-        collected: list[Experience] = []
-        for _ in range(2):
-            outcome = await harness.run("朋友今天只回复了一个「嗯」，他是不是讨厌我？")
-            collected += await _experiences_from(harness, outcome.cognitive_round_id)
+        run = await harness.learning_service.review()
 
-        assert PatternDetector().detect(collected) == []
+        assert run.patterns == ()
+        assert run.created == ()
 
     async def test_unattributed_rounds_never_reach_the_threshold(self, harness_factory) -> None:
-        """判不了的经验不参与计数——跑多少次都不会"凑"出一个模式。"""
+        """判不了的经验不参与计数——跑多少次、纠正多少次都不会"凑"出一个模式。"""
         harness: Harness = harness_factory(responses=_scripted_round(missing_counterexample=False))
+        await _rounds_with_correction(harness, count=3, correction=True)
 
-        collected: list[Experience] = []
+        run = await harness.learning_service.review()
+
+        assert run.patterns == ()
+        assert run.created == ()
+
+    async def test_disagreement_alone_reaches_supported_not_confirmed(
+        self, harness_factory
+    ) -> None:
+        """🔴 §二.5 的档位区分：只说"我不同意"抬到 ``SUPPORTED``。
+
+        它仍然计权（``SUPPORTED`` 权重为 1），但评价里**不该**出现
+        ``CONFIRMED``——用户没有指出哪里错了，把他的一句话升格成
+        "确认"是替他把话说满了。
+        """
+        harness: Harness = harness_factory(responses=_scripted_round(missing_counterexample=True))
+        round_ids: list[Any] = []
         for _ in range(3):
             outcome = await harness.run("朋友今天只回复了一个「嗯」，他是不是讨厌我？")
-            collected += await _experiences_from(harness, outcome.cognitive_round_id)
+            round_ids.append(outcome.cognitive_round_id)
+        for round_id in round_ids:
+            await harness.feedback_service.record(
+                round_id=round_id,
+                feedback_type=FeedbackType.DISAGREEMENT,
+                content="我不同意",
+                actor_id="test_user",
+            )
 
-        assert len(collected) == 3
-        assert PatternDetector().detect(collected) == []
+        run = await harness.learning_service.review()
+
+        assert len(run.created) == 1, run.summary()
+        assert run.patterns[0].evaluations == (ExperienceEvaluation.SUPPORTED,)

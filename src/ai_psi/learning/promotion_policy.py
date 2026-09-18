@@ -29,6 +29,7 @@ from typing import Final
 
 from ai_psi.domain.enums import ErrorType
 from ai_psi.domain.improvement_proposals import PROPOSAL_ESCALATION_THRESHOLD
+from ai_psi.learning.evaluation_weighting import DEFAULT_WEIGHTING, EvaluationWeighting
 from ai_psi.learning.pattern_detector import ErrorPattern
 
 __all__ = [
@@ -132,11 +133,21 @@ class PromotionDecision:
 class PromotionPolicy:
     """按 §11.3 判定一个观察是否可以升级为提案。"""
 
-    def __init__(self, *, threshold: int = PROPOSAL_ESCALATION_THRESHOLD) -> None:
+    def __init__(
+        self,
+        *,
+        threshold: int = PROPOSAL_ESCALATION_THRESHOLD,
+        weighting: EvaluationWeighting = DEFAULT_WEIGHTING,
+    ) -> None:
         """初始化。
 
         Args:
-            threshold: 同类错误的次数门槛。
+            threshold: 同类错误的**加权**次数门槛。
+            weighting: 评价状态的计数权重。必须与
+                :class:`~ai_psi.learning.pattern_detector.PatternDetector`
+                用的是同一份——两处用不同的权重表，会让
+                "模式发现了它、裁决却说不合格"变成常态，
+                而那种不一致没有任何测试会自然发现。
 
         Raises:
             ValueError: 门槛低于 2（不变量 10）。
@@ -145,11 +156,17 @@ class PromotionPolicy:
             msg = "提案门槛不得低于 2：单次经验不足以支撑全局策略（不变量 10）"
             raise ValueError(msg)
         self._threshold = threshold
+        self._weighting = weighting
 
     @property
     def threshold(self) -> int:
         """当前门槛。"""
         return self._threshold
+
+    @property
+    def weighting(self) -> EvaluationWeighting:
+        """当前使用的评价权重表。"""
+        return self._weighting
 
     def decide(self, evidence: PromotionEvidence) -> PromotionDecision:
         """裁断一个观察是否够格成为提案。
@@ -203,16 +220,22 @@ class PromotionPolicy:
         if pattern is None:
             reasons.append("条件一（同类错误 ≥3 次）：没有达到次数的模式")
             return
-        if pattern.count < self._threshold:
+        # 🔴 **比的是加权计数，不是发生次数**（阶段 6.5 §二.6–7）。
+        # 三次内部怀疑的发生次数是 3，加权计数是 0——它不该跨过门槛。
+        if pattern.weighted_count < self._threshold:
             reasons.append(
-                f"条件一（同类错误 ≥3 次）：{pattern.error_type.value} 出现 "
-                f"{pattern.count} 次，未达门槛 {self._threshold}"
+                f"条件一（同类错误 ≥3 次）：{pattern.error_type.value} 发生 "
+                f"{pattern.count} 次，加权计数 {pattern.weighted_count}，"
+                f"未达门槛 {self._threshold}"
+                f"（评价状态：{'、'.join(item.value for item in pattern.evaluations)}）"
             )
             return
         triggers.append(PromotionTrigger.REPEATED_SAME_ERROR)
         reasons.append(
             f"条件一命中：{pattern.error_type.value} 在情境 "
-            f"{pattern.situation_signature} 下出现 {pattern.count} 次"
+            f"{pattern.situation_signature} 下发生 {pattern.count} 次，"
+            f"加权计数 {pattern.weighted_count}"
+            f"（评价状态：{'、'.join(item.value for item in pattern.evaluations)}）"
         )
 
     def _check_severe(

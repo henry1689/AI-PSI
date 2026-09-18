@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID, uuid4
 
-from ai_psi.application.ports import UnitOfWorkFactory
+from ai_psi.application.ports import UnitOfWork, UnitOfWorkFactory
 from ai_psi.domain.common import utc_now
 from ai_psi.domain.enums import (
     ActorType,
@@ -197,6 +197,7 @@ class MemoryService:
         proposal: MemoryWriteProposal,
         actor_id: str = "memory_service",
         correlation_id: UUID | None = None,
+        uow: UnitOfWork | None = None,
     ) -> MemoryWriteOutcome:
         """处理一条记忆写入请求。
 
@@ -204,10 +205,24 @@ class MemoryService:
         被拒绝的写入同样是审计信息——"系统曾经想记住什么但被挡住了"
         与"系统记住了什么"一样重要。
 
+        🔴 **``uow`` 非空时，事务归调用方。**
+
+        阶段 6.5 §三.5–6 要求"反馈、领域事件、状态更新必须在同一事务"。
+        反馈路径因此把它的工作单元交进来，让记忆写入**长在同一个事务上**
+        而不是另开一个。
+
+        ⚠️ **这条路径靠策略判定保证"记忆失败不拖垮反馈"，不是靠捕获异常。**
+        写入策略拒绝是一条**正常返回**（``decision.allows_write`` 为假），
+        事务照常提交，反馈事件照样落库。
+        而真正的数据库错误会毒化整个事务——那种情况下原子性要求
+        整体回滚，**用户的反馈确实会丢**。这是"同一事务"这个选择的
+        固有代价，不是实现缺陷（ADR-0021 §?）。
+
         Args:
             proposal: 写入提案。
             actor_id: 发起者标识。
             correlation_id: 关联链标识。
+            uow: 调用方已开启的工作单元；``None`` 时本方法自己开并提交。
 
         Returns:
             处理结果。
@@ -215,28 +230,81 @@ class MemoryService:
         decision = self._policy.decide(proposal)
         correlation = correlation_id or uuid4()
 
+        if uow is not None:
+            return await self._apply(
+                proposal=proposal,
+                decision=decision,
+                actor_id=actor_id,
+                correlation=correlation,
+                uow=uow,
+            )
+
+        async with self._uow_factory() as own_uow:
+            outcome = await self._apply(
+                proposal=proposal,
+                decision=decision,
+                actor_id=actor_id,
+                correlation=correlation,
+                uow=own_uow,
+            )
+            await own_uow.commit()
+        return outcome
+
+    async def _apply(
+        self,
+        *,
+        proposal: MemoryWriteProposal,
+        decision: WritePolicyDecision,
+        actor_id: str,
+        correlation: UUID,
+        uow: UnitOfWork,
+    ) -> MemoryWriteOutcome:
+        """在给定的工作单元里完成一次写入请求（**不提交**）。"""
         if not decision.allows_write:
-            await self._record_standalone(
+            await self._record_rejection(
+                uow=uow,
+                proposal=proposal,
+                decision=decision,
+                actor_id=actor_id,
+                correlation=correlation,
+            )
+            return MemoryWriteOutcome(
+                decision=decision.decision, memory=None, reasons=decision.reasons
+            )
+        return await self._write(
+            proposal, decision, actor_id=actor_id, correlation=correlation, uow=uow
+        )
+
+    async def _record_rejection(
+        self,
+        *,
+        uow: UnitOfWork,
+        proposal: MemoryWriteProposal,
+        decision: WritePolicyDecision,
+        actor_id: str,
+        correlation: UUID,
+    ) -> None:
+        """把一次被策略拒绝的写入记进给定的事务。"""
+        payload: dict[str, object] = {
+            "memory_type": proposal.memory_type.value,
+            "decision": decision.decision.value,
+            "reasons": list(decision.reasons),
+            "forbidden_class": decision.forbidden_class,
+            # 🔴 记录**内容长度而非内容**：被拒绝的内容
+            # 往往正是最不该落库的那一类
+            "content_length": len(proposal.content),
+        }
+        assert_audit_payload_safe(payload, operation="memory_propose_rejected")
+        await uow.events.append(
+            self._event(
                 event_type=EventType.MEMORY_REJECTED,
                 user_id=proposal.user_id,
                 correlation_id=correlation,
                 actor_id=actor_id,
                 sensitivity=SensitivityLevel.INTERNAL,
-                payload={
-                    "memory_type": proposal.memory_type.value,
-                    "decision": decision.decision.value,
-                    "reasons": list(decision.reasons),
-                    "forbidden_class": decision.forbidden_class,
-                    # 🔴 记录**内容长度而非内容**：被拒绝的内容
-                    # 往往正是最不该落库的那一类
-                    "content_length": len(proposal.content),
-                },
+                payload=payload,
             )
-            return MemoryWriteOutcome(
-                decision=decision.decision, memory=None, reasons=decision.reasons
-            )
-
-        return await self._write(proposal, decision, actor_id=actor_id, correlation=correlation)
+        )
 
     async def _write(
         self,
@@ -245,97 +313,131 @@ class MemoryService:
         *,
         actor_id: str,
         correlation: UUID,
+        uow: UnitOfWork | None = None,
     ) -> MemoryWriteOutcome:
         """在**一个事务内**完成重复检查、写入与审计。
 
         重复检查必须与写入同事务：分成两次事务的话，两个并发的
         相同写入会各自查到"没有重复"然后都写进去——
         而重复检查存在的全部理由就是防这个。
+
+        🔴 这个理由对**调用方的事务**同样成立，而且更强：
+        反馈路径把它的工作单元交进来时，重复检查、"没有重复"的判定、
+        以及那条记忆的落库全部发生在同一个事务里。
+
+        ``uow`` 为 ``None`` 时本方法自己开事务并提交；非空时
+        **由调用方提交**——它可能还要在同一个事务里写别的东西。
         """
-        async with self._uow_factory() as uow:
-            candidates = await uow.memories.retrieve(
-                user_id=proposal.user_id,
-                query=proposal.content,
-                limit=_DUPLICATE_SCAN_LIMIT,
-            )
-            duplicate = find_exact_duplicate(
-                content=proposal.content,
-                memory_type=proposal.memory_type,
-                user_id=proposal.user_id,
-                existing=candidates,
-            )
-            if duplicate is not None:
-                # 完全相同的内容已经记过。**不写第二条**，也不静默成功——
-                # 静默成功会让调用方以为产生了新记忆，而实际的记忆条数没变。
-                payload = {
-                    "memory_type": proposal.memory_type.value,
-                    "decision": "duplicate",
-                    "reasons": ["内容与既有记忆完全相同"],
-                    "duplicate_of": str(duplicate.id),
-                    "content_length": len(proposal.content),
-                }
-                assert_audit_payload_safe(payload, operation="memory_propose_duplicate")
-                await uow.events.append(
-                    self._event(
-                        event_type=EventType.MEMORY_REJECTED,
-                        user_id=proposal.user_id,
-                        correlation_id=correlation,
-                        actor_id=actor_id,
-                        sensitivity=SensitivityLevel.INTERNAL,
-                        payload=payload,
-                    )
+        if uow is None:
+            async with self._uow_factory() as own_uow:
+                outcome = await self._write_in(
+                    own_uow,
+                    proposal=proposal,
+                    decision=decision,
+                    actor_id=actor_id,
+                    correlation=correlation,
                 )
-                await uow.commit()
-                return MemoryWriteOutcome(
-                    decision=decision.decision,
-                    memory=None,
-                    reasons=("内容与既有记忆完全相同，未重复写入",),
-                    duplicate_of=duplicate.id,
-                )
+                await own_uow.commit()
+            return outcome
 
-            conflicts = await self._detect_conflicts(proposal=proposal, existing=candidates)
+        return await self._write_in(
+            uow,
+            proposal=proposal,
+            decision=decision,
+            actor_id=actor_id,
+            correlation=correlation,
+        )
 
-            memory = Memory(
-                created_by=actor_id,
-                user_id=proposal.user_id,
-                memory_type=proposal.memory_type,
-                content=proposal.content,
-                source_event_ids=list(proposal.source_event_ids),
-                sensitivity=proposal.sensitivity,
-                retention_policy=RetentionPolicy.USER_CONTROLLED,
-                valid_from=utc_now(),
-                status=MemoryStatus.ACTIVE,
-                verification_status=(
-                    VerificationStatus.SELF_REPORTED
-                    if proposal.user_confirmed
-                    else VerificationStatus.UNVERIFIED
-                ),
-                # 🔴 向量版本必须与仓储实际使用的 Provider 一致，
-                # 否则仓储会明确报错（见 memory_repository._embed）。
-                embedding_version=self._embeddings.version,
-            )
-            await uow.memories.add(memory)
+    async def _write_in(
+        self,
+        uow: UnitOfWork,
+        *,
+        proposal: MemoryWriteProposal,
+        decision: WritePolicyDecision,
+        actor_id: str,
+        correlation: UUID,
+    ) -> MemoryWriteOutcome:
+        """写入的实际内容（**不提交**——提交是事务所有者的决定）。"""
+        candidates = await uow.memories.retrieve(
+            user_id=proposal.user_id,
+            query=proposal.content,
+            limit=_DUPLICATE_SCAN_LIMIT,
+        )
+        duplicate = find_exact_duplicate(
+            content=proposal.content,
+            memory_type=proposal.memory_type,
+            user_id=proposal.user_id,
+            existing=candidates,
+        )
+        if duplicate is not None:
+            # 完全相同的内容已经记过。**不写第二条**，也不静默成功——
+            # 静默成功会让调用方以为产生了新记忆，而实际的记忆条数没变。
             payload = {
-                "memory_id": str(memory.id),
-                "memory_type": memory.memory_type.value,
-                "decision": decision.decision.value,
-                "reasons": list(decision.reasons),
-                "embedding_version": self._embeddings.version,
-                "potential_conflict_ids": [str(item.memory_id) for item in conflicts],
+                "memory_type": proposal.memory_type.value,
+                "decision": "duplicate",
+                "reasons": ["内容与既有记忆完全相同"],
+                "duplicate_of": str(duplicate.id),
+                "content_length": len(proposal.content),
             }
-            assert_audit_payload_safe(payload, operation="memory_propose_approved")
+            assert_audit_payload_safe(payload, operation="memory_propose_duplicate")
             await uow.events.append(
                 self._event(
-                    event_type=EventType.MEMORY_APPROVED,
+                    event_type=EventType.MEMORY_REJECTED,
                     user_id=proposal.user_id,
                     correlation_id=correlation,
                     actor_id=actor_id,
-                    sensitivity=memory.sensitivity,
+                    sensitivity=SensitivityLevel.INTERNAL,
                     payload=payload,
                 )
             )
-            await uow.commit()
+            return MemoryWriteOutcome(
+                decision=decision.decision,
+                memory=None,
+                reasons=("内容与既有记忆完全相同，未重复写入",),
+                duplicate_of=duplicate.id,
+            )
 
+        conflicts = await self._detect_conflicts(proposal=proposal, existing=candidates)
+
+        memory = Memory(
+            created_by=actor_id,
+            user_id=proposal.user_id,
+            memory_type=proposal.memory_type,
+            content=proposal.content,
+            source_event_ids=list(proposal.source_event_ids),
+            sensitivity=proposal.sensitivity,
+            retention_policy=RetentionPolicy.USER_CONTROLLED,
+            valid_from=utc_now(),
+            status=MemoryStatus.ACTIVE,
+            verification_status=(
+                VerificationStatus.SELF_REPORTED
+                if proposal.user_confirmed
+                else VerificationStatus.UNVERIFIED
+            ),
+            # 🔴 向量版本必须与仓储实际使用的 Provider 一致，
+            # 否则仓储会明确报错（见 memory_repository._embed）。
+            embedding_version=self._embeddings.version,
+        )
+        await uow.memories.add(memory)
+        payload = {
+            "memory_id": str(memory.id),
+            "memory_type": memory.memory_type.value,
+            "decision": decision.decision.value,
+            "reasons": list(decision.reasons),
+            "embedding_version": self._embeddings.version,
+            "potential_conflict_ids": [str(item.memory_id) for item in conflicts],
+        }
+        assert_audit_payload_safe(payload, operation="memory_propose_approved")
+        await uow.events.append(
+            self._event(
+                event_type=EventType.MEMORY_APPROVED,
+                user_id=proposal.user_id,
+                correlation_id=correlation,
+                actor_id=actor_id,
+                sensitivity=memory.sensitivity,
+                payload=payload,
+            )
+        )
         return MemoryWriteOutcome(
             decision=decision.decision,
             memory=memory,
@@ -731,30 +833,6 @@ class MemoryService:
     # ------------------------------------------------------------------
     # 内部
     # ------------------------------------------------------------------
-
-    async def _record_standalone(
-        self,
-        *,
-        event_type: EventType,
-        user_id: UUID | None,
-        correlation_id: UUID,
-        actor_id: str,
-        payload: Mapping[str, object],
-        sensitivity: SensitivityLevel,
-    ) -> Event:
-        """写入一条独立的审计事件（不与任何记忆写入绑定）。"""
-        event = self._event(
-            event_type=event_type,
-            user_id=user_id,
-            correlation_id=correlation_id,
-            actor_id=actor_id,
-            sensitivity=sensitivity,
-            payload=payload,
-        )
-        async with self._uow_factory() as uow:
-            await uow.events.append(event)
-            await uow.commit()
-        return event
 
     def _event(
         self,

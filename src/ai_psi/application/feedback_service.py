@@ -21,47 +21,100 @@
 不满足条件时结果里会**显式说明为什么没写**，而不是静默跳过：
 用户打开了开关却什么都没发生，必须能从返回值里看出原因。
 
-⚠️ **事务边界：反馈事件先落，记忆更新后做，两步不在同一个事务里。**
+🔴 **反馈会把对应回合的经验抬到有证据的档位。**
 
-这是刻意的。反过来（记忆先写、事件后记）的失败后果是
-"改了却没有记录"（ADR-0015 §5）——但在这里，另一个方向的失败更严重：
-**用户说过的话丢失了**。记忆没更新上，用户再说一次即可；
-反馈正文没记下来，它就真的没了。
+阶段 6.5 §二.5：只有用户明确纠正、可靠后续证据或独立评测
+才能产生 ``SUPPORTED`` / ``CONFIRMED``。内部元认知最多 ``SUSPECTED``，
+而**默认权重下 ``SUSPECTED`` 计 0 次**——因此没有这条路径，
+"三次同类错误"这条验收条件在系统里永远凑不满。
 
-两步通过共同的 ``correlation_id`` 关联（记忆提案的 ``source_event_ids``
-直接指向那条反馈事件），因此"这条记忆为什么会出现"仍然可以追回来。
+本服务把反馈事件与经验评价事件写在**同一个事务**里：
+它们表达的是同一件事（"用户此刻指出了这个回合的问题"），
+分成两个事务就会出现"纠正留下了、它应该抬高的经验没有抬高"。
+
+⚠️ **事务边界：反馈事件、经验评价、记忆更新现在在同一个事务里。**
+
+阶段 6 曾把它们分成两个事务，理由是"丢用户的话比丢一次记忆更新更严重"。
+阶段 6.5 §三.5–6 要求三者原子，因此改成单事务
+（ADR-0021：该决定被修正，ADR-0018 §4 原文保留）。
+
+不改的是那条顾虑本身，它由**两条**机制承接：
+
+1. **写入策略拒绝是一条正常返回，不是异常。** 反馈内容命中红线时，
+   ``WritePolicy`` 拒绝写入并**照常提交**——用户的反馈与它带出的
+   经验评价都留下了，只有记忆没写。这是最常见的情形。
+2. **真正的数据库故障会让整体回滚，用户的反馈确实会丢。**
+   这是"同一事务"的固有代价，不是实现缺陷：原子性与
+   "某个子步骤失败时仍保留其余部分"在定义上互斥。
+   区别在于，现在这个代价是**写在 ADR 里的、被选择过的**，
+   而不是两事务方案里那个没有被讨论过的副作用。
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final
 from uuid import UUID, uuid4
 
+from ai_psi.application.experience_reader import (
+    evaluation_from_event,
+    experience_from_event,
+)
 from ai_psi.application.memory_service import MemoryService
-from ai_psi.application.ports import UnitOfWorkFactory
+from ai_psi.application.ports import UnitOfWork, UnitOfWorkFactory
 from ai_psi.domain.common import utc_now
 from ai_psi.domain.enums import (
     ActorType,
     EventType,
+    ExperienceEvaluation,
+    ExperienceEvaluator,
     FeedbackType,
     MemoryType,
     SensitivityLevel,
 )
 from ai_psi.domain.events import Event
 from ai_psi.domain.exceptions import NotFoundError
+from ai_psi.domain.experiences import (
+    Experience,
+    ExperienceEvaluationRecord,
+    assess_experiences,
+)
 from ai_psi.domain.memories import Memory
 from ai_psi.memory.write_policy import MemoryWriteProposal
 
 __all__ = [
+    "EVALUATION_BY_FEEDBACK_TYPE",
     "FEEDBACK_MEMORY_TYPE",
     "MEMORY_UPDATING_FEEDBACK_TYPES",
     "FeedbackOutcome",
     "FeedbackService",
     "MemoryEffect",
 ]
+
+#: 反馈类型 → 它能把经验抬到的最高评价档位（阶段 6.5 §二.5）。
+#:
+#: 🔴 **白名单。** 没列进来的反馈类型**不产生任何评价**——
+#: 新增一个反馈类型时，默认行为必须是"它不改变经验的可信度"，
+#: 而不是"它悄悄地把经验抬高了一档"。
+#:
+#: 档位的选择依据是**这句话说了什么**：
+#:
+#: * ``CORRECTION``——"你这里错了，应该是 X"。它指出了具体问题，
+#:   是用户能给出的最强确认 → ``CONFIRMED``；
+#: * ``DISAGREEMENT``——"我不同意"。它表达了否定但没说对的是什么，
+#:   因此强度低一档 → ``SUPPORTED``；
+#: * ``CLARIFICATION`` / ``AGREEMENT`` / ``ACKNOWLEDGEMENT`` / ``RATING``
+#:   ——补充信息、赞同、"收到"、打分。它们说的是"好不好"或
+#:   "还有别的情况"，**不是"这里错了"**，因此不在此表中。
+EVALUATION_BY_FEEDBACK_TYPE: Final[dict[FeedbackType, ExperienceEvaluation]] = {
+    FeedbackType.CORRECTION: ExperienceEvaluation.CONFIRMED,
+    FeedbackType.DISAGREEMENT: ExperienceEvaluation.SUPPORTED,
+}
+
+#: 用户纠正这条评价路径的版本。
+EVALUATOR_VERSION: Final[str] = "user-correction/1"
+
 
 
 #: 能够带出一条记忆的反馈类型。
@@ -122,6 +175,10 @@ class FeedbackOutcome:
         event: 本次反馈留下的审计事件。
         memory_effect: 对长期记忆的实际影响。
         memory: 写入的记忆；没有写入时为 ``None``。
+        evaluations: 本次反馈对经验评价的**实际改动**（阶段 6.5 §二.5）。
+            空元组表示这次反馈没有改变任何经验的评价——可能是反馈类型
+            本就不携带"这里错了"的信息，也可能是对应经验的档位已经更高。
+            两者的区别在 ``reasons`` 里。
         reasons: 逐条可读的说明——**包括"为什么没写记忆"**。
     """
 
@@ -130,12 +187,18 @@ class FeedbackOutcome:
     event: Event
     memory_effect: MemoryEffect = MemoryEffect.NONE
     memory: Memory | None = None
+    evaluations: tuple[ExperienceEvaluationRecord, ...] = ()
     reasons: tuple[str, ...] = ()
 
     @property
     def memory_written(self) -> bool:
         """是否真的产生了新记忆。"""
         return self.memory is not None
+
+    @property
+    def evaluation_changed(self) -> bool:
+        """本次反馈是否提高了至少一条经验的评价。"""
+        return bool(self.evaluations)
 
 
 class FeedbackService:
@@ -190,68 +253,136 @@ class FeedbackService:
             NotFoundError: 回合不存在。
         """
         correlation = uuid4()
-        user_id = await self._require_round(round_id)
 
-        # 先算清"这次反馈够不够格写记忆"，再让事件如实记下这个判定。
-        ineligible = (
-            self._memory_update_blocker(feedback_type=feedback_type, user_id=user_id)
-            if allow_memory_update
-            else None
-        )
+        # 🔴 **整段在一个事务里**（阶段 6.5 §三.5–6）：
+        # 反馈事件、经验评价、记忆更新要么都留下，要么都不留。
+        async with self._uow_factory() as uow:
+            round_ = await uow.rounds.get(round_id)
+            if round_ is None:
+                msg = f"认知回合不存在：{round_id}"
+                raise NotFoundError(msg, context={"cognitive_round_id": str(round_id)})
+            user_id = round_.user_id
 
-        # 🔴 **反馈事件先落库。** 见模块文档：用户说过的话不能丢。
-        event = await self._record_feedback(
+            # 先算清"这次反馈够不够格写记忆"，再让事件如实记下这个判定。
+            ineligible = (
+                self._memory_update_blocker(feedback_type=feedback_type, user_id=user_id)
+                if allow_memory_update
+                else None
+            )
+
+            event = self._feedback_event(
+                round_id=round_id,
+                user_id=user_id,
+                correlation_id=correlation,
+                actor_id=actor_id,
+                feedback_type=feedback_type,
+                content=content,
+                related_claim=related_claim,
+                allow_memory_update=allow_memory_update,
+                eligible=allow_memory_update and ineligible is None,
+                ineligible_reason=ineligible,
+            )
+            await uow.events.append(event)
+
+            # 🔴 反馈对**经验评价**的影响，与反馈事件同事务（§二.5）。
+            evaluations, evaluation_reasons = await self._evaluate_experiences(
+                uow=uow,
+                round_id=round_id,
+                user_id=user_id,
+                feedback_type=feedback_type,
+                correlation_id=correlation,
+                actor_id=actor_id,
+                feedback_event_id=event.id,
+            )
+
+            effect, memory, memory_reasons = await self._memory_step(
+                uow=uow,
+                round_id=round_id,
+                user_id=user_id,
+                correlation_id=correlation,
+                actor_id=actor_id,
+                feedback_type=feedback_type,
+                content=content,
+                feedback_event_id=event.id,
+                allow_memory_update=allow_memory_update,
+                ineligible=ineligible,
+            )
+
+            await uow.commit()
+
+        return FeedbackOutcome(
             round_id=round_id,
-            user_id=user_id,
-            correlation_id=correlation,
-            actor_id=actor_id,
             feedback_type=feedback_type,
-            content=content,
-            related_claim=related_claim,
-            allow_memory_update=allow_memory_update,
-            eligible=allow_memory_update and ineligible is None,
-            ineligible_reason=ineligible,
+            event=event,
+            memory_effect=effect,
+            memory=memory,
+            evaluations=evaluations,
+            reasons=(*evaluation_reasons, *memory_reasons),
         )
 
+    async def _memory_step(
+        self,
+        *,
+        uow: UnitOfWork,
+        round_id: UUID,
+        user_id: UUID | None,
+        correlation_id: UUID,
+        actor_id: str,
+        feedback_type: FeedbackType,
+        content: str,
+        feedback_event_id: UUID,
+        allow_memory_update: bool,
+        ineligible: str | None,
+    ) -> tuple[MemoryEffect, Memory | None, tuple[str, ...]]:
+        """在**已开启的事务**里走记忆写入流程。
+
+        🔴 **返回原因而不是抛异常。** 记忆被策略拒绝是这条链路的
+        正常分支之一（用户说了句命中红线的话），它不该让整个事务
+        回滚——那样连反馈本身都留不下。
+
+        Returns:
+            ``(影响, 写入的记忆或 None, 理由)``。
+        """
         if not allow_memory_update:
             # 🔴 "没请求"与"请求了但不满足"是两回事，不合并成一种结果。
             # 合并之后，调用方无法区分"我忘了开开关"与"我开了但被规则挡住了"。
-            return FeedbackOutcome(
-                round_id=round_id,
-                feedback_type=feedback_type,
-                event=event,
-                memory_effect=MemoryEffect.NONE,
-                reasons=("本次反馈未请求更新记忆（allow_memory_update=false）",),
+            return (
+                MemoryEffect.NONE,
+                None,
+                ("本次反馈未请求更新记忆（allow_memory_update=false）",),
             )
 
         if ineligible is not None:
-            return FeedbackOutcome(
-                round_id=round_id,
-                feedback_type=feedback_type,
-                event=event,
-                memory_effect=MemoryEffect.NOT_ELIGIBLE,
-                reasons=(ineligible,),
-            )
+            return (MemoryEffect.NOT_ELIGIBLE, None, (ineligible,))
 
         # 到此 ``user_id`` 必定非空：匿名回合会被上面那条判定挡住。
         if user_id is None:  # pragma: no cover - 上一条判定已覆盖，防御性保留
-            return FeedbackOutcome(
-                round_id=round_id,
-                feedback_type=feedback_type,
-                event=event,
-                memory_effect=MemoryEffect.NOT_ELIGIBLE,
-                reasons=(_NO_SCOPE_REASON,),
-            )
+            return (MemoryEffect.NOT_ELIGIBLE, None, (_NO_SCOPE_REASON,))
 
-        return await self._update_memory(
-            round_id=round_id,
-            user_id=user_id,
-            correlation_id=correlation,
+        outcome = await self._memory_service.propose(
+            proposal=MemoryWriteProposal(
+                user_id=user_id,
+                memory_type=FEEDBACK_MEMORY_TYPE,
+                content=content,
+                sensitivity=SensitivityLevel.PERSONAL,
+                # 指向那条反馈事件——"这条记忆为什么会出现"因此可追
+                source_event_ids=(feedback_event_id,),
+                user_confirmed=True,
+            ),
             actor_id=actor_id,
-            feedback_type=feedback_type,
-            content=content,
-            feedback_event_id=event.id,
-            event=event,
+            correlation_id=correlation_id,
+            # 🔴 把事务交出去：记忆写入长在反馈的事务上（§三.5–6）
+            uow=uow,
+        )
+
+        if outcome.written:
+            return (MemoryEffect.WRITTEN, outcome.memory, ("反馈已写入长期记忆",))
+        if outcome.duplicate_of is not None:
+            return (MemoryEffect.DUPLICATE, None, ("内容与既有记忆完全相同，未重复写入",))
+        return (
+            MemoryEffect.REJECTED_BY_POLICY,
+            None,
+            (f"写入策略未放行（{outcome.decision.value}）", *outcome.reasons),
         )
 
     # ------------------------------------------------------------------
@@ -281,90 +412,154 @@ class FeedbackService:
             return _NO_SCOPE_REASON
         return None
 
-    async def _update_memory(
+    # ------------------------------------------------------------------
+    # 经验评价（阶段 6.5 §二.5）
+    # ------------------------------------------------------------------
+
+    async def _evaluate_experiences(
         self,
         *,
+        uow: UnitOfWork,
         round_id: UUID,
-        user_id: UUID,
+        user_id: UUID | None,
+        feedback_type: FeedbackType,
         correlation_id: UUID,
         actor_id: str,
-        feedback_type: FeedbackType,
-        content: str,
         feedback_event_id: UUID,
-        event: Event,
-    ) -> FeedbackOutcome:
-        """把反馈提给记忆写入流程。
+    ) -> tuple[tuple[ExperienceEvaluationRecord, ...], tuple[str, ...]]:
+        """把本回合的经验抬到这次反馈所支持的档位。
 
-        🔴 构造的是 :class:`MemoryWriteProposal`，不是 :class:`Memory`。
-        前者没有写入权限，必须经过 ``WritePolicy`` 才能变成后者。
+        🔴 **这是"内部元认知最多 SUSPECTED"这条规则的出口。**
 
-        ``user_confirmed=True`` 在这里是**如实陈述**，不是绕过确认：
-        策略要求的"用户在当前系统中明确确认"，指的正是
-        "用户此刻在本系统里亲手写下了这句话"——
-        而这条反馈本身就是那个动作。
+        没有它，生产里能产出的经验永远停在 ``SUSPECTED``，
+        而 ``SUSPECTED`` 在默认权重下计 0 次——"三次同类错误
+        生成提案"因此在系统里**永远不可能发生**。
+
+        档位映射（§二.5）：
+
+        * ``CORRECTION``——用户**指出了哪里不对**，这是明确的确认，
+          抬到 ``CONFIRMED``；
+        * ``DISAGREEMENT``——用户只说"不同意"，没说对的是什么，
+          抬到 ``SUPPORTED``；
+        * 其余类型（赞同 / 确认收到 / 评分 / 澄清）**不产生评价**。
+          澄清与评分说的是"补充信息"和"好不好"，不是"这里错了"。
+
+        ⚠️ **只在真的会抬高时才写。** 用户对同一个回合点两次纠正
+        不该产生两条评价记录——那不是"更确认"，只是重复。
+
+        Args:
+            uow: 已开启的工作单元（与反馈事件同一个事务）。
+            round_id: 被反馈的回合。
+            user_id: 归属用户。
+            feedback_type: 反馈类型。
+            correlation_id: 关联链标识。
+            actor_id: 发起者标识。
+            feedback_event_id: 反馈事件 id，作为评价的证据引用。
+
+        Returns:
+            ``(写入的评价记录, 理由)``。
         """
-        outcome = await self._memory_service.propose(
-            proposal=MemoryWriteProposal(
-                user_id=user_id,
-                memory_type=FEEDBACK_MEMORY_TYPE,
-                content=content,
-                sensitivity=SensitivityLevel.PERSONAL,
-                # 指向那条反馈事件——"这条记忆为什么会出现"因此可追
-                source_event_ids=(feedback_event_id,),
-                user_confirmed=True,
-            ),
-            actor_id=actor_id,
-            correlation_id=correlation_id,
-        )
+        target = EVALUATION_BY_FEEDBACK_TYPE.get(feedback_type)
+        if target is None:
+            return (), ()
 
-        if outcome.written:
-            return FeedbackOutcome(
-                round_id=round_id,
-                feedback_type=feedback_type,
-                event=event,
-                memory_effect=MemoryEffect.WRITTEN,
-                memory=outcome.memory,
-                reasons=("反馈已写入长期记忆",),
+        events = await uow.events.read_stream(cognitive_round_id=round_id)
+        created = [item for item in events if item.event_type is EventType.EXPERIENCE_CREATED]
+        if not created:
+            return (
+                (),
+                (
+                    "本回合没有产出经验（失败回合、或该回合关闭了长期记忆），"
+                    "本次反馈没有被记到任何经验上",
+                ),
             )
 
-        if outcome.duplicate_of is not None:
-            return FeedbackOutcome(
-                round_id=round_id,
-                feedback_type=feedback_type,
-                event=event,
-                memory_effect=MemoryEffect.DUPLICATE,
-                reasons=("内容与既有记忆完全相同，未重复写入",),
-            )
+        experiences = [
+            item
+            for item in (experience_from_event(event) for event in created)
+            if item is not None
+        ]
+        current = await self._current_evaluations(uow, experiences)
 
-        return FeedbackOutcome(
-            round_id=round_id,
-            feedback_type=feedback_type,
-            event=event,
-            memory_effect=MemoryEffect.REJECTED_BY_POLICY,
-            reasons=(
-                f"写入策略未放行（{outcome.decision.value}）",
-                *outcome.reasons,
-            ),
-        )
+        written: list[ExperienceEvaluationRecord] = []
+        skipped = 0
+        for experience in experiences:
+            if current.get(experience.id, experience.evaluation).rank >= target.rank:
+                skipped += 1
+                continue
+            record = ExperienceEvaluationRecord(
+                created_by=actor_id,
+                experience_id=experience.id,
+                experience_canonical_key=experience.canonical_key,
+                evaluation=target,
+                evaluator_type=ExperienceEvaluator.USER_CORRECTION,
+                evaluator_version=EVALUATOR_VERSION,
+                evidence_refs=[feedback_event_id],
+                reasons=[
+                    f"用户在回合 {round_id} 上给出了 {feedback_type.value} 反馈",
+                    f"评价由 {self._describe_prior(current.get(experience.id))} "
+                    f"抬到 {target.value}",
+                ],
+                evaluated_at=utc_now(),
+            )
+            await uow.events.append(
+                Event(
+                    event_type=EventType.EXPERIENCE_EVALUATED,
+                    occurred_at=utc_now(),
+                    actor_type=ActorType.USER,
+                    actor_id=actor_id,
+                    user_id=user_id,
+                    conversation_id=None,
+                    cognitive_round_id=round_id,
+                    correlation_id=correlation_id,
+                    payload={"evaluation": record.model_dump(mode="json")},
+                    sensitivity=SensitivityLevel.INTERNAL,
+                )
+            )
+            written.append(record)
+
+        reasons: list[str] = []
+        if written:
+            reasons.append(
+                f"{len(written)} 条经验的评价被抬到 {target.value}"
+                f"（依据：{feedback_type.value} 反馈）"
+            )
+        if skipped:
+            reasons.append(f"{skipped} 条经验的评价已不低于 {target.value}，未重复记")
+        return tuple(written), tuple(reasons)
+
+    async def _current_evaluations(
+        self,
+        uow: UnitOfWork,
+        experiences: list[Experience],
+    ) -> dict[UUID, ExperienceEvaluation]:
+        """本回合这些经验**当前**的有效评价。"""
+        if not experiences:
+            return {}
+        known = {item.id for item in experiences}
+        records = [
+            record
+            for event in await uow.events.read_by_event_type(
+                event_type=EventType.EXPERIENCE_EVALUATED
+            )
+            if (record := evaluation_from_event(event)) is not None
+            and record.experience_id in known
+        ]
+        return {
+            item.experience.id: item.evaluation
+            for item in assess_experiences(experiences, records)
+        }
+
+    @staticmethod
+    def _describe_prior(evaluation: ExperienceEvaluation | None) -> str:
+        """把"抬升前是什么"写进理由。"""
+        return evaluation.value if evaluation is not None else "unassessed"
 
     # ------------------------------------------------------------------
     # 事件
     # ------------------------------------------------------------------
 
-    async def _require_round(self, round_id: UUID) -> UUID | None:
-        """确认回合存在，并返回它的归属用户。
-
-        Raises:
-            NotFoundError: 回合不存在。
-        """
-        async with self._uow_factory() as uow:
-            round_ = await uow.rounds.get(round_id)
-        if round_ is None:
-            msg = f"认知回合不存在：{round_id}"
-            raise NotFoundError(msg, context={"cognitive_round_id": str(round_id)})
-        return round_.user_id
-
-    async def _record_feedback(
+    def _feedback_event(
         self,
         *,
         round_id: UUID,
@@ -378,7 +573,7 @@ class FeedbackService:
         eligible: bool,
         ineligible_reason: str | None,
     ) -> Event:
-        """写入 ``user.feedback.received`` 事件。
+        """构造 ``user.feedback.received`` 事件（**不落库**）。
 
         🔴 **负载里有 ``content``，而且不能没有。**
 
@@ -405,34 +600,8 @@ class FeedbackService:
             "memory_update_eligible": eligible,
             "memory_update_ineligible_reason": ineligible_reason,
         }
-        event = self._event(
-            event_type=EventType.USER_FEEDBACK_RECEIVED,
-            round_id=round_id,
-            user_id=user_id,
-            correlation_id=correlation_id,
-            actor_id=actor_id,
-            payload=payload,
-            sensitivity=SensitivityLevel.PERSONAL,
-        )
-        async with self._uow_factory() as uow:
-            await uow.events.append(event)
-            await uow.commit()
-        return event
-
-    def _event(
-        self,
-        *,
-        event_type: EventType,
-        round_id: UUID,
-        user_id: UUID | None,
-        correlation_id: UUID,
-        actor_id: str,
-        payload: Mapping[str, object],
-        sensitivity: SensitivityLevel,
-    ) -> Event:
-        """构造一条反馈事件对象（不落库）。"""
         return Event(
-            event_type=event_type,
+            event_type=EventType.USER_FEEDBACK_RECEIVED,
             occurred_at=utc_now(),
             actor_type=ActorType.USER,
             actor_id=actor_id,
@@ -442,6 +611,6 @@ class FeedbackService:
             # 因此"这个回合收到了什么反馈"沿事件流就能读出来
             cognitive_round_id=round_id,
             correlation_id=correlation_id,
-            payload=dict(payload),
-            sensitivity=sensitivity,
+            payload=payload,
+            sensitivity=SensitivityLevel.PERSONAL,
         )

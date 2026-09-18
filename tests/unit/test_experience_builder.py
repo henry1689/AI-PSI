@@ -208,6 +208,13 @@ class TestNoFreeTextEntersTheLearningChain:
             "later_evidence_ids",
             "applicable_conditions",
             "counterexamples",
+            # 阶段 6.5 §二.9 / §二.12：身份锚点与独立性分组。
+            # ⚠️ 两者都是**结构化标识**（事件 id、客户端幂等键），
+            # 不是自由文本——幂等键看着像"用户给的东西"，
+            # 但它由客户端生成、在本系统里只做分组，
+            # 且不承载任何语义（ADR-0020 §?）。
+            "origin_event_ids",
+            "idempotency_key",
         }
     )
 

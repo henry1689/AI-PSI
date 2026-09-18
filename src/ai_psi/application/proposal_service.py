@@ -34,6 +34,7 @@ from typing import Final
 from uuid import UUID, uuid4
 
 from ai_psi.application.ports import UnitOfWork, UnitOfWorkFactory
+from ai_psi.application.proposal_gate import GateVerdict
 from ai_psi.domain.common import utc_now
 from ai_psi.domain.enums import (
     ActorType,
@@ -115,16 +116,30 @@ class ProposalService:
         self,
         proposal: ImprovementProposal,
         *,
+        verdict: GateVerdict,
         actor_id: str = "proposal_generator",
         correlation_id: UUID | None = None,
     ) -> ImprovementProposal:
         """写入一条新提案（状态必须是 ``DRAFT``）。
 
-        🔴 不接受已经处于其他状态的提案：一条"生成出来就已评估"
+        🔴 **不接受已经处于其他状态的提案**：一条"生成出来就已评估"
         的提案会让"谁评估的、依据是什么"无从回答。
+
+        🔴 **必须携带门禁结论，且该结论必须与这条提案对得上**
+        （阶段 6.5 §二.15）。
+
+        落库是整条链路上**唯一会留下东西**的一步，因此它是最后的
+        一道关。这里拒绝三件事：
+
+        * 未经门禁授权的提案（``verdict.authorised`` 为假）；
+        * **张冠李戴**的门禁结论——拿着 A 模式的授权去写 B 模式的提案；
+        * 引用的经验与门禁实际重查到的不一致——那说明生成时用的
+          证据与复核时看到的证据不是同一批，而评审将要**根据
+          这些 id** 去查证。
 
         Args:
             proposal: 待写入的提案。
+            verdict: 门禁结论（``ProposalGate.review`` 的产物）。
             actor_id: 产生者标识。
             correlation_id: 关联链标识。
 
@@ -133,13 +148,20 @@ class ProposalService:
 
         Raises:
             IllegalStateTransitionError: 提案不是 ``DRAFT``。
+            InvalidRequestError: 门禁结论不被接受（见上）。
         """
+        # ⚠️ **顺序是有意的：先查提案自身的形状，再查授权。**
+        # 反过来的话，"一条状态就不对的提案"会先撞上"门禁结论与提案
+        # 不匹配"——那是**另一件事**的报错，而调用方会照着它去修
+        # 门禁那一侧。报错指向的问题必须是实际存在的问题。
         if proposal.status is not ProposalStatus.DRAFT:
             self._raise_transition(
                 proposal,
                 to_state=ProposalStatus.DRAFT,
                 message="新提案只能以 DRAFT 状态写入",
             )
+
+        self._require_gate_authorisation(proposal, verdict)
 
         event = self._event(
             event_type=EventType.IMPROVEMENT_PROPOSAL_CREATED,
@@ -153,6 +175,14 @@ class ProposalService:
                 "approval_level": proposal.approval_level.value,
                 "supporting_experience_count": len(proposal.supporting_experience_ids),
                 "counterexample_count": len(proposal.counterexamples),
+                # 🔴 门禁**当时看到的**。审计问题是"这条提案凭什么被放行"，
+                # 而回答它需要的不是"门禁存在过"，是那一刻的计数与读取完整性。
+                # 事后重跑门禁未必得到同样结果（经验会继续累积），
+                # 因此这些数字必须随事件一起落库。
+                "gate_threshold": verdict.threshold,
+                "gate_weighted_count": verdict.recomputed_weighted_count,
+                "gate_occurrence_count": verdict.recomputed_occurrences,
+                "gate_data_quality": verdict.data_quality,
             },
         )
         async with self._uow_factory() as uow:
@@ -160,6 +190,59 @@ class ProposalService:
             await uow.events.append(event)
             await uow.commit()
         return proposal
+
+    def _require_gate_authorisation(
+        self,
+        proposal: ImprovementProposal,
+        verdict: GateVerdict,
+    ) -> None:
+        """门禁结论必须**授权**、且**确实是关于这条提案的**。
+
+        🔴 三条检查缺一不可，理由各不相同：
+
+        1. ``authorised``——最基本的：没授权就不能落库。
+        2. **键一致**——挡住"拿 A 模式的授权写 B 模式的提案"。
+           少了它，一次真实授权可以被复用成任意多条提案，
+           而每条都带着一份看起来无懈可击的门禁记录。
+        3. **证据一致**——评审会**按 id 去查证**这些经验。
+           如果提案引用的与门禁重查到的是两批，那么评审查到的
+           东西与门禁批准的东西不是一回事，而两边都不会察觉。
+
+        Raises:
+            InvalidRequestError: 任一检查不通过。
+        """
+        if not verdict.authorised:
+            msg = (
+                f"提案未被门禁授权（{verdict.error_type.value} / "
+                f"{verdict.situation_signature}）："
+                f"加权计数 {verdict.recomputed_weighted_count}，"
+                f"门槛 {verdict.threshold}。"
+                "阶段 6.5 §二.15 不允许未经复核的模式落库"
+            )
+            raise InvalidRequestError(msg, context={"proposal_id": str(proposal.id)})
+
+        if proposal.error_class is not verdict.error_type or (
+            not proposal.applicability or proposal.applicability[0] != verdict.situation_signature
+        ):
+            msg = (
+                f"门禁结论与提案不匹配：结论针对 "
+                f"{verdict.error_type.value} / {verdict.situation_signature}，"
+                f"提案是 {proposal.error_class.value} / "
+                f"{proposal.applicability[0] if proposal.applicability else '(空)'}。"
+                "一次授权不得被复用到另一条提案上"
+            )
+            raise InvalidRequestError(msg, context={"proposal_id": str(proposal.id)})
+
+        cited = sorted(str(item) for item in proposal.supporting_experience_ids)
+        verified = sorted(str(item) for item in verdict.evidence_experience_ids)
+        if cited != verified:
+            msg = (
+                f"提案引用的支撑经验与门禁重查到的不一致："
+                f"提案引用 {len(cited)} 条，门禁核实 {len(verified)} 条。"
+                "评审将按这些 id 去查证——两边不是同一批证据时，"
+                "评审看到的与门禁批准的不是一回事"
+            )
+            raise InvalidRequestError(msg, context={"proposal_id": str(proposal.id)})
 
     async def get(self, proposal_id: UUID) -> ImprovementProposal:
         """按 id 读取提案。

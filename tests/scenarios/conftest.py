@@ -27,8 +27,13 @@ from ai_psi.application.cognitive_runtime import (
     RoundOutcome,
     RoundRequest,
 )
+from ai_psi.application.experience_reader import ExperienceReader
+from ai_psi.application.feedback_service import FeedbackService
+from ai_psi.application.learning_service import LearningService
 from ai_psi.application.memory_service import MemoryService
 from ai_psi.application.ports import UnitOfWorkFactory
+from ai_psi.application.proposal_gate import ProposalGate
+from ai_psi.application.proposal_service import ProposalService
 from ai_psi.cognition.projection import ArtifactView, project_artifacts
 from ai_psi.config import Settings
 from ai_psi.domain.enums import CognitiveDepth, EventType
@@ -207,6 +212,11 @@ class Harness:
     provider: MockProvider
     store: InMemoryStore
     memory_service: MemoryService
+    feedback_service: FeedbackService
+    proposal_service: ProposalService
+    experience_reader: ExperienceReader
+    proposal_gate: ProposalGate
+    learning_service: LearningService
     embeddings: EmbeddingProvider
     prompts: PromptRegistry
     settings: Settings
@@ -297,11 +307,26 @@ def harness_factory() -> Callable[..., Harness]:
             memory_service=memory_service,
             settings=resolved,
         )
+        # 🔴 与容器**同一套装配**。场景测试若要验证学习链路，
+        # 用的一定是生产里那条链路——在测试夹具里另拼一套，
+        # 验证的就不是系统了。
+        feedback_service = FeedbackService(uow_factory, memory_service)
+        proposal_service = ProposalService(uow_factory)
+        experience_reader = ExperienceReader(uow_factory)
+        proposal_gate = ProposalGate(experience_reader)
+        learning_service = LearningService(
+            uow_factory, experience_reader, proposal_gate, proposal_service
+        )
         return Harness(
             runtime=runtime,
             provider=provider,
             store=store,
             memory_service=memory_service,
+            feedback_service=feedback_service,
+            proposal_service=proposal_service,
+            experience_reader=experience_reader,
+            proposal_gate=proposal_gate,
+            learning_service=learning_service,
             embeddings=embeddings,
             prompts=prompts,
             settings=resolved,

@@ -31,6 +31,9 @@ __all__ = [
     "EventType",
     "EvidenceDirectness",
     "ExpectedOutputType",
+    "ExperienceEvaluation",
+    "ExperienceEvaluator",
+    "ExperienceKind",
     "FeedbackType",
     "HypothesisCategory",
     "HypothesisStatus",
@@ -544,6 +547,101 @@ class ErrorType(StrEnum):
     UNKNOWN_ERROR = "unknown_error"
 
 
+class ExperienceEvaluation(StrEnum):
+    """一条经验的**错误归因**被确认到什么程度（阶段 6.5 §二.3）。
+
+    🔴 **这个枚举存在的理由：内部元认知不是证据。**
+
+    在它出现之前，``Experience.error_type`` 这个字段同时承担了两件
+    完全不同的事：一是"系统的元认知模块怀疑这里出了问题"，
+    二是"这里确实出了问题"。两者被写进同一个字段、按同一个权重
+    计入提案门槛——于是**系统自己的怀疑可以自我确认成规律**：
+    元认知怀疑三次，就有了一个"已被三次独立观察支持"的提案。
+
+    §二.4 因此划了一条硬线：**内部元认知最多产生 ``SUSPECTED``。**
+    ``SUPPORTED`` 与 ``CONFIRMED`` 只能来自经验之外的证据
+    （用户明确纠正、可靠后续证据、独立评测）。
+
+    四档的语义边界：
+
+    * ``UNASSESSED``——没有任何评估者对它下过判断。系统连怀疑都没有，
+      只是把它记下来了。**它不计入门槛。**
+    * ``SUSPECTED``——内部元认知怀疑有错。这是一个**假设**，
+      不是一条证据。**默认不计入门槛**（§二.7 要求不得与
+      ``SUPPORTED``/``CONFIRMED`` 等权——默认权重取 0 是最强的不等权）。
+    * ``SUPPORTED``——有独立于内部元认知的证据支持：
+      用户明确纠正、或判断之后出现的新证据。
+    * ``CONFIRMED``——用户直接指出这是错的，或独立评测确认。
+      这是最高一档，它只可能来自**系统之外**。
+
+    ⚠️ ``rank`` 只表达**次序**，不表达**权重**。权重是门槛策略
+    （见 :mod:`ai_psi.learning.promotion_policy`），会随策略变化；
+    而次序是语义，不该变。
+    """
+
+    UNASSESSED = "unassessed"
+    SUSPECTED = "suspected"
+    SUPPORTED = "supported"
+    CONFIRMED = "confirmed"
+
+    @property
+    def rank(self) -> int:
+        """次序（0 = 最低）。只用于比较，不用于加权。"""
+        return _EXPERIENCE_EVALUATION_RANK[self]
+
+
+_EXPERIENCE_EVALUATION_RANK: dict[ExperienceEvaluation, int] = {
+    ExperienceEvaluation.UNASSESSED: 0,
+    ExperienceEvaluation.SUSPECTED: 1,
+    ExperienceEvaluation.SUPPORTED: 2,
+    ExperienceEvaluation.CONFIRMED: 3,
+}
+
+
+class ExperienceEvaluator(StrEnum):
+    """**谁**判定了一条经验的评价状态（阶段 6.5 §二.8）。
+
+    🔴 **知道了"是什么状态"还不够，必须知道"谁说的"。**
+
+    ``CONFIRMED`` 来自"用户明确说这是错的"与来自"内部模块自己这么认为"，
+    是完全不同的两件事——哪怕它们最终都是错误类型的事实描述。
+    没有这一栏，一次策略放宽（比如允许内部元认知产生 ``SUPPORTED``）
+    会让**历史上所有**的印象分记录在一夜之间改变含义，
+    而且没有任何痕迹说明它们当时是谁判的。
+
+    ⚠️ 这四者之间**没有**"哪个更权威"的偏序：``USER_CORRECTION``
+    说"用户认为错了"，``LATER_EVIDENCE`` 说"后面出现了反证"，
+    它们是**不同类型的依据**，不是同一个尺子上的刻度。
+    把它们排成序会让"用户说的"和"证据显示的"在需要区分时无法区分
+    （不变量 4：用户赞同不能把事实改为已验证）。
+    """
+
+    INTERNAL_METACOGNITION = "internal_metacognition"
+    """内部元认知模块（反思、置信度检查、反刍信号）。**最多产生 SUSPECTED。**"""
+
+    LATER_EVIDENCE = "later_evidence"
+    """判断**之后**才出现的证据。"""
+
+    USER_CORRECTION = "user_correction"
+    """用户明确表示了否定（纠正 / 不同意）。"""
+
+    INDEPENDENT_EVALUATION = "independent_evaluation"
+    """独立于本回合的评测（阶段 7 的 Golden Dataset 对照等）。"""
+
+
+class ExperienceKind(StrEnum):
+    """经验的种类，参与 ``canonical_key`` 的构成（阶段 6.5 §二.10）。
+
+    ⚠️ V0.1 只有一种。保留它是因为 ``canonical_key`` 必须能区分
+    "同一个回合里、针对同一对象、但属于不同种类"的经验——
+    少了这一维，将来新增一种经验就会与既有的撞键，
+    而撞键的表现是"新经验被唯一约束静默拒绝"，不是报错。
+    """
+
+    ROUND_OUTCOME = "round_outcome"
+    """一次认知回合的结果复盘。"""
+
+
 class ApprovalLevel(StrEnum):
     """提案所需的审批级别。"""
 
@@ -767,6 +865,16 @@ class EventType(StrEnum):
 
     # 经验与提案
     EXPERIENCE_CREATED = "experience.created"
+    #: 阶段 6.5 §二 新增（ADR-0020）。**经验本身不可变，评价会变。**
+    #:
+    #: 一条经验在写入时只可能拿到"内部元认知"这一种评估者，
+    #: 而用户纠正、后续证据都在那之后才到。要表达"这条经验后来
+    #: 被用户确认了"，只有两条路：改写经验（违反不可变），
+    #: 或者追加一条评价事件（本事件）。
+    #:
+    #: 🔴 缺了它，"三次被支持的同类错误"这条验收条件就无法成立——
+    #: 生产里能产出的经验永远停在 ``SUSPECTED``。
+    EXPERIENCE_EVALUATED = "experience.evaluated"
     IMPROVEMENT_PROPOSAL_CREATED = "improvement_proposal.created"
     IMPROVEMENT_PROPOSAL_EVALUATED = "improvement_proposal.evaluated"
     #: 任务书 §5.2 清单中缺失（ADR-0018）。

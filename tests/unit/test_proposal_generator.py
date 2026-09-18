@@ -38,6 +38,11 @@ def _pattern(error_type: ErrorType = ErrorType.REASONING_ERROR, count: int = 3) 
         error_type=error_type,
         situation_signature=SIGNATURE,
         experience_ids=tuple(uuid4() for _ in range(count)),
+        # 🔴 门槛比的是**加权计数**（阶段 6.5 §二.6–7）：
+        # 本文件的模式一律按"已被外部证据确认"构造，因此两者相等。
+        occurrence_count=count,
+        weighted_count=count,
+        experience_count=count,
     )
 
 
@@ -139,6 +144,9 @@ class TestEvidenceIsCarried:
             error_type=ErrorType.REASONING_ERROR,
             situation_signature=SIGNATURE,
             experience_ids=(uuid4(), uuid4(), uuid4()),
+            occurrence_count=3,
+            weighted_count=3,
+            experience_count=3,
             counterexample_count=2,
         )
         decision = PromotionPolicy().decide(PromotionEvidence(pattern=pattern))

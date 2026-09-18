@@ -118,14 +118,16 @@ class ProposalGenerator:
 
         if (
             PromotionTrigger.REPEATED_SAME_ERROR in decision.triggers
-            and pattern.count < PROPOSAL_ESCALATION_THRESHOLD
+            and pattern.weighted_count < PROPOSAL_ESCALATION_THRESHOLD
         ):
             # 🔴 这是被**伪造**或**篡改**的裁决，不是运行时状态。
             # 静默返回 None 会让它看起来像"没什么可生成的"，
             # 而真相是有人绕过了门槛——那必须响。
             msg = (
                 f"裁决声称命中「同类错误重复出现」，但模式只支持 "
-                f"{pattern.count} 条（门槛 {PROPOSAL_ESCALATION_THRESHOLD}）。"
+                f"加权计数 {pattern.weighted_count}（门槛 {PROPOSAL_ESCALATION_THRESHOLD}，"
+                f"发生 {pattern.count} 次、评价 "
+                f"{'、'.join(item.value for item in pattern.evaluations)}）。"
                 "这不是运行时状态，而是被构造出来的裁决——"
                 "不变量 10 不允许从它产出提案"
             )

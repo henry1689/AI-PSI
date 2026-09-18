@@ -217,6 +217,21 @@ class CognitiveRuntime:
         return self._prompts
 
     @property
+    def uow_factory(self) -> UnitOfWorkFactory:
+        """工作单元工厂。
+
+        🔴 **给的是工厂而不是一个开着的工作单元。**
+        事务边界必须由真正使用它的那段代码划定——把已开启的
+        工作单元传出去，会让"这个读操作属于哪个事务"变成一个
+        取决于调用顺序的问题。
+
+        ⚠️ 暴露它是因为回合收尾需要**读回本回合自己的事件**
+        （``origin_event_ids``，阶段 6.5 §二.9）。那是审计问题，
+        只有事件存储能回答，而回合执行器手里的内存状态答不了。
+        """
+        return self._uow_factory
+
+    @property
     def memory_service(self) -> MemoryService:
         """长期记忆服务。
 
@@ -1136,6 +1151,14 @@ class _RoundExecution:
             evidence_ids=tuple(item.id for item in self._request.evidence),
             # 模块名（结构标签），不是模型的措辞
             strategy_used=tuple(sorted(self._state.analysis_signature)),
+            # 🔴 本回合**走到这里为止**写入的全部事件。
+            # 它是经验可被回放重建的锚点：没有它，"这条经验读的是哪几个
+            # 事件"只能靠时间与 payload 形状去猜（阶段 6.5 §二.9）。
+            origin_event_ids=await self._round_event_ids(),
+            # 幂等键决定独立性分组：同一 key 的技术重试只算一次发生
+            # （阶段 6.5 §二.12）。它来自回合本身，不是请求——
+            # 重放一个已有回合时，请求是新的，发生还是同一次。
+            idempotency_key=self._state.round_.idempotency_key,
         )
         experience, attribution = self._experience_builder.build(
             record=record, signals=self._error_signals()
@@ -1152,6 +1175,24 @@ class _RoundExecution:
             actor_id="cognitive_runtime",
             payload={"experience": payload},
         )
+
+    async def _round_event_ids(self) -> tuple[UUID, ...]:
+        """本回合到目前为止写入的事件 id（按写入序）。
+
+        🔴 **它必须从事件流里读，不能从内存里的状态拼。**
+
+        内存里能拿到的是"这一轮跑过哪些模块"，而 ``origin_event_ids``
+        要回答的是"这条经验对应事件流里的哪几行"——那是审计问题，
+        只有事件存储能回答。从内存拼出来的 id 集合在降级、跳过、
+        元认知循环等路径上会与真实写入不重合，而那些恰好是
+        最需要复盘的情形。
+
+        ⚠️ 这是一次**只读**的事务，不参与经验写入的事务——
+        读失败时应当让回合收尾失败，而不是拿一个残缺的锚点继续。
+        """
+        async with self._runtime.uow_factory() as uow:
+            events = await uow.events.read_stream(cognitive_round_id=self._round_id)
+        return tuple(event.id for event in events)
 
     def _error_signals(self) -> ErrorSignals:
         """把本回合的可观察状态翻译成归因判据。

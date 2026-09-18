@@ -19,7 +19,7 @@ from ai_psi.api.app import API_PREFIX, create_app
 from ai_psi.config import Environment, Settings
 from ai_psi.container import build_container
 from ai_psi.domain.enums import ErrorType
-from ai_psi.domain.improvement_proposals import ImprovementProposal
+from tests.helpers import seed_learning_evidence
 
 pytestmark = pytest.mark.unit
 
@@ -47,23 +47,41 @@ async def _seed(
     error_class: ErrorType = ErrorType.REASONING_ERROR,
     experiences: int = 3,
 ) -> UUID:
-    """直接经服务写入一条 DRAFT 提案，返回它的 id。
+    """经**真实学习链路**写入一条 DRAFT 提案，返回它的 id。
 
-    ⚠️ §12.4 **没有**创建提案的接口——提案由学习链路生成，
-    不由客户端提交。这里走的是服务层，不是绕过被测代码。
+    ⚠️ §12.4 **没有**创建提案的接口——提案只能由学习链路生成，
+    不由客户端提交。阶段 6.5 起落库还必须携带门禁结论，因此
+    这里不能像以前那样直接构造一个 ``ImprovementProposal`` 塞进去。
+
+    做法：准备一批被用户纠正确认过的经验（见
+    :func:`tests.helpers.seed_learning_evidence` 的边界说明——
+    这个辅助函数**只用于**「提案生命周期」这类测试，
+    **不用于**学习链路本身的黑盒验收），再跑一次链路。
+
+    Args:
+        client: 测试客户端。
+        error_class: 经验里的错误类别。
+        experiences: 造几个回合。**低于 3 时链路不会产出提案**——
+            门槛是不变量 10 的一部分，本函数不绕过它。
+
+    Returns:
+        生成的提案 id。
+
+    Raises:
+        AssertionError: 链路没有产出恰好一条提案。
     """
     container: Any = client._transport.app.state.container  # type: ignore[attr-defined]
-    proposal = ImprovementProposal(
-        created_by="test",
-        target_component="prompt:logical_analyzer",
-        observed_problem="同类推理错误反复出现",
-        error_class=error_class,
-        proposed_change="检查该情境下的反例检查环节",
-        expected_benefit="降低复发率",
-        supporting_experience_ids=[uuid4() for _ in range(experiences)],
+    await seed_learning_evidence(
+        round_service=container.round_service,
+        artifact_service=container.artifact_service,
+        feedback_service=container.feedback_service,
+        rounds=experiences,
+        error_type=error_class,
+        situation_signature=f"{error_class.value}|d2|multi_source",
     )
-    await container.proposal_service.create(proposal)
-    return proposal.id
+    run = await container.learning_service.review()
+    assert len(run.created) == 1, run.summary()
+    return UUID(str(run.created[0].proposal.id))
 
 
 async def _evaluate(client: httpx.AsyncClient, proposal_id: UUID, **body: Any) -> httpx.Response:

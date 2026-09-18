@@ -20,7 +20,7 @@ from ai_psi.application.feedback_service import (
     MemoryEffect,
 )
 from ai_psi.application.memory_service import MemoryService, MemoryWriteOutcome
-from ai_psi.application.ports import UnitOfWorkFactory
+from ai_psi.application.ports import UnitOfWork, UnitOfWorkFactory
 from ai_psi.domain.cognitive_rounds import CognitiveBudget, CognitiveRound
 from ai_psi.domain.enums import (
     CognitiveDepth,
@@ -497,27 +497,42 @@ class TestFeedbackCannotBypassTheWritePolicy:
         assert service.memory_service is memory_service
 
 
-class TestTheFeedbackRecordSurvivesAMemoryFailure:
-    """🔴 事务顺序的直接证据：用户说过的话不能丢。"""
+class _Exploding(MemoryService):
+    """记忆写入时崩溃的替身。"""
 
-    async def test_feedback_event_is_written_before_the_memory_update(
+    async def propose(
+        self,
+        *,
+        proposal: MemoryWriteProposal,
+        actor_id: str = "memory_service",
+        correlation_id: UUID | None = None,
+        uow: UnitOfWork | None = None,
+    ) -> MemoryWriteOutcome:
+        del proposal, actor_id, correlation_id, uow
+        msg = "模拟记忆写入过程中崩溃"
+        raise RuntimeError(msg)
+
+
+class TestFeedbackIsAtomicWithItsMemoryUpdate:
+    """🔴 阶段 6.5 §三.5–6：反馈事件、经验评价、记忆更新在**同一事务**。
+
+    ⚠️ **本类断言的"方向"与阶段 6 相反，这是有意的。**
+
+    阶段 6 的实现让反馈事件先落、记忆更新后做（两个事务），
+    理由是"丢用户的话比丢一次记忆更新更严重"。阶段 6.5 §三.5–6
+    要求三者原子，用户选择了单事务（ADR-0021），因此：
+    **记忆写入崩溃时，反馈事件也不再留下。**
+
+    这是被选择过的代价，不是缺陷——原子性与"某个子步骤失败时
+    仍保留其余部分"在定义上互斥。真正承接那条顾虑的是另一条路径：
+    **写入策略拒绝是一条正常返回**，那一刻事务照常提交，
+    用户的反馈与它带出的经验评价都留下（见下一个类）。
+    """
+
+    async def test_a_memory_crash_leaves_no_feedback_behind(
         self, uow_factory: UnitOfWorkFactory
     ) -> None:
-        user_id = uuid4()
-        round_id = await _make_round(uow_factory, user_id=user_id)
-
-        class _Exploding(MemoryService):
-            async def propose(
-                self,
-                *,
-                proposal: MemoryWriteProposal,
-                actor_id: str = "memory_service",
-                correlation_id: UUID | None = None,
-            ) -> MemoryWriteOutcome:
-                del proposal, actor_id, correlation_id
-                msg = "模拟记忆写入过程中崩溃"
-                raise RuntimeError(msg)
-
+        round_id = await _make_round(uow_factory, user_id=uuid4())
         service = FeedbackService(uow_factory, _Exploding(uow_factory, LocalHashingEmbedding()))
 
         with pytest.raises(RuntimeError, match="模拟记忆写入过程中崩溃"):
@@ -527,6 +542,52 @@ class TestTheFeedbackRecordSurvivesAMemoryFailure:
                 content=CORRECTION_TEXT,
                 allow_memory_update=True,
             )
+
+        assert await _events(uow_factory, round_id) == []
+
+    async def test_nothing_is_written_when_the_round_is_missing(
+        self, uow_factory: UnitOfWorkFactory
+    ) -> None:
+        """回合不存在时同样不留任何东西。"""
+        service = FeedbackService(uow_factory, MemoryService(uow_factory, LocalHashingEmbedding()))
+
+        with pytest.raises(NotFoundError):
+            await service.record(
+                round_id=uuid4(),
+                feedback_type=FeedbackType.CORRECTION,
+                content=CORRECTION_TEXT,
+                allow_memory_update=True,
+            )
+
+        assert await _events(uow_factory, uuid4()) == []
+
+
+class TestPolicyRejectionStillKeepsTheFeedback:
+    """🔴 "用户的话不能丢"由**这条**路径承接，不是由事务顺序。
+
+    策略拒绝是一次**正常返回**（``decision.allows_write`` 为假）——
+    事务照常提交，反馈事件与它带出的经验评价都留下，只有记忆没写。
+    这是最常见的情形；真正会丢反馈的只有数据库本身故障。
+    """
+
+    async def test_a_policy_rejection_keeps_the_feedback_event(
+        self, uow_factory: UnitOfWorkFactory
+    ) -> None:
+        round_id = await _make_round(uow_factory, user_id=uuid4())
+        service = FeedbackService(
+            uow_factory,
+            MemoryService(uow_factory, LocalHashingEmbedding(), policy=_DenyAllPolicy()),
+        )
+
+        outcome = await service.record(
+            round_id=round_id,
+            feedback_type=FeedbackType.CORRECTION,
+            content=CORRECTION_TEXT,
+            allow_memory_update=True,
+        )
+
+        assert outcome.memory_effect is MemoryEffect.REJECTED_BY_POLICY
+        assert outcome.memory is None
 
         events = await _events(uow_factory, round_id)
         assert [item.event_type for item in events] == [EventType.USER_FEEDBACK_RECEIVED]

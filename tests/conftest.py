@@ -25,12 +25,19 @@ from ai_psi.domain.enums import (
     ActorType,
     ConcernCategory,
     EventType,
+    ExperienceKind,
     MemoryType,
     SourceType,
 )
 from ai_psi.domain.events import Event, ModelInvocationInfo
 from ai_psi.domain.evidence import Evidence
-from ai_psi.domain.experiences import Experience
+from ai_psi.domain.experiences import (
+    EXTRACTOR_VERSION,
+    Experience,
+    canonical_key_for,
+    evaluation_target_for_judgment,
+    independence_group_for,
+)
 from ai_psi.domain.hypotheses import Hypothesis
 from ai_psi.domain.improvement_proposals import ImprovementProposal
 from ai_psi.domain.inquiries import Inquiry
@@ -191,8 +198,31 @@ def make_experience() -> Factory:
             "judgment_id": uuid4(),
             "situation_signature": "factual|d0|single_source",
             "inquiry_type": "factual",
+            "experience_kind": ExperienceKind.ROUND_OUTCOME,
+            "extractor_version": EXTRACTOR_VERSION,
         }
         payload.update(overrides)
+        # 身份字段按**最终**值派生：调用方覆盖了回合或判断 id 之后，
+        # 键必须跟着走，否则会撞上 ``canonical_key`` 的一致性校验
+        # （那条校验是有意的——它拦的正是"改了事实却忘了改键"）。
+        payload.setdefault(
+            "evaluation_target", evaluation_target_for_judgment(payload["judgment_id"])
+        )
+        payload.setdefault(
+            "independence_group",
+            independence_group_for(
+                idempotency_key=None, cognitive_round_id=payload["cognitive_round_id"]
+            ),
+        )
+        payload.setdefault(
+            "canonical_key",
+            canonical_key_for(
+                cognitive_round_id=payload["cognitive_round_id"],
+                evaluation_target=payload["evaluation_target"],
+                experience_kind=payload["experience_kind"],
+                extractor_version=payload["extractor_version"],
+            ),
+        )
         return Experience(**payload)
 
     return _make

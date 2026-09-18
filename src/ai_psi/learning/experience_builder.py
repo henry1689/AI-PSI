@@ -23,11 +23,30 @@ from __future__ import annotations
 from dataclasses import dataclass
 from uuid import UUID
 
-from ai_psi.domain.enums import VerificationStatus
-from ai_psi.domain.experiences import Experience
+from ai_psi.domain.enums import (
+    ExperienceEvaluation,
+    ExperienceEvaluator,
+    ExperienceKind,
+    VerificationStatus,
+)
+from ai_psi.domain.experiences import (
+    EXTRACTOR_VERSION,
+    Experience,
+    canonical_key_for,
+    evaluation_target_for_judgment,
+    independence_group_for,
+)
 from ai_psi.learning.error_classifier import ErrorAttribution, ErrorClassifier, ErrorSignals
 
-__all__ = ["ExperienceBuilder", "RoundRecord"]
+__all__ = ["EVALUATOR_VERSION", "ExperienceBuilder", "RoundRecord"]
+
+#: 抽取时那一手评价（内部元认知）的逻辑版本。
+#:
+#: 与 :data:`~ai_psi.domain.experiences.EXTRACTOR_VERSION` 分开：
+#: 前者说的是"这条经验**怎么被抽出来**的"，后者说的是
+#: "它**被谁判成什么状态**"。两件事独立演进——
+#: 改了归因判据（评价逻辑）不必让所有经验换 canonical_key。
+EVALUATOR_VERSION: str = "internal-metacognition/1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +77,22 @@ class RoundRecord:
 
     later_evidence_ids: tuple[UUID, ...] = ()
     """判断**之后**才出现的证据——归因的关键输入。"""
+
+    origin_event_ids: tuple[UUID, ...] = ()
+    """产生本经验的**事件**（阶段 6.5 §二.9）。
+
+    它是"这条经验读的是哪几个事件"的锚点。没有它，从事件回放里
+    重建经验只能靠时间和 payload 形状猜，而"猜"在审计场景里
+    等于没有证据。
+    """
+
+    idempotency_key: str | None = None
+    """该回合的客户端幂等键（阶段 6.5 §二.12）。
+
+    🔴 它的唯一用途是算 ``independence_group``：同一幂等键的
+    所有技术重试落在**同一分组**里，因此在门槛上只算一次。
+    没有它，一次网络抖动后的重发就会被当成"这件事又发生了一次"。
+    """
 
     applicable_conditions: tuple[str, ...] = ()
     counterexamples: tuple[str, ...] = ()
@@ -118,6 +153,8 @@ class ExperienceBuilder:
             （见 :class:`~ai_psi.learning.pattern_detector.PatternDetector`）。
         """
         attribution = self._classifier.classify(signals)
+        target = evaluation_target_for_judgment(record.judgment_id)
+        evaluation, evaluator = _internal_metacognition_verdict(attribution)
         experience = Experience(
             created_by=created_by,
             cognitive_round_id=record.cognitive_round_id,
@@ -137,6 +174,25 @@ class ExperienceBuilder:
             # 归因那一条路，经验本身记不住"这一条是从哪种反馈来的"。
             actual_feedback=list(self.summarise_feedback(signals)),
             verification_status=VerificationStatus.UNVERIFIED,
+            # --- 规范身份（事实派生，不由调用方随手填）---
+            experience_kind=ExperienceKind.ROUND_OUTCOME,
+            evaluation_target=target,
+            origin_event_ids=list(record.origin_event_ids),
+            extractor_version=EXTRACTOR_VERSION,
+            independence_group=independence_group_for(
+                idempotency_key=record.idempotency_key,
+                cognitive_round_id=record.cognitive_round_id,
+            ),
+            canonical_key=canonical_key_for(
+                cognitive_round_id=record.cognitive_round_id,
+                evaluation_target=target,
+                experience_kind=ExperienceKind.ROUND_OUTCOME,
+                extractor_version=EXTRACTOR_VERSION,
+            ),
+            # --- 抽取时刻的评价（§二.4：内部元认知最多 SUSPECTED）---
+            evaluation=evaluation,
+            evaluator_type=evaluator,
+            evaluator_version=EVALUATOR_VERSION if evaluator is not None else None,
         )
         return experience, attribution
 
@@ -160,6 +216,38 @@ class ExperienceBuilder:
             形如 ``("feedback:correction",)`` 的摘要项。
         """
         return tuple(sorted(f"feedback:{item.value}" for item in set(signals.feedback_types)))
+
+
+def _internal_metacognition_verdict(
+    attribution: ErrorAttribution,
+) -> tuple[ExperienceEvaluation, ExperienceEvaluator | None]:
+    """内部元认知对本回合的自我评价（阶段 6.5 §二.4）。
+
+    🔴 **它最多只能说「怀疑」。**
+
+    抽取发生在回合收尾，那一刻除了系统自己没有任何评估者。
+    归因判据指向了某个错误类别，这是一个**假设**，不是一个观察——
+    用户还没说话，后续证据还没出现。
+
+    因此本函数的返回值只有两种可能：
+
+    * 归因成功 → ``(SUSPECTED, INTERNAL_METACOGNITION)``；
+    * 归因失败 → ``(UNASSESSED, None)``——**"不知道错在哪"不是一种评价**，
+      它连怀疑都算不上。
+
+    注意第二种情况**不是** ``SUSPECTED`` 配 ``error_type=None``：
+    那样会让"我们没看出问题"与"我们怀疑有问题但说不出是哪类"
+    在计数时长得一样。
+
+    Args:
+        attribution: 归因结论。
+
+    Returns:
+        ``(评价状态, 评估者)``。
+    """
+    if attribution.error_type is None:
+        return ExperienceEvaluation.UNASSESSED, None
+    return ExperienceEvaluation.SUSPECTED, ExperienceEvaluator.INTERNAL_METACOGNITION
 
 
 # ⚠️ **``Experience.strategy_effectiveness`` 在 V0.1 恒为 ``None``。**
