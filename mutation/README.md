@@ -214,17 +214,57 @@ cosmic-ray 的 `ReplaceBinaryOperator_BitOr_*` 一族在 `X | None`
 登记的语义是「**这一条**变异在所有可达输入上不可观察」，
 不是「这一行不必再查」。
 
-当前登记的条目：
+当前登记的条目有四十余条，但**理由只有七八种**。按族看比按条目看更能判断
+"这一份登记表靠不靠得住"：
 
-| 模块 | 变异 | 覆盖 | 为什么等价 |
-|---|---|---|---|
-| `write_policy` @65 | `is` → `==` | 1 条 | 枚举成员是单例，对成员输入两者给出相同答案 |
-| `write_policy` @65 | `is` → `<=` | 1 条 | ⚠️ **侥幸等价**：`WriteDecision` 四个成员的值按字典序排列时 `approved` 恰好最前，因此 `x <= APPROVED` 与 `x is APPROVED` 对所有成员答案相同 |
-| `invariants` @197 | `forbidden[0]` → `[1]` / `[-1]` | 2 条 | 四个候选词**没有一个**能构造出 `HypothesisStatus`，所以那句说明文字对四个取值同为真；没有任何代码读这句话 |
-| `invariants` @365 | `_probe_proposal(1)` → `(0)` / `(2)` | 2 条 | `_check_i11` 只用这个探针读 `can_become_active`——它是类级属性，与支撑经验条数无关 |
-| `invariants` @315 | `index + 1` → `index + 2` | 1 条 | 探针的契约是「n 个互异、非全零、构造合法的 UUID」，两个取值都满足。⚠️ 同行的另外七条**不是**等价——它们会产出 `UUID(int=0)`（即本模块自己的 `_PROBE_UUID`）或浮点 UUID |
-| `invariants` @73 | `==` → `is` | 1 条 | CPython 会 intern 形如标识符的字符串字面量，实参与 `INVARIANTS` 里的是同一个对象。⚠️ **实现细节上的侥幸等价**，换实现即失效 |
-| `invariants` @52 | `slots=True` → `False` | 1 条 | `frozen=True` **本身**就拒绝一切属性赋值，与 `slots` 无关（实测：只有 `frozen=True` 的 dataclass 上 `obj.y = 2` 同样抛 `FrozenInstanceError`）。`slots` 只影响内存布局与 `__dict__` 是否存在，而没有任何代码读 `__dict__`。⚠️ 同族的 `frozen=True → False` **是真变异**，由 `test_checks_are_frozen` 杀掉 |
+| 族 | 条数 | 成立条件 |
+|---|---|---|
+| **枚举比较** | ~14 | 成员是单例 + 调用方只传成员 ⟹ `is` ≡ `==` ≡ `!=` ≡ `is not` |
+| **StrEnum 字典序** | ~10 | 排序比的是字符串，而某组取值恰好落在一侧 ⟹ `x < A` ≡ `x is not A` |
+| **CPython 小整数缓存** | ~4 | `rank is not 1` ≡ `rank != 1`（`-5..256` 内） |
+| **字符串 intern / `object.__eq__`** | 3 | 两侧是同一个字面量对象；或凭据是裸 `object`（它没有自定义 `__eq__`） |
+| **slots 族** | 8 | `frozen=True` 自己就拒绝一切赋值，`slots` 只改内存布局 |
+| **`*,` → `/,`** | 8 | 只**多允许**一种调用方式，不改任何现有调用的行为 |
+| **不可达分支** | ~4 | 派生值的最短长度、`reasons` 永远非空、`pattern`/`decision` 同生共死 |
+
+逐条的完整清单与理由在 `mutation/run.py` 的 `EQUIVALENTS` 里，
+每条都能独立复核。几条值得单独点名的：
+
+| 条目 | 为什么等价 |
+|---|---|
+| `write_policy` @65 `is` → `<=` | ⚠️ **侥幸等价**：四个成员的值按字典序排列时 `approved` 恰好最前 |
+| `invariants` @315 `index + 1` → `index + 2` | 探针的契约是「n 个互异、非全零、构造合法的 UUID」，两个取值都满足。⚠️ 同行的另外七条**不是**等价——它们会产出 `UUID(int=0)` 或浮点 UUID |
+| `invariants` @73 / `offline_evaluator` @229 `==` → `is` | 字符串 intern：两侧本就是同一个字面量对象。⚠️ 换实现、或让名字从数据里读，立刻失效 |
+| `experiences` @287 `min_length` 两侧 | `canonical_key` 是**派生值**，最短 42 字符——长度约束没有任何输入能走到 |
+| `experiences` @539 `>` → `>=` | 四档 `rank` 互异 ⟹ 等秩即同成员 ⟹ 赋值是空操作 |
+| `proposal_gate` @157 `and` → `or` | `pattern` 与 `decision` 在两条返回路径上**总是同生共死**；🔴 这条耦合由 `TestEveryVerdictKeepsThePatternAndTheDecisionTogether` 显式钉住 |
+
+🔴 **每一条侥幸等价都配了一条"守前提"的用例。** 例如
+`TestTheEnumLiteralsSomeEquivalencesRestOn` 钉住那几个成员的字面量、
+`TestTheScanLookupIgnoresHalfMatchesInSuppressed` 钉住谓词两半各自的行为。
+字面量或实现一变，那条用例先红——而不是让等价表悄悄开始放行真变异。
+
+#### 成族的等价是什么样：**枚举比较**
+
+`experiences` 上登记的十几条里，绝大多数是同一个现象。它们分两小类：
+
+1. **`is` / `==` / `!=` / `is not` 互相等价。** 枚举成员是单例，
+   而且调用方**只传成员**——字段标注是 `ExperienceEvaluator`，
+   pydantic 会把 JSON 里的字符串**强制转换**成成员，所以到达比较时
+   它已经是成员了。
+   ⚠️ **这条理由的边界要记住**：分叉点是"来了一个非成员"，
+   而那时 `is` 会把一个裸的 `"internal_metacognition"` 判成
+   「不是内部元认知」——**静默放行自我确认**。当前不可达
+   （见 `docs/risks.md` R59），不是靠"测不出来"糊过去的。
+2. **`<` / `>=` 落在同一个枚举上。** StrEnum 的排序比的是**字符串**，
+   而 `ExperienceEvaluation` 的另外三个值恰好都排在 `"unassessed"`
+   前面，于是 `< UNASSESSED` 与 `is not UNASSESSED` 同答案。
+   ⚠️ **侥幸等价**。守它的是 `TestTheEnumLiteralsSomeEquivalencesRestOn`：
+   改任何一个成员的字面量，那条用例会先红——而不是让这里的登记
+   悄悄开始放行真变异。
+
+还有一类零星的是 **CPython 小整数缓存**：`rank is not 1` 与 `rank != 1`
+在 `0..3` 上同答案。门槛一旦超过 256 就会变成真变异。
 
 报告里每条登记后面会写「覆盖 N 条」——**N 必须与理由的论证范围相符**。
 理由只论证了某一个取值却在覆盖多个，就是放行了没被论证过的东西。

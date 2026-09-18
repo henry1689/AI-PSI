@@ -79,6 +79,7 @@
 | **R56** | **`evidence` 的长度上限写在 Schema 校验器里而不是 `Field(max_length=...)`** | 同一份 `schemas.py` 里，单值的长度上限用 `Field`、列表项的长度上限用 `field_validator`，两种写法并存 | 原因是 pydantic 的 `max_length` 对 `list` 管的是**条目数**不是**各项长度**，逐项长度只能在校验器里做。风险是改动时容易只改一处。边界行为由 `tests/integration/test_input_contract.py` 在两个后端上钉住 |
 | **R57** | **`ProposalGate` 每次复核都要全量读取事件流** | 代价随历史线性增长；经验数量大时一次学习运行会扫很多遍 | V0.1 的经验总量以百计，实测（1713 用例全套跑 113 秒）没有成为瓶颈。阶段 7 若经验量上升到需要分页，读取器需要一个按 `(错误类别, 情境签名)` 的索引——那时改的是 `ExperienceReader`，门禁一行不用动（ADR-0022 影响一节） |
 | **R58** | **归因判据里仍有四条在生产上不可达** | `_from_failure`（失败回合不构经验）、`_from_budget`（刻意不喂）、`_from_memory_rejection`（无生产者）、`_from_user_feedback`（反馈在回合之后到达，无回流路径） | 与 R46/R50 同源。阶段 6.5 §二 接通了"反馈抬高评价"这条路径，但**没有**给归因回路加新输入——那需要失败回合产生经验（R50）与记忆拒绝回流，两者都是阶段 7 的显式待办 |
+| **R59** | 🔴 **§二.4 那条硬线依赖"调用方传的是枚举成员"** | `assert_evaluator_may_produce` 用 `evaluator is ExperienceEvaluator.INTERNAL_METACOGNITION` 判断。**如果**一个非成员值（例如从 JSON 直接取出的裸字符串 `"internal_metacognition"`）到达这里，`is` 会判为「不是内部元认知」——于是**静默放行自我确认**，而 `==` 会正确拦住 | **当前不可达**：该函数的两个调用点都来自 pydantic 模型字段（`ExperienceEvaluator` 标注，pydantic 会把 JSON 字符串**强制转换**成成员），mypy 也在调用点强制类型。它被记下来是因为失效方式是**静默地反向**——类型纪律一旦在某处松动（例如将来加一个绕过 pydantic 的适配器），这条不变量不是"失效"而是"变成放行"。加固只要三行（进来先 `isinstance` 断言），但没有真实路径触发它，因此留作显式残余风险而不是现在就加一个不可达分支 |
 
 ---
 

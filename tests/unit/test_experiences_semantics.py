@@ -138,6 +138,33 @@ class TestTheValidatorsActuallyRefuseThings:
                 canonical_key=experience.canonical_key,
             )
 
+    def test_the_relation_does_not_matter_only_equality_does(self, make_experience) -> None:
+        """🔴 ``!=`` 改成 ``>``（或 ``<``）之后，**一半的错键会被放行**。
+
+        上面那一问用的键大还是小，取决于另一个回合 id 的字典序——
+        也就是说它**能不能杀掉这条变异体是随机的**：id 恰好更小时杀掉，
+        更大时放行。
+
+        ``extractor_version`` 是键的最后一段，把它换成别的字符串就能
+        **确定地**造出更大与更小两个方向的错键，不需要猜 uuid 的排序。
+        两个方向都要试：判据只能是"相等"，不能是"谁大谁小"。
+        """
+        round_id, judgment_id = uuid4(), uuid4()
+        target = evaluation_target_for_judgment(judgment_id)
+        for version in ("0-比真版本小", "zzz-比真版本大"):
+            with pytest.raises(ValidationError, match="canonical_key"):
+                make_experience(
+                    cognitive_round_id=round_id,
+                    judgment_id=judgment_id,
+                    evaluation_target=target,
+                    canonical_key=canonical_key_for(
+                        cognitive_round_id=round_id,
+                        evaluation_target=target,
+                        experience_kind=ExperienceKind.ROUND_OUTCOME,
+                        extractor_version=version,
+                    ),
+                )
+
     def test_the_right_key_is_accepted(self, make_experience) -> None:
         """正向对照：没有它，上面两条对"一律拒绝"的实现也成立。"""
         round_id, judgment_id = uuid4(), uuid4()

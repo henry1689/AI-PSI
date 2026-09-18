@@ -477,6 +477,362 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
         mutation="rank != ExperienceEvaluation.SUSPECTED.rank",
         reason="同上：rank 的四个取值互异且都在小整数缓存内，`!=` 与 `>` 同答案",
     ),
+    # ------------------------------------------------------------------
+    # 《slots 族》：`@dataclass(frozen=True, slots=True)` → `slots=False`。
+    #
+    # 🔴 这是**跨模块的同一个事实**，不是七次巧合：`frozen=True`
+    # **本身**就拒绝一切属性赋值（实测：只有 `frozen=True`、没有 `slots`
+    # 的 dataclass 上 `obj.y = 2` 同样抛 `FrozenInstanceError`）。
+    # `slots` 只影响内存布局与 `__dict__` 是否存在，而本仓库没有任何代码
+    # 读 `__dict__`——所以它改不出任何**可观察**差异。
+    #
+    # ⚠️ 同族的 `frozen=True → False` 是**真变异**（它让结论可以被事后
+    # 改写），每个模块各有一条用例守着，逐条写在下面条目的旁边。
+    #
+    # 之所以仍逐条登记而不是写成一条"族规则"：片段 `slots=False` 已经
+    # 把它精确地限定在 `slots` 那一半上，逐条列出来便于复核"这一处
+    # 到底有没有人守 frozen"。条数多但理由只有一句。
+    # ------------------------------------------------------------------
+    Equivalent(
+        module="pattern_detector",
+        operator="core/ReplaceTrueWithFalse",
+        line=104,
+        mutation="slots=False",
+        reason="《slots 族》。同族的 `frozen=True → False` 由 `TestTheResultsAreImmutable` 杀掉",
+    ),
+    Equivalent(
+        module="pattern_detector",
+        operator="core/ReplaceTrueWithFalse",
+        line=152,
+        mutation="slots=False",
+        reason="《slots 族》。同上",
+    ),
+    Equivalent(
+        module="pattern_detector",
+        operator="core/ReplaceTrueWithFalse",
+        line=172,
+        mutation="slots=False",
+        reason="《slots 族》。同上",
+    ),
+    Equivalent(
+        module="promotion_policy",
+        operator="core/ReplaceTrueWithFalse",
+        line=87,
+        mutation="slots=False",
+        reason=(
+            "《slots 族》。同族的 `frozen=True → False` 由 "
+            "`TestTheConstructionAndAccessorsAreStable::test_the_evidence_is_immutable` 杀掉"
+        ),
+    ),
+    Equivalent(
+        module="promotion_policy",
+        operator="core/ReplaceTrueWithFalse",
+        line=115,
+        mutation="slots=False",
+        reason="《slots 族》。`PromotionDecision` 的 frozen 由既有的 `TestDecisionShape` 守着",
+    ),
+    Equivalent(
+        module="pattern_detector",
+        operator="core/ReplaceUnaryOperator_USub_Invert",
+        line=262,
+        mutation="(~item.weighted_count,",
+        reason=(
+            "`~x` 就是 `-x - 1`，是 `-x` 的**单调变换**（相差一个常数 1）。"
+            "排序只关心相对次序，因此 `~weighted_count` 与 `-weighted_count` "
+            "给出完全相同的排列。⚠️ 注意它**不是**「随便什么一元算子都行」："
+            "同族的 `not` / 去掉 `-` / `+` 都是真变异，由 "
+            "`TestDeterministicOrdering` 的两条新用例杀掉"
+        ),
+    ),
+    Equivalent(
+        module="pattern_detector",
+        operator="core/ReplaceUnaryOperator_USub_Invert",
+        line=265,
+        mutation="(~item.weighted_count,",
+        reason="同上（`suppressed.sort` 用的是同一个键表达式）",
+    ),
+    Equivalent(
+        module="pattern_detector",
+        operator="core/NumberReplacer",
+        line=334,
+        mutation="evaluations[- 0]",
+        reason=(
+            "这一支**只在全部参与计数的评价权重都为 0 时**才进入"
+            "（判据是 `all(not counts_toward_threshold(...))`，而 "
+            "`counts_toward_threshold` 就是 `weight_of(x) > 0`）。"
+            "既然每个元素的权重都是 0，`weight_of(evaluations[i])` 对**任何**"
+            "下标都是 0——取第一个还是最后一个不可观察。⚠️ 这句话依赖"
+            "「权重非负」，而它由 `EvaluationWeighting.__post_init__` 显式拒绝负数保证"
+        ),
+    ),
+    Equivalent(
+        module="pattern_detector",
+        operator="core/ReplaceUnaryOperator_USub_Not",
+        line=334,
+        mutation="evaluations[not 1]",
+        reason="同上：`not 1` 是 `False`，即下标 0——同样落在「全部权重为 0」的不可观察区间里",
+    ),
+    # ------------------------------------------------------------------
+    # 《`*,` → `/,` 族》：函数签名里"后面全是关键字参数"的那个星号。
+    #
+    # 🔴 这一族**改变的是 API 的宽容度，不是行为**。
+    #
+    # `def f(self, *, a, b)` → `def f(self, /, a, b)` 之后，`a` / `b`
+    # 从"只能按关键字传"变成"两种都行"。而本仓库里这些函数
+    # **全部按关键字调用**（唯一被允许的那种），因此每一个现有调用的
+    # 行为都不变——变异体只是**多允许**了一种此前会报错的写法。
+    #
+    # 换句话说：没有任何一条断言能"观察"到它的区别，除非去断言
+    # "位置调用必须报错"——那测的是 Python 的调用约定，不是本系统的
+    # 任何保证。所以登记为等价，而不是写四条这样的用例。
+    # ------------------------------------------------------------------
+    Equivalent(
+        module="pattern_detector",
+        operator="core/ReplaceBinaryOperator_Mul_Div",
+        line=194,
+        mutation="/,",
+        reason="《`*,` → `/,` 族》",
+    ),
+    Equivalent(
+        module="promotion_policy",
+        operator="core/ReplaceBinaryOperator_Mul_Div",
+        line=138,
+        mutation="/,",
+        reason="《`*,` → `/,` 族》",
+    ),
+    Equivalent(
+        module="proposal_generator",
+        operator="core/ReplaceBinaryOperator_Mul_Div",
+        line=81,
+        mutation="/,",
+        reason="《`*,` → `/,` 族》",
+    ),
+    Equivalent(
+        module="proposal_generator",
+        operator="core/ReplaceBinaryOperator_Mul_Div",
+        line=187,
+        mutation="/,",
+        reason="《`*,` → `/,` 族》",
+    ),
+    Equivalent(
+        module="proposal_gate",
+        operator="core/ReplaceComparisonOperator_Is_Eq",
+        line=359,
+        mutation="pattern.error_type == error_type",
+        reason="《枚举比较》",
+    ),
+    Equivalent(
+        module="proposal_gate",
+        operator="core/ReplaceComparisonOperator_Is_Eq",
+        line=362,
+        mutation="item.error_type == error_type",
+        reason=(
+            "《枚举比较》。⚠️ 同一行上的 `or` 与 `>=` / `<=` **不是**等价，"
+            "已由 `TestTheScanLookupIgnoresHalfMatchesInSuppressed` 杀掉"
+        ),
+    ),
+    Equivalent(
+        module="proposal_gate",
+        operator="core/ReplaceFalseWithTrue",
+        line=126,
+        mutation="compare=True",
+        reason=(
+            "所有**真**结论携带的都是同一个 `_GATE_TOKEN` 对象（同一性相同），"
+            "而手工构造的结论根本构造不出来（`__post_init__` 会抛）。"
+            "于是把 `_token` 纳入相等性比较，`==` 的结果一个字都不变。"
+            "⚠️ 同行的 `repr=True` **不是**等价——它会把凭据印进日志与断言输出，"
+            "已由 `test_the_token_stays_out_of_the_repr` 杀掉"
+        ),
+    ),
+    Equivalent(
+        module="proposal_gate",
+        operator="core/ReplaceAndWithOr",
+        line=157,
+        mutation="or self.decision is not None",
+        reason=(
+            "`and` 比 `or` 结合得紧，因此这一改等价于 "
+            "`pattern is not None or (decision is not None and ...)`。"
+            "两条返回路径上 `pattern` 与 `decision` **总是同生共死**"
+            "（要么都给、要么都是 None），所以"
+            "「pattern 有而 decision 没有」这个能让两者分叉的状态不可达。"
+            "🔴 这条等价依赖那条耦合，而它由 "
+            "`TestEveryVerdictKeepsThePatternAndTheDecisionTogether` 显式钉住"
+        ),
+    ),
+    Equivalent(
+        module="proposal_gate",
+        operator="core/ReplaceOrWithAnd",
+        line=207,
+        mutation="'；'.join(self.reasons) and '未给出理由'",
+        reason=(
+            "`self.reasons` 在两条返回路径上**都不可能为空**："
+            "一条是 `list(suppressed) or [兜底]`，另一条来自 "
+            "`PromotionPolicy.decide`（五条条件各至少追加一句）。"
+            "因此 `'未给出理由'` 这个兜底目前**不可达**，"
+            "`or` 与 `and` 给出同样的消息。"
+            "⚠️ 这也意味着那段兜底是死代码——保留它是为了将来"
+            "某条路径真的不带理由时消息仍然可读，"
+            "而那时这条登记会失配并报出来"
+        ),
+    ),
+    Equivalent(
+        module="proposal_generator",
+        operator="core/ReplaceComparisonOperator_Is_Eq",
+        line=198,
+        mutation="error_type == ErrorType.UNKNOWN_ERROR",
+        reason=(
+            "《枚举比较》。⚠️ 同行的 `>=` **不是**等价"
+            "（实测 `value_substitution` 与 `user_model_error` 在字典序上"
+            '都 `>= "unknown_error"`），已由 '
+            "`test_only_unknown_error_gets_the_investigation_text` 杀掉"
+        ),
+    ),
+    Equivalent(
+        module="proposal_gate",
+        operator="core/ReplaceTrueWithFalse",
+        line=66,
+        mutation="slots=False",
+        reason=(
+            "《slots 族》。同族的 `frozen=True → False` "
+            "由 `TestTheGateEvidenceDefaults::test_it_is_immutable` 杀掉"
+        ),
+    ),
+    Equivalent(
+        module="proposal_gate",
+        operator="core/ReplaceTrueWithFalse",
+        line=99,
+        mutation="slots=False",
+        reason=(
+            "《slots 族》。同族的 `frozen=True → False` "
+            "由 `TestTheGateVerdictIsDerivedNotFilled::test_the_verdict_is_immutable` 杀掉"
+        ),
+    ),
+    Equivalent(
+        module="proposal_gate",
+        operator="core/ReplaceBinaryOperator_Mul_Div",
+        line=233,
+        mutation="/,",
+        reason="《`*,` → `/,` 族》",
+    ),
+    Equivalent(
+        module="proposal_gate",
+        operator="core/ReplaceBinaryOperator_Mul_Div",
+        line=275,
+        mutation="/,",
+        reason="《`*,` → `/,` 族》",
+    ),
+    Equivalent(
+        module="proposal_gate",
+        operator="core/ReplaceBinaryOperator_Mul_Div",
+        line=349,
+        mutation="/,",
+        reason="《`*,` → `/,` 族》",
+    ),
+    Equivalent(
+        module="proposal_gate",
+        operator="core/ReplaceComparisonOperator_IsNot_NotEq",
+        line=134,
+        mutation="self._token != _GATE_TOKEN",
+        reason=(
+            "`_GATE_TOKEN` 是 `object()`，而 `object` 的 `__eq__` / `__ne__` "
+            "**就是**同一性比较（没有子类覆写）。`_token` 的取值只有两个："
+            "那个 token 本身，或 `None`。三种组合下 `!=` 与 `is not` 答案相同。"
+            "⚠️ 这条依赖「凭据是裸 object」——哪天它换成一个自定义了 "
+            "`__eq__` 的类型，立刻变成真变异"
+        ),
+    ),
+    Equivalent(
+        module="offline_evaluator",
+        operator="core/ReplaceTrueWithFalse",
+        line=43,
+        mutation="slots=False",
+        reason=(
+            "《slots 族》。同族的 `frozen=True → False` 由 `TestTheValueObjectsAreImmutable` 杀掉"
+        ),
+    ),
+    Equivalent(
+        module="offline_evaluator",
+        operator="core/ReplaceTrueWithFalse",
+        line=64,
+        mutation="slots=False",
+        reason="《slots 族》",
+    ),
+    Equivalent(
+        module="offline_evaluator",
+        operator="core/ReplaceTrueWithFalse",
+        line=82,
+        mutation="slots=False",
+        reason=(
+            "《slots 族》。同族的 `frozen=True → False` 由 `TestTheValueObjectsAreImmutable` 杀掉"
+        ),
+    ),
+    Equivalent(
+        module="offline_evaluator",
+        operator="core/ReplaceTrueWithFalse",
+        line=202,
+        mutation="slots=False",
+        reason=(
+            "《slots 族》。同族的 `frozen=True → False` 由 `TestTheValueObjectsAreImmutable` 杀掉"
+        ),
+    ),
+    Equivalent(
+        module="offline_evaluator",
+        operator="core/ReplaceComparisonOperator_Eq_Is",
+        line=229,
+        mutation="key is name",
+        reason=(
+            "指标名全部是 `snapshot()` 里的**字面量**，而 `delta_for` 的调用方"
+            "（`HIGHER_IS_BETTER_METRICS` / `LOWER_IS_BETTER_METRICS` 的成员，"
+            "以及测试里直接写的同一个字面量）用的也是字面量。CPython 把形如"
+            "标识符的字符串字面量 intern 到同一张表里，因此两侧**是同一个对象**。"
+            "与 `invariants` @74 同族：⚠️ **实现细节上的侥幸等价**，"
+            "换一个 Python 实现、或让指标名从配置里读，它立刻变成真变异"
+        ),
+    ),
+    Equivalent(
+        module="offline_evaluator",
+        operator="core/ReplaceComparisonOperator_Is_Eq",
+        line=259,
+        mutation="item.state == RoundState.COMPLETED",
+        reason=(
+            "《枚举比较》。⚠️ 同行的 `<=` **不是**等价"
+            '（`"analyzing"` 与 `"cancelled"` 都排在 `"completed"` 前面），'
+            "已由 `TestOnlyCompletedRoundsCountAsCompleted` 杀掉"
+        ),
+    ),
+    Equivalent(
+        module="offline_evaluator",
+        operator="core/ReplaceBinaryOperator_Mul_Div",
+        line=329,
+        mutation="/,",
+        reason="《`*,` → `/,` 族》",
+    ),
+    Equivalent(
+        module="offline_evaluator",
+        operator="core/ReplaceTrueWithFalse",
+        line=386,
+        mutation="strict=False",
+        reason=(
+            "`snapshot()` 恒定返回**同样七条**指标（`rounds` 为空时返回空元组，"
+            "而 `compare` 在那之前就返回了），因此 `baseline` 与 `candidate` "
+            "的长度永远相等，`strict=True` 的检查**没有输入能触发**。"
+            "⚠️ 这条依赖「snapshot 的条目数不随数据变化」——"
+            "哪天有条件指标（例如「没有模型调用时不算这一条」）时，"
+            "它立刻变成真变异，而那时这条登记会失配并报出来"
+        ),
+    ),
+    Equivalent(
+        module="evaluation_weighting",
+        operator="core/ReplaceComparisonOperator_Gt_NotEq",
+        line=87,
+        mutation="self.weights[evaluation] != 0",
+        reason=(
+            "`EvaluationWeighting.__post_init__` 对**每一个**评价状态显式拒绝负权重"
+            "（`if weight < 0: raise ValueError`），因此权重恒为自然数，"
+            "`> 0` 与 `!= 0` 在所有可达输入上同答案。"
+            "⚠️ 判据依赖那条构造期校验：它一旦被放宽，这条立刻变成真变异"
+        ),
+    ),
 )
 
 

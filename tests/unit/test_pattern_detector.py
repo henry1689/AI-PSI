@@ -30,8 +30,13 @@ import pytest
 
 from ai_psi.domain.enums import ConfidenceBand, ErrorType, ExperienceEvaluation
 from ai_psi.domain.experiences import Experience, ExperienceAssessment
-from ai_psi.learning.evaluation_weighting import EvaluationWeighting
-from ai_psi.learning.pattern_detector import ErrorPattern, PatternDetector
+from ai_psi.learning.evaluation_weighting import DEFAULT_WEIGHTING, EvaluationWeighting
+from ai_psi.learning.pattern_detector import (
+    ErrorPattern,
+    PatternDetector,
+    PatternScan,
+    SuppressedPattern,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -501,3 +506,138 @@ class TestDeterministicOrdering:
             for item in detector.detect(experiences).patterns
         ]
         assert first == second
+
+    def test_frequency_beats_the_signature_order(self, detector, make_experience) -> None:
+        """🔴 变异测试发现：排序键里的**第一项**可以被拿掉而无人察觉。
+
+        已有用例的"更频繁的在前"用的是「少」（3 次）与「多」（5 次），
+        而这两个字在字典序上恰好也是「多」在前——于是把
+        ``-weighted_count`` 换成 ``not weighted_count``（全部并列）
+        之后，回退到第二、三项排序，答案**碰巧**仍然是对的。
+
+        这里让次数与字典序**相反**：次数多的签名排在后面。
+        排序键的第一项一旦失效，答案就会翻过来。
+        """
+        experiences = _repeated(make_experience, 5, situation_signature="zzz-更多次")
+        experiences += _repeated(make_experience, 3, situation_signature="aaa-更少次")
+        patterns = detector.detect(experiences).patterns
+        assert [item.count for item in patterns] == [5, 3]
+
+    def test_suppressed_are_sorted_by_the_same_rule(self, make_experience) -> None:
+        """🔴 变异测试发现：**``suppressed`` 的排序从来没有任何断言。**
+
+        ``patterns.sort(...)`` 与 ``suppressed.sort(...)`` 用的是同一个
+        键表达式，但只有前者被验证过。把后者的 ``-`` 去掉、
+        换成 ``+`` 或 ``not``，全部存活。
+
+        未达门槛的分组同样要按加权计数降序——"为什么没有提案"那张
+        清单是可交付物的一部分。签名与次数**故意交叉**（次数多的
+        排在字典序后面），否则排序键的第一项失效时它会碰巧还对。
+        """
+        strict = PatternDetector(threshold=10)
+        # ⚠️ 错误类别也要**交叉**：只让签名与次数相反还不够——
+        #    并列之后回退到「错误类别 → 情境签名」，而
+        #    "reasoning_error" 恰好排在 "scope_error" 前面，
+        #    于是"次数多的在前"仍然碰巧成立。两次都必须交叉。
+        experiences = _repeated(
+            make_experience, 4, error_type=ErrorType.SCOPE_ERROR, situation_signature="zzz-更多次"
+        )
+        experiences += _repeated(make_experience, 2, situation_signature="aaa-更少次")
+
+        scan = strict.detect(experiences)
+
+        assert scan.patterns == ()
+        assert [item.experience_count for item in scan.suppressed] == [4, 2]
+
+    def test_suppressed_ties_are_broken_deterministically(self, detector, make_experience) -> None:
+        """同一批经验总得到同样的顺序——``suppressed`` 也不例外。"""
+        experiences = _repeated(make_experience, 2, situation_signature="sig-b")
+        experiences += _repeated(make_experience, 2, situation_signature="sig-a")
+        scan = detector.detect(experiences)
+        assert [item.situation_signature for item in scan.suppressed] == ["sig-a", "sig-b"]
+
+
+class TestTheCountingFieldsDefaultToNothing:
+    """🔴 变异测试发现：三张结果对象的**计数字段默认值**从未被断言。
+
+    ``occurrence_count: int = 0`` 之类改成 ``1`` 或 ``-1`` 全部存活，
+    因为 ``detect`` 与既有的测试 helper 都**显式传了**这些字段——
+    默认值一次都没被用到。
+
+    ⚠️ "没被用到"不等于"不重要"：默认值 1 意味着任何一处新的构造
+    （比如以后加一个只报错误类别的最小投影）都会凭空带上一次发生。
+    ``weighted_count`` 尤其危险——它是门槛比的数。
+    """
+
+    def test_an_empty_error_pattern_counts_nothing(self) -> None:
+        pattern = ErrorPattern(error_type=ErrorType.REASONING_ERROR, situation_signature="sig")
+        assert pattern.occurrence_count == 0
+        assert pattern.weighted_count == 0
+        assert pattern.experience_count == 0
+        assert pattern.counterexample_count == 0
+        assert pattern.experience_ids == ()
+        assert pattern.first_round_id is None
+        assert pattern.last_round_id is None
+
+    def test_an_empty_scan_counts_nothing(self) -> None:
+        scan = PatternScan()
+        assert scan.patterns == ()
+        assert scan.suppressed == ()
+        assert scan.unattributable_count == 0
+        assert scan.low_confidence_count == 0
+
+
+class TestTheResultsAreImmutable:
+    """🔴 变异测试发现：``frozen=True`` 改成 ``False`` 之后有两条存活。
+
+    这三张对象是**一份结论**：调用方拿到之后再改它的
+    ``weighted_count``，等于让"门槛放行了它"与"它当时算出来几"分家，
+    而报告仍然按改过的数生成。
+    """
+
+    def test_error_pattern_cannot_be_mutated(self) -> None:
+        pattern = ErrorPattern(error_type=ErrorType.REASONING_ERROR, situation_signature="sig")
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            pattern.weighted_count = 99  # type: ignore[misc]
+
+    def test_suppressed_pattern_cannot_be_mutated(self) -> None:
+        pattern = SuppressedPattern(
+            error_type=ErrorType.REASONING_ERROR,
+            situation_signature="sig",
+            occurrence_count=1,
+            weighted_count=0,
+            experience_count=1,
+        )
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            pattern.weighted_count = 99  # type: ignore[misc]
+
+    def test_pattern_scan_cannot_be_mutated(self) -> None:
+        scan = PatternScan()
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            scan.unattributable_count = 99  # type: ignore[misc]
+
+
+class TestTheConstructorTakesKeywords:
+    """🔴 变异测试发现：``__init__` 的 ``*`` 改成 ``/`` 之后全绿。
+
+    ``PatternDetector(threshold=..., weighting=...)`` 是**按关键字**调用的
+    契约——改成位置限定之后，``threshold=2`` 会直接 TypeError。
+    既有用例只用无参构造，所以没有任何断言碰到它。
+    """
+
+    def test_both_parameters_are_keyword_only(self) -> None:
+        built = PatternDetector(threshold=2, weighting=DEFAULT_WEIGHTING)
+        assert built.threshold == 2
+        assert built.weighting is DEFAULT_WEIGHTING
+
+    def test_a_threshold_of_two_is_accepted(self) -> None:
+        """🔴 ``threshold < 2`` 的**边界值**：2 是那道守卫声称的最小合法值。
+
+        改成 ``< 3`` 或 ``<= 2`` 之后，门槛 2 被当成非法——
+        而"1 会被拒"那条断言对它照样成立。加上这一条两个方向都钉住了。
+        """
+        assert PatternDetector(threshold=2).threshold == 2
+
+    def test_one_below_the_boundary_is_still_refused(self) -> None:
+        with pytest.raises(ValueError, match="不变量 10"):
+            PatternDetector(threshold=0)

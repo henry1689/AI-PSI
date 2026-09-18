@@ -46,8 +46,10 @@ def _pattern(error_type: ErrorType = ErrorType.REASONING_ERROR, count: int = 3) 
     )
 
 
-def _allowed(error_type: ErrorType = ErrorType.REASONING_ERROR) -> PromotionDecision:
-    return PromotionPolicy().decide(PromotionEvidence(pattern=_pattern(error_type)))
+def _allowed(
+    error_type: ErrorType = ErrorType.REASONING_ERROR, count: int = 3
+) -> PromotionDecision:
+    return PromotionPolicy().decide(PromotionEvidence(pattern=_pattern(error_type, count)))
 
 
 @pytest.fixture
@@ -91,6 +93,21 @@ class TestGateIsEnforcedHereToo:
         )
         with pytest.raises(ValueError, match="门槛"):
             generator.generate(pattern=_pattern(count=1), decision=fabricated)
+
+    def test_a_pattern_above_the_threshold_still_generates(self, generator) -> None:
+        """🔴 变异测试发现：篡改检测里的 ``<`` 只在**恰好等于门槛**时被验过。
+
+        那道检测的含义是「裁决声称命中重复，但模式的加权计数**不够**」。
+        把 ``<`` 改成 ``!=`` / ``is not`` 之后，"恰好三条"这一组用例
+        全部照样通过，而**超过门槛**的模式会被当成伪造的裁决——
+        一条合法的、证据更充分的提案反而抛错。
+
+        后果不是"少了一条提案"，是**学习链路在最该工作的时候报错**。
+        """
+        pattern = _pattern(count=10)
+        decision = _allowed(count=10)
+        assert PromotionTrigger.REPEATED_SAME_ERROR in decision.triggers
+        assert generator.generate(pattern=pattern, decision=decision) is not None
 
     def test_a_decision_without_a_pattern_produces_nothing(self, generator) -> None:
         """🔴 没有模式就没有支撑证据，提案无从构造。
@@ -221,6 +238,26 @@ class TestContentPointsAtADirectionNotASolution:
         assert proposal is not None
         assert "待人工调查" in proposal.proposed_change
         assert "无根据" in proposal.proposed_change
+
+    @pytest.mark.parametrize(
+        "error_type", [ErrorType.VALUE_SUBSTITUTION, ErrorType.USER_MODEL_ERROR]
+    )
+    def test_only_unknown_error_gets_the_investigation_text(
+        self, generator, error_type: ErrorType
+    ) -> None:
+        """🔴 变异测试发现：``is UNKNOWN_ERROR`` 换成 ``>=`` 之后全绿。
+
+        原因是 **StrEnum 的排序比字符串**，而 ``"value_substitution"`` 与
+        ``"user_model_error"`` 恰好都排在 ``"unknown_error"`` **之后**——
+        于是这两个类别也会拿到"待人工调查"那段话，而
+        「UNKNOWN_ERROR 才要调查」这条断言照样成立（它只测了正方向）。
+
+        这两个取值不是随便挑的：它们是实测出来的、在字典序上
+        ``>= "unknown_error"`` 的那两个。
+        """
+        proposal = generator.generate(pattern=_pattern(error_type), decision=_allowed(error_type))
+        assert proposal is not None
+        assert "待人工调查" not in proposal.proposed_change
 
     def test_expected_benefit_names_the_situation(self, generator) -> None:
         proposal = generator.generate(pattern=_pattern(), decision=_allowed())

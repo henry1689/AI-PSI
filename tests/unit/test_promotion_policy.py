@@ -17,10 +17,12 @@ import pytest
 
 from ai_psi.domain.enums import ErrorType
 from ai_psi.domain.improvement_proposals import PROPOSAL_ESCALATION_THRESHOLD
+from ai_psi.learning.evaluation_weighting import DEFAULT_WEIGHTING
 from ai_psi.learning.pattern_detector import ErrorPattern
 from ai_psi.learning.promotion_policy import (
     MODULE_REGRESSION_STREAK,
     SEVERE_ERROR_TYPES,
+    PromotionDecision,
     PromotionEvidence,
     PromotionPolicy,
     PromotionTrigger,
@@ -29,17 +31,21 @@ from ai_psi.learning.promotion_policy import (
 pytestmark = pytest.mark.unit
 
 
-def _pattern(error_type: ErrorType = ErrorType.REASONING_ERROR, count: int = 3) -> ErrorPattern:
+def _pattern(
+    error_type: ErrorType = ErrorType.REASONING_ERROR,
+    count: int = 3,
+    weighted: int | None = None,
+) -> ErrorPattern:
     return ErrorPattern(
         error_type=error_type,
         situation_signature="d1|with_evidence|h2",
         experience_ids=tuple(uuid4() for _ in range(count)),
         # 🔴 门槛比的是**加权计数**（阶段 6.5 §二.6–7）。
-        # 本文件的模式一律按"已被外部证据确认"构造，因此两者相等；
+        # 本文件的模式一律按"已被外部证据确认"构造，因此两者默认相等；
         # 权重本身的行为由 test_pattern_detector 的
         # TestEvaluationWeighting 与 test_evaluation_weighting 覆盖。
         occurrence_count=count,
-        weighted_count=count,
+        weighted_count=count if weighted is None else weighted,
         experience_count=count,
         counterexample_count=0,
     )
@@ -306,3 +312,127 @@ class TestTriggerVocabulary:
 
     def test_module_streak_is_three(self) -> None:
         assert MODULE_REGRESSION_STREAK == 3
+
+
+class TestAboveThresholdCountsStillTrigger:
+    """🔴 变异测试发现：本文件**只测了"恰好等于门槛"**这一个取值。
+
+    条件一、四、五里的判据都是 ``计数 < 门槛``。把它改成 ``!=``
+    或 ``is not`` 之后，"恰好等于门槛"这一组用例全部照样通过——
+    而 **超过门槛**的观察会被当成不合格，理由是"未达门槛"。
+
+    后果是系统只承认"刚好三次"，三次以上反而永远不产生提案。
+    """
+
+    def test_more_than_the_threshold_still_triggers(self, policy) -> None:
+        decision = policy.decide(PromotionEvidence(pattern=_pattern(count=10)))
+        assert PromotionTrigger.REPEATED_SAME_ERROR in decision.triggers
+        assert decision.allowed is True
+
+    def test_many_corrections_still_trigger(self, policy) -> None:
+        decision = policy.decide(
+            PromotionEvidence(user_corrections=9, user_correction_shows_systemic_issue=True)
+        )
+        assert PromotionTrigger.USER_CORRECTION_PATTERN in decision.triggers
+
+    def test_a_long_streak_still_triggers(self, policy) -> None:
+        decision = policy.decide(PromotionEvidence(module_streak=MODULE_REGRESSION_STREAK + 5))
+        assert PromotionTrigger.MODULE_BELOW_THRESHOLD in decision.triggers
+
+    def test_the_threshold_itself_still_triggers(self, policy) -> None:
+        """边界值单独再钉一次：``<`` 改成 ``<=`` 时它会掉下去。"""
+        assert policy.decide(PromotionEvidence(pattern=_pattern(count=3))).allowed is True
+        assert (
+            PromotionTrigger.USER_CORRECTION_PATTERN
+            in policy.decide(
+                PromotionEvidence(user_corrections=3, user_correction_shows_systemic_issue=True)
+            ).triggers
+        )
+        assert (
+            PromotionTrigger.MODULE_BELOW_THRESHOLD
+            in policy.decide(PromotionEvidence(module_streak=MODULE_REGRESSION_STREAK)).triggers
+        )
+
+
+class TestTheNoTriggerReasonOnlyAppearsWhenNothingFired:
+    """🔴 变异测试发现：``if not triggers:`` 去掉那个 ``not`` 之后全绿。
+
+    两条理由都还在，只是**该出现的时候不出现、不该出现的时候出现**：
+    一个条件命中的裁决里会多出一句"五条触发条件一条都未命中"，
+    而一份没有命中的裁决里反而没有这句话。
+
+    裁决理由是评审唯一的输入——一句自相矛盾的理由比没有理由更坏。
+    """
+
+    def test_the_reason_is_present_when_nothing_fired(self, policy) -> None:
+        decision = policy.decide(PromotionEvidence())
+        assert decision.triggers == ()
+        assert any("一条都未命中" in reason for reason in decision.reasons)
+
+    def test_the_reason_is_absent_when_something_fired(self, policy) -> None:
+        decision = policy.decide(PromotionEvidence(pattern=_pattern(count=3)))
+        assert decision.triggers
+        assert not any("一条都未命中" in reason for reason in decision.reasons)
+
+
+class TestTheDefaultsAreWhatWeAgreedOn:
+    """🔴 变异测试发现：两个字段的默认值没有任何调用者，因此无人断言。
+
+    * ``counterexample_count: int = 0`` 改成 ``1`` —— 一份**没有反例**的
+      裁决会声称有反例，而反例会原样进入提案；
+    * ``user_correction_shows_systemic_issue: bool = False`` 改成 ``True``
+      —— 默认值变成"已判定为系统性问题"，条件四会**默认命中**。
+      这条尤其危险：条件四是一条**触发条件**，它的默认值足以让
+      整个裁决翻面。
+    """
+
+    def test_a_decision_with_nothing_counts_nothing(self) -> None:
+        decision = PromotionDecision(allowed=False)
+        assert decision.triggers == ()
+        assert decision.reasons == ()
+        assert decision.counterexample_count == 0
+
+    def test_corrections_are_not_systemic_by_default(self) -> None:
+        assert PromotionEvidence().user_correction_shows_systemic_issue is False
+
+    def test_omitting_the_flag_does_not_trigger(self, policy) -> None:
+        """行为上的另一半：省略那个字段时条件四**不该**命中。"""
+        decision = policy.decide(PromotionEvidence(user_corrections=5))
+        assert PromotionTrigger.USER_CORRECTION_PATTERN not in decision.triggers
+        assert any("未被判定为系统性问题" in reason for reason in decision.reasons)
+
+    def test_the_other_defaults_are_absences(self) -> None:
+        evidence = PromotionEvidence()
+        assert evidence.pattern is None
+        assert evidence.fix_direction is None
+
+
+class TestTheConstructionAndAccessorsAreStable:
+    def test_threshold_is_keyword_only(self) -> None:
+        """🔴 变异测试发现：``__init__`` 的 ``*`` 改成 ``/`` 之后全绿。
+
+        改成位置限定之后 ``PromotionPolicy(threshold=2)`` 直接 TypeError。
+        既有两个门槛用例都是**位置**传参，所以碰不到它。
+        """
+        assert PromotionPolicy(threshold=2).threshold == 2
+
+    def test_a_threshold_of_two_is_accepted(self) -> None:
+        """🔴 ``threshold < 2`` 的边界值：2 是这道守卫声称的最小合法值。
+
+        改成 ``< 3`` 或 ``<= 2`` 之后门槛 2 被判非法，
+        而"1 会被拒"那条断言对它照样成立。
+        """
+        assert PromotionPolicy(threshold=2).threshold == 2
+
+    def test_the_weighting_is_a_value_not_a_method(self) -> None:
+        """🔴 变异测试发现：``weighting`` 上的 ``@property`` 去掉之后全绿。
+
+        去掉之后它是个绑定方法——而调用方拿到它只是为了**比较是不是同一份**
+        （两处用不同的权重表会让"模式发现了它、裁决却说不合格"变成常态）。
+        """
+        assert PromotionPolicy().weighting is DEFAULT_WEIGHTING
+
+    def test_the_evidence_is_immutable(self) -> None:
+        evidence = PromotionEvidence()
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            evidence.pattern = _pattern()  # type: ignore[misc]

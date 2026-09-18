@@ -21,7 +21,12 @@ from ai_psi.application.learning_service import LearningService
 from ai_psi.application.memory_service import MemoryService
 from ai_psi.application.metrics_reader import RoundMetricsReader
 from ai_psi.application.ports import UnitOfWorkFactory
-from ai_psi.application.proposal_gate import GateVerdict, ProposalGate
+from ai_psi.application.proposal_gate import (
+    GateEvidence,
+    GateVerdict,
+    ProposalGate,
+    _find,
+)
 from ai_psi.application.proposal_service import (
     ProposalEvaluation,
     ProposalService,
@@ -39,6 +44,8 @@ from ai_psi.domain.exceptions import (
 from ai_psi.domain.improvement_proposals import ImprovementProposal
 from ai_psi.infrastructure.in_memory.store import InMemoryStore
 from ai_psi.infrastructure.in_memory.unit_of_work import make_in_memory_unit_of_work_factory
+from ai_psi.learning.pattern_detector import ErrorPattern, PatternScan, SuppressedPattern
+from ai_psi.learning.promotion_policy import PromotionTrigger
 from ai_psi.providers.embeddings import LocalHashingEmbedding
 from tests.helpers import forged, seed_learning_evidence
 
@@ -747,3 +754,411 @@ class TestTransitionShape:
         ):
             events = await _events(uow_factory, event_type)
             assert len(events) == 1, event_type
+
+
+# ---------------------------------------------------------------------------
+# §六 补齐：`_find` 的匹配谓词
+# ---------------------------------------------------------------------------
+
+
+class TestTheScanLookupPicksTheRightEntry:
+    """🔴 变异测试发现：``proposal_gate._find`` 的两个匹配谓词上有
+    **21 个变异体存活**——52 条里的四成。
+
+    那个谓词是「这个键（错误类别 + 情境签名）在扫描结果里长什么样」，
+    而它是 §二.13–15 那道「证据不许张冠李戴」防线的落点。
+
+    既有用例全部只在**唯一一个键、且第一个就命中**的扫描上跑过，
+    于是谓词的每一个组成部分都可以被改坏而无人察觉：
+
+    * ``error_type`` 那一半换成 ``!=`` / ``<`` / ``>`` / ``is not``；
+    * ``situation_signature`` 那一半换成 ``!=`` / ``<`` / ``>`` / ``is not``；
+    * 把中间的 ``and`` 换成 ``or``（**任一维相同即命中**，
+      于是"同一情境下的另一个错误"会顶替掉真正要找的那一条）；
+    * 把遍历 ``suppressed`` 的那个循环清空。
+
+    下面每个用例都构造**多个键**，并要求取回**指定的那一个**。
+    """
+
+    @staticmethod
+    def _pattern(error_type: ErrorType, signature: str) -> ErrorPattern:
+        return ErrorPattern(
+            error_type=error_type,
+            situation_signature=signature,
+            occurrence_count=3,
+            weighted_count=3,
+            experience_count=3,
+        )
+
+    @staticmethod
+    def _suppressed(error_type: ErrorType, signature: str, reason: str) -> SuppressedPattern:
+        return SuppressedPattern(
+            error_type=error_type,
+            situation_signature=signature,
+            occurrence_count=2,
+            weighted_count=1,
+            experience_count=2,
+            reasons=(reason,),
+        )
+
+    @classmethod
+    def _scan(cls) -> PatternScan:
+        return PatternScan(
+            patterns=(
+                cls._pattern(ErrorType.SCOPE_ERROR, "sig-a"),
+                cls._pattern(ErrorType.REASONING_ERROR, "sig-b"),
+            ),
+            suppressed=(
+                cls._suppressed(ErrorType.FACTUAL_ERROR, "sig-c", "第一条理由"),
+                cls._suppressed(ErrorType.MEMORY_ERROR, "sig-d", "第二条理由"),
+            ),
+        )
+
+    def test_a_pattern_that_is_not_first_is_still_found(self) -> None:
+        found, reasons = _find(
+            self._scan(), error_type=ErrorType.REASONING_ERROR, signature="sig-b"
+        )
+        assert found is not None
+        assert found.situation_signature == "sig-b"
+        assert reasons == ()
+
+    def test_a_suppressed_entry_that_is_not_first_is_still_found(self) -> None:
+        found, reasons = _find(self._scan(), error_type=ErrorType.MEMORY_ERROR, signature="sig-d")
+        assert found is None
+        assert reasons == ("第二条理由",)
+
+    def test_the_reasons_belong_to_the_matching_entry(self) -> None:
+        """🔴 取回**另一条**分组的理由，正是"张冠李戴"最直接的形态。"""
+        _, reasons = _find(self._scan(), error_type=ErrorType.FACTUAL_ERROR, signature="sig-c")
+        assert reasons == ("第一条理由",)
+
+    def test_the_right_error_type_with_the_wrong_signature_is_not_found(self) -> None:
+        """🔴 ``and`` → ``or`` 在这一条上会翻车：签名撞上了别的键。"""
+        assert _find(self._scan(), error_type=ErrorType.REASONING_ERROR, signature="sig-a") == (
+            None,
+            (),
+        )
+
+    def test_the_right_signature_with_the_wrong_error_type_is_not_found(self) -> None:
+        assert _find(self._scan(), error_type=ErrorType.SCOPE_ERROR, signature="sig-b") == (
+            None,
+            (),
+        )
+
+    def test_a_key_that_is_nowhere_returns_nothing(self) -> None:
+        assert _find(self._scan(), error_type=ErrorType.CALIBRATION_ERROR, signature="sig-z") == (
+            None,
+            (),
+        )
+
+    def test_an_empty_scan_returns_nothing(self) -> None:
+        assert _find(PatternScan(), error_type=ErrorType.REASONING_ERROR, signature="sig") == (
+            None,
+            (),
+        )
+
+    def test_a_key_present_in_both_prefers_the_pattern(self) -> None:
+        """合格的那一份优先——门槛已经过了，理由清单是次要信息。"""
+        scan = PatternScan(
+            patterns=(self._pattern(ErrorType.REASONING_ERROR, "sig"),),
+            suppressed=(self._suppressed(ErrorType.REASONING_ERROR, "sig", "不该被取到"),),
+        )
+        found, reasons = _find(scan, error_type=ErrorType.REASONING_ERROR, signature="sig")
+        assert found is not None
+        assert reasons == ()
+
+
+# ---------------------------------------------------------------------------
+# §六 补齐：门禁结论本身的形状
+# ---------------------------------------------------------------------------
+
+
+class TestTheGateVerdictIsDerivedNotFilled:
+    """🔴 变异测试发现：门禁结论上有 **12 个变异体存活**，全都指向同一件事——
+    既有用例**只走过"恰好三条经验"这一种输入**。
+
+    * ``authorised`` 里三个 ``and`` 被换成 ``or``；
+    * ``weighted_count >= threshold`` 被换成 ``==`` / ``<=`` / ``is``；
+    * ``recomputed_occurrences`` / ``recomputed_weighted_count`` 的
+      兜底值从 ``0`` 变成 ``1`` / ``-1``；
+    * ``GateEvidence`` 的默认值改成"已判定为系统性问题"。
+
+    "恰好等于门槛"是**一个点**；上面这些改动在其余全部取值上都不同。
+    """
+
+    @staticmethod
+    async def _seed(rig, *, rounds: int, signature: str) -> None:
+        await seed_learning_evidence(
+            round_service=rig.round_service,
+            artifact_service=rig.artifact_service,
+            feedback_service=rig.feedback_service,
+            rounds=rounds,
+            error_type=ErrorType.REASONING_ERROR,
+            situation_signature=signature,
+        )
+
+    async def test_a_pattern_well_above_the_threshold_is_authorised(self, rig) -> None:
+        """🔴 ``>=`` 的**上边界**。改成 ``==`` / ``<=`` / ``is`` 之后，
+        证据**越充分**反而越不授权——而"恰好三条"那一组用例照样通过。"""
+        signature = "reasoning|d2|well-above"
+        await self._seed(rig, rounds=5, signature=signature)
+
+        verdict = await rig.gate.review(
+            error_type=ErrorType.REASONING_ERROR, situation_signature=signature
+        )
+
+        assert verdict.recomputed_weighted_count == 5
+        assert verdict.authorised is True
+
+    async def test_a_below_threshold_key_is_not_authorised(self, rig) -> None:
+        """🔴 三个 ``and`` 换成 ``or`` 之后，这一条会**抛 AttributeError**。
+
+        ``pattern`` 与 ``decision`` 是成对出现的（要么都有、要么都没有），
+        于是 ``or`` 不再短路，下一项 ``self.decision.allowed`` 直接炸。
+        结论应当是"不授权"，而不是一个异常。
+        """
+        signature = "reasoning|d2|below"
+        await self._seed(rig, rounds=2, signature=signature)
+
+        verdict = await rig.gate.review(
+            error_type=ErrorType.REASONING_ERROR, situation_signature=signature
+        )
+
+        assert verdict.authorised is False
+        assert verdict.pattern is None
+
+    async def test_an_unobserved_key_says_so(self, rig) -> None:
+        verdict = await rig.gate.review(
+            error_type=ErrorType.SCOPE_ERROR, situation_signature="从来没有出现过"
+        )
+        assert verdict.authorised is False
+        assert any("没有任何达到门槛的独立发生" in reason for reason in verdict.reasons)
+
+    async def test_a_below_threshold_key_gets_its_own_reasons(self, rig) -> None:
+        """🔴 ``reasons = list(suppressed) or [...]`` 里的那个 ``or``。
+
+        改成 ``and`` 之后，**未达门槛**的分组会退回那句笼统的
+        "没有任何达到门槛的独立发生"——而那正是这一节要消灭的
+        "为什么没有"答不上来的情形。
+        """
+        signature = "reasoning|d2|has-reasons"
+        await self._seed(rig, rounds=2, signature=signature)
+
+        verdict = await rig.gate.review(
+            error_type=ErrorType.REASONING_ERROR, situation_signature=signature
+        )
+
+        assert any("未达门槛" in reason for reason in verdict.reasons)
+        assert not any("没有任何达到门槛的独立发生" in reason for reason in verdict.reasons)
+
+    async def test_condition_two_can_still_fire_through_the_gate(self, rig) -> None:
+        """🔴 ``error_type in SEVERE_ERROR_TYPES`` 被改成 ``not in`` 之后，
+        严重错误的修复方向**传不进** PromotionEvidence，条件二永远不触发。
+
+        这一条是那条通路唯一的观测点：既有用例从来没让门禁走到条件二。
+
+        ⚠️ 必须**达到次数门槛**才能走到那里：没有模式时门禁在
+        ``_find`` 那一关就返回了，``decision`` 是 ``None``——
+        条件二根本没机会被评估。
+        """
+        signature = "calibration|d2|severe"
+        await seed_learning_evidence(
+            round_service=rig.round_service,
+            artifact_service=rig.artifact_service,
+            feedback_service=rig.feedback_service,
+            rounds=3,
+            error_type=ErrorType.CALIBRATION_ERROR,
+            situation_signature=signature,
+        )
+
+        verdict = await rig.gate.review(
+            error_type=ErrorType.CALIBRATION_ERROR,
+            situation_signature=signature,
+            evidence=GateEvidence(fix_direction="在标定阶段显式给出区间"),
+        )
+
+        assert verdict.decision is not None
+        assert PromotionTrigger.SEVERE_ERROR_WITH_FIX in verdict.decision.triggers
+
+    async def test_the_unavailable_counts_are_zero(self, rig) -> None:
+        """没有模式时，两个"重新计算出来的计数"是 **0**。
+
+        改成 1 或 -1 之后，一份**没有证据**的结论会声称发生过一次——
+        而这两个数会随结论一起交出去。
+        """
+        verdict = await rig.gate.review(
+            error_type=ErrorType.SCOPE_ERROR, situation_signature="从来没有出现过"
+        )
+        assert verdict.recomputed_occurrences == 0
+        assert verdict.recomputed_weighted_count == 0
+
+    async def test_the_key_is_a_value_not_a_method(self, rig) -> None:
+        verdict = await rig.gate.review(
+            error_type=ErrorType.SCOPE_ERROR, situation_signature="某个情境"
+        )
+        assert verdict.key == ("scope_error", "某个情境")
+        assert verdict.authorised is False  # 属性而不是绑定方法
+
+    async def test_the_token_stays_out_of_the_repr(self, rig) -> None:
+        """🔴 ``_token`` 上的 ``repr=False`` 不是装饰。
+
+        它是**授权凭据对象**：``repr`` 会进日志、进失败信息、进
+        ``pytest`` 的断言输出。把它印出来等于把"门禁唯一的那点凭据"
+        抄送到每一个看得见日志的地方。
+        """
+        verdict = await rig.gate.review(
+            error_type=ErrorType.SCOPE_ERROR, situation_signature="某个情境"
+        )
+        assert "_token" not in repr(verdict)
+
+    async def test_the_verdict_is_immutable(self, rig) -> None:
+        import dataclasses
+
+        verdict = await rig.gate.review(
+            error_type=ErrorType.SCOPE_ERROR, situation_signature="某个情境"
+        )
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            verdict.threshold = 99
+
+
+class TestTheGateEvidenceDefaults:
+    def test_the_systemic_flag_defaults_to_false(self) -> None:
+        """🔴 一条**触发条件**的默认值，足以让整个裁决翻面。"""
+        evidence = GateEvidence()
+        assert evidence.user_correction_shows_systemic_issue is False
+        assert evidence.fix_direction is None
+        assert evidence.offline_regression is None
+        assert evidence.module_streak is None
+        assert evidence.user_corrections is None
+
+    def test_it_is_immutable(self) -> None:
+        import dataclasses
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            GateEvidence().fix_direction = "改这里"  # type: ignore[misc]
+
+
+class TestTheGateThresholdBoundary:
+    """🔴 变异测试发现：``ProposalGate.__init__`` 的 ``threshold < 2``
+    有 **4 个变异体存活**——``< 1``、``< 3``、``<= 2``、``== 2``。
+
+    既有用例只验过"1 会被拒"，而 2 是这道守卫声称的**最小合法值**。
+    """
+
+    def test_a_threshold_of_two_is_accepted(self, rig) -> None:
+        gate = ProposalGate(rig.gate._reader, threshold=2)
+        assert gate.threshold == 2
+
+    def test_a_threshold_below_two_is_refused(self, rig) -> None:
+        """🔴 **断言的是门禁自己那句话，不是"抛了 ValueError"。**
+
+        变异测试发现：``< 2`` 改成 ``< 1`` 之后这条仍然通过——因为
+        ``threshold=1`` 会落到下面 ``PatternDetector(threshold=1)``
+        自己的守卫上，抛出一个同样含"不变量 10"的 ``ValueError``。
+
+        也就是说这道守卫**在行为上是冗余的**，它唯一独有的东西是
+        那句说得出"是哪一层拒绝了"的措辞。既然如此，
+        要证明它还在，就得断言那句措辞。
+        """
+        for bad in (0, 1):
+            with pytest.raises(ValueError, match="门禁门槛"):
+                ProposalGate(rig.gate._reader, threshold=bad)
+
+
+class TestTheScanLookupIgnoresHalfMatchesInSuppressed:
+    """🔴 变异测试发现：``_find`` 的**第二个循环**（遍历 ``suppressed``）
+    上的匹配谓词仍有 5 个变异体存活。
+
+    上一个类里的用例全部用的是"两个维度都不撞"的反例，
+    而这里的谓词是 ``error_type is X`` **且** ``signature == Y``：
+
+    * 改成 ``or``：任一维相同就命中；
+    * ``error_type`` 换成 ``>=`` / ``<=``：**StrEnum 的排序**会把
+      ``scope_error`` 之类判成与 ``reasoning_error`` 相等或更大；
+    * ``signature`` 换成 ``>=`` / ``<=``：同理。
+
+    因此需要**分别只在错误类别上撞、只在签名上撞**的两条反例——
+    它们各自能钉住谓词的一半。
+    """
+
+    @staticmethod
+    def _suppressed(error_type: ErrorType, signature: str, reason: str) -> SuppressedPattern:
+        return SuppressedPattern(
+            error_type=error_type,
+            situation_signature=signature,
+            occurrence_count=2,
+            weighted_count=1,
+            experience_count=2,
+            reasons=(reason,),
+        )
+
+    @classmethod
+    def _scan(cls) -> PatternScan:
+        """查询的键是 ``REASONING_ERROR / sig-target``，而这张表里
+        没有任何一条**同时**在两个维度上相等。"""
+        return PatternScan(
+            suppressed=(
+                # 只在错误类别上撞
+                cls._suppressed(ErrorType.REASONING_ERROR, "sig-other", "错类别撞"),
+                # 只在签名上撞
+                cls._suppressed(ErrorType.SCOPE_ERROR, "sig-target", "错签名撞"),
+                # 🔴 下面两条专治"把 `==` 换成 `>=` / `<=`"——
+                #    它们各自**一个维度相等、另一个维度按字典序落在某侧**，
+                #    因此顺序比较会命中，而相等比较不会。
+                cls._suppressed(ErrorType.REASONING_ERROR, "sig-zzz", "签名更大，类别相等"),
+                cls._suppressed(ErrorType.FACTUAL_ERROR, "sig-target", "类别更小，签名相等"),
+            )
+        )
+
+    def test_nothing_matches(self) -> None:
+        assert _find(
+            self._scan(), error_type=ErrorType.REASONING_ERROR, signature="sig-target"
+        ) == (None, ())
+
+    def test_the_real_match_is_still_found(self) -> None:
+        """正向对照：没有它，上面那条对"一律找不到"的实现也成立。"""
+        scan = PatternScan(
+            suppressed=(
+                self._suppressed(ErrorType.SCOPE_ERROR, "sig-other", "别的"),
+                self._suppressed(ErrorType.REASONING_ERROR, "sig-target", "就是它"),
+            )
+        )
+        assert _find(scan, error_type=ErrorType.REASONING_ERROR, signature="sig-target") == (
+            None,
+            ("就是它",),
+        )
+
+
+class TestEveryVerdictKeepsThePatternAndTheDecisionTogether:
+    """🔴 **这条用例守的不是行为，是 `authorised` 里一条等价登记的前提。**
+
+    ``GateVerdict`` 的两条返回路径都是"要么 ``pattern`` 与 ``decision``
+    都给、要么都不给"。``authorised`` 的第二个 ``and`` 换成 ``or``
+    之所以在所有可达输入上等价，正是**因为**这条耦合成立：
+    让两者分叉之后，那个 ``or`` 会放行一份**没有裁决**的结论。
+
+    耦合目前是"两条 return 各写一遍"的结果，没有任何机制保证它。
+    这条用例把它变成一条可执行的约定：哪天多出一条只给一半的路径，
+    它会先红，而不是让等价表悄悄开始放行真变异。
+    """
+
+    async def test_a_qualifying_verdict_has_both(self, rig) -> None:
+        verdict = await rig.verdict()
+        assert verdict.pattern is not None
+        assert verdict.decision is not None
+        assert verdict.authorised is True
+
+    async def test_a_non_qualifying_verdict_has_neither(self, rig) -> None:
+        verdict = await rig.gate.review(
+            error_type=ErrorType.SCOPE_ERROR, situation_signature="从来没有出现过"
+        )
+        assert verdict.pattern is None
+        assert verdict.decision is None
+        assert verdict.authorised is False
+
+    async def test_the_two_fields_never_disagree(self, rig) -> None:
+        for signature in ("sig-甲", "sig-乙"):
+            verdict = await rig.gate.review(
+                error_type=ErrorType.SCOPE_ERROR, situation_signature=signature
+            )
+            assert (verdict.pattern is None) == (verdict.decision is None)

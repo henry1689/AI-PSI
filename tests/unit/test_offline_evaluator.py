@@ -22,6 +22,7 @@ from ai_psi.learning.offline_evaluator import (
     MetricSnapshot,
     OfflineEvaluator,
     RoundMetrics,
+    UnavailableMetric,
 )
 
 pytestmark = pytest.mark.unit
@@ -405,3 +406,150 @@ class TestValueObjects:
     def test_default_comparison_is_not_available(self) -> None:
         """默认构造出来的是"什么都没做"，不是"做完了没问题"。"""
         assert EvaluationComparison().comparison_available is False
+
+
+class TestTheCountingDefaultsAreZero:
+    """🔴 变异测试发现：``RoundMetrics`` 的七个计数字段与
+    ``EvaluationComparison`` 的两个回合数，默认值**从未被断言**。
+
+    它们的默认值改成 ``1`` 或 ``-1`` 之后全部存活——因为
+    ``snapshot`` 与既有测试 helper 都显式传了这些字段，
+    默认值一次都没被走到。
+
+    ⚠️ 这九个字段里有两个是**比值**的分母（``model_calls`` 之类经
+    ``snapshot`` 求和），剩下的直接出现在报告里。默认值 1 意味着
+    "一条度量都没有的回合"看起来调用过一次模型。
+    """
+
+    def test_a_round_with_nothing_recorded_counts_nothing(self) -> None:
+        metrics = RoundMetrics(
+            cognitive_round_id=uuid4(),
+            state=RoundState.CREATED,
+            depth=CognitiveDepth.D1,
+        )
+        assert metrics.model_calls == 0
+        assert metrics.metacognitive_loops == 0
+        assert metrics.successful_model_calls == 0
+        assert metrics.failed_model_calls == 0
+        assert metrics.input_tokens == 0
+        assert metrics.output_tokens == 0
+        assert metrics.total_latency_ms == 0
+
+    def test_a_comparison_with_nothing_counts_nothing(self) -> None:
+        comparison = EvaluationComparison()
+        assert comparison.round_count == 0
+        assert comparison.candidate_round_count == 0
+
+
+class TestTheValueObjectsAreImmutable:
+    """🔴 变异测试发现：四处 ``frozen=True`` 改成 ``False`` 全部存活。
+
+    这几张对象都是**一次评估的结论**：``MetricSnapshot`` 的 ``value``
+    被改掉之后，报告里的数字与算出来的不一致；``EvaluationComparison``
+    的 ``comparison_available`` 被改掉之后，"没对照"能变成"对照了没问题"。
+    """
+
+    @pytest.mark.parametrize(
+        ("factory", "field", "value"),
+        [
+            (lambda: MetricSnapshot(name="x", value=1.0), "name", "y"),
+            (
+                lambda: RoundMetrics(
+                    cognitive_round_id=uuid4(), state=RoundState.CREATED, depth=CognitiveDepth.D1
+                ),
+                "model_calls",
+                9,
+            ),
+            (lambda: EvaluationComparison(), "comparison_available", True),
+            (
+                lambda: UnavailableMetric(name="x", reason="缺数据", owner_stage="阶段 7"),
+                "reason",
+                "改过了",
+            ),
+        ],
+    )
+    def test_cannot_be_mutated(self, factory, field: str, value: object) -> None:
+        import dataclasses
+
+        target = factory()
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(target, field, value)
+
+
+class TestOnlyCompletedRoundsCountAsCompleted:
+    """🔴 变异测试发现：``state is COMPLETED`` 改成 ``<=`` 之后全绿。
+
+    原因是 **StrEnum 的排序比字符串**，而 ``"analyzing"`` 与
+    ``"cancelled"`` 恰好都排在 ``"completed"`` **前面**——
+    于是"分析到一半就不见了的回合"和"被取消的回合"都会被算成
+    **成功完成**。成功率因此会虚高，而报告上看不出任何异常。
+
+    既有用例只用 ``FAILED`` 做过反例，而 ``"failed"`` 排在
+    ``"completed"`` 后面，所以那条用例恰好盖不住这个方向。
+    """
+
+    @pytest.mark.parametrize("state", [RoundState.ANALYZING, RoundState.CANCELLED])
+    def test_a_non_completed_state_is_not_completed(
+        self, evaluator: OfflineEvaluator, state: RoundState
+    ) -> None:
+        rounds = [_round(), _round(state=state)]
+        assert _values(evaluator, rounds)["cognitive_round_success_rate"] == 0.5
+
+
+class TestRuminationCountsAboveTheThreshold:
+    """🔴 变异测试发现：反刍判据 ``loops >= 阈值`` 的**上边界**没有被断言。
+
+    阈值是 2。改成 ``==``（或 ``is``）之后，**绕了三次、四次圈**的回合
+    不再算反刍——而那恰恰是反刍最严重的情形。既有用例只试了
+    1 次与 2 次，刚好是边界的两侧。
+    """
+
+    def test_three_loops_is_still_rumination(self, evaluator: OfflineEvaluator) -> None:
+        rounds = [_round(metacognitive_loops=1), _round(metacognitive_loops=3)]
+        assert _values(evaluator, rounds)["rumination_rate"] == 0.5
+
+    def test_the_threshold_itself_counts(self, evaluator: OfflineEvaluator) -> None:
+        rounds = [_round(metacognitive_loops=1), _round(metacognitive_loops=2)]
+        assert _values(evaluator, rounds)["rumination_rate"] == 0.5
+
+
+class TestAveragesAreNotTruncated:
+    """🔴 变异测试发现：三个"平均值"指标的除法改成整除之后全绿。
+
+    既有的平均值用例**刻意挑的是能整除的数字**（4 次调用、2 个回合），
+    于是 `/` 与 `//` 给出同一个答案。而在真实数据上两者差的是小数部分：
+    平均延迟 800 与 850 的真值是 825.0，整除会报成 825——
+    一个**看起来像整数**的毫秒数，没有任何迹象说明它被截断过。
+    """
+
+    def test_latency_average_keeps_the_fraction(self, evaluator: OfflineEvaluator) -> None:
+        rounds = [_round(total_latency_ms=800), _round(total_latency_ms=851)]
+        assert _values(evaluator, rounds)["average_latency_ms"] == 825.5
+
+    def test_token_average_keeps_the_fraction(self, evaluator: OfflineEvaluator) -> None:
+        # 第一个回合 100+51=151，第二个回合 100+50=150；平均 150.5
+        rounds = [
+            _round(input_tokens=100, output_tokens=51),
+            _round(input_tokens=100, output_tokens=50),
+        ]
+        assert _values(evaluator, rounds)["average_token_cost_per_round"] == 150.5
+
+    def test_model_call_average_keeps_the_fraction(self, evaluator: OfflineEvaluator) -> None:
+        rounds = [_round(model_calls=4), _round(model_calls=5)]
+        assert _values(evaluator, rounds)["average_model_calls_per_round"] == 4.5
+
+
+class TestDeltaLookupFindsTheMetric:
+    """``delta_for`` 按**指标名**取差值。"""
+
+    def test_every_snapshot_metric_can_be_looked_up(self, evaluator: OfflineEvaluator) -> None:
+        baseline = [_round(), _round()]
+        candidate = [_round(model_calls=9), _round(model_calls=9)]
+        comparison = evaluator.compare(baseline_rounds=baseline, candidate_rounds=candidate)
+
+        for snapshot in comparison.baseline:
+            assert comparison.delta_for(snapshot.name) is not None
+
+    def test_an_unknown_name_returns_none(self, evaluator: OfflineEvaluator) -> None:
+        comparison = evaluator.compare(baseline_rounds=[_round()], candidate_rounds=[_round()])
+        assert comparison.delta_for("没有这个指标") is None
