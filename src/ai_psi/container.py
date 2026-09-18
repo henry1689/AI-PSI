@@ -33,6 +33,7 @@ from ai_psi.application.cognitive_runtime import CognitiveRuntime
 from ai_psi.application.feedback_service import FeedbackService
 from ai_psi.application.memory_service import MemoryService
 from ai_psi.application.ports import UnitOfWorkFactory
+from ai_psi.application.proposal_service import ProposalService
 from ai_psi.application.round_service import CognitiveRoundService
 from ai_psi.config import Settings, get_settings
 from ai_psi.infrastructure.in_memory.store import InMemoryStore
@@ -64,6 +65,7 @@ class Container:
         artifact_service: 产物记录服务。
         memory_service: 记忆服务。
         feedback_service: 反馈服务。
+        proposal_service: 改进提案服务。
         runtime: 认知运行时。
         engine: PostgreSQL 引擎（``storage_backend=memory`` 时为 ``None``）。
         http_client: 共享的 HTTP 客户端（真实 Provider 用；Mock 下也存在但不用）。
@@ -78,6 +80,7 @@ class Container:
     artifact_service: ArtifactService
     memory_service: MemoryService
     feedback_service: FeedbackService
+    proposal_service: ProposalService
     runtime: CognitiveRuntime
     engine: AsyncEngine | None = field(default=None)
     http_client: httpx.AsyncClient | None = field(default=None)
@@ -139,6 +142,9 @@ def build_container(settings: Settings | None = None) -> Container:
     # 🔴 反馈服务复用**同一个** MemoryService 实例：另造一个会让
     # 反馈路径与其余路径各持一份写入策略，策略一旦被局部替换就会分家。
     feedback_service = FeedbackService(uow_factory, memory_service)
+    # 提案服务只依赖工作单元：它不碰记忆，也不需要模型——
+    # 生成提案的那一步（learning/）是纯函数，由调用方先行完成。
+    proposal_service = ProposalService(uow_factory)
     runtime = CognitiveRuntime(
         uow_factory=uow_factory,
         provider=provider,
@@ -159,6 +165,7 @@ def build_container(settings: Settings | None = None) -> Container:
         artifact_service=artifact_service,
         memory_service=memory_service,
         feedback_service=feedback_service,
+        proposal_service=proposal_service,
         runtime=runtime,
         engine=engine,
         http_client=http_client,

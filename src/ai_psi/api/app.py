@@ -18,6 +18,7 @@ from ai_psi.api.routes import (
     feedback,
     health,
     memories,
+    proposals,
     replay,
 )
 from ai_psi.config import Settings, get_settings
@@ -83,6 +84,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(cognitive_rounds.router, prefix=API_PREFIX)
     app.include_router(memories.router, prefix=API_PREFIX)
     app.include_router(feedback.router, prefix=API_PREFIX)
+    app.include_router(proposals.router, prefix=API_PREFIX)
     app.include_router(replay.router, prefix=API_PREFIX)
     app.include_router(health.router, prefix=API_PREFIX)
 

@@ -18,12 +18,63 @@ from ai_psi.api.schemas import (
     JudgmentView,
     MemoryView,
     ModelInvocationView,
+    ProposalView,
     ReflectionView,
 )
 from ai_psi.domain.events import ModelInvocationInfo
+from ai_psi.domain.improvement_proposals import ImprovementProposal
 from ai_psi.domain.memories import Memory
 
-__all__ = ["judgment_view", "memory_view", "model_invocation_view", "reflection_view"]
+__all__ = [
+    "judgment_view",
+    "memory_view",
+    "model_invocation_view",
+    "proposal_view",
+    "reflection_view",
+]
+
+
+def proposal_view(proposal: ImprovementProposal) -> ProposalView:
+    """把领域提案映射为 API 视图。
+
+    🔴 **只暴露 ``supporting_experience_ids`` 的**数量**，不暴露 id 列表。**
+
+    经验 id 指向的是内部学习记录，客户端拿它做不了什么；
+    而"这条提案是几条经验攒出来的"才是评审真正要看的数字——
+    它直接对应不变量 10 的门槛。
+
+    ``can_become_active`` 是**恒为 false 的显式字段**，不是 omit 掉的：
+    让客户端能检查它，比让它只能从"响应里没有这个字段"去推断好
+    （不变量 11）。
+
+    Args:
+        proposal: 领域提案。
+
+    Returns:
+        API 视图。
+    """
+    return ProposalView(
+        id=proposal.id,
+        status=proposal.status,
+        error_class=proposal.error_class,
+        target_component=proposal.target_component,
+        observed_problem=proposal.observed_problem,
+        supporting_experience_count=len(set(proposal.supporting_experience_ids)),
+        counterexamples=list(proposal.counterexamples),
+        proposed_change=proposal.proposed_change,
+        expected_benefit=proposal.expected_benefit,
+        possible_regressions=list(proposal.possible_regressions),
+        applicability=list(proposal.applicability),
+        evaluation_plan=list(proposal.evaluation_plan),
+        success_metrics=list(proposal.success_metrics),
+        rollback_conditions=list(proposal.rollback_conditions),
+        approval_level=proposal.approval_level,
+        can_become_active=proposal.can_become_active,
+        is_terminal=proposal.is_terminal,
+        created_at=proposal.created_at,
+        updated_at=proposal.updated_at,
+        version=proposal.version,
+    )
 
 
 def judgment_view(payload: dict[str, Any] | None) -> JudgmentView | None:

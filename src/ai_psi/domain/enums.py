@@ -27,6 +27,7 @@ __all__ = [
     "EpistemicAction",
     "EpistemicClassification",
     "ErrorType",
+    "EvaluationVerdict",
     "EventType",
     "EvidenceDirectness",
     "ExpectedOutputType",
@@ -581,6 +582,29 @@ class ProposalStatus(StrEnum):
         }
 
 
+class EvaluationVerdict(StrEnum):
+    """一次离线评估的结论。
+
+    🔴 **``INCONCLUSIVE`` 是一个必须存在的选项。**
+
+    没有它，评估者只能在"有效"与"无效"之间二选一——
+    而"样本太少，看不出差别"是最常见、也最诚实的结果。
+    逼它变成其中一个，等于把噪声变成结论。
+    """
+
+    IMPROVED = "improved"
+    """目标指标改善，且对照指标未退化。"""
+
+    NO_CHANGE = "no_change"
+    """没有可观测的变化。"""
+
+    REGRESSED = "regressed"
+    """出现退化（任务书 §11.3 第三条触发条件所指的那一种）。"""
+
+    INCONCLUSIVE = "inconclusive"
+    """数据不足以得出结论。**不是"没差"**，是"看不出"。"""
+
+
 # ---------------------------------------------------------------------------
 # 用户模型
 # ---------------------------------------------------------------------------
@@ -676,11 +700,11 @@ class RoundState(StrEnum):
 
 
 class EventType(StrEnum):
-    """事件类型全集，共 33 种。
+    """事件类型全集，共 35 种。
 
     事件只追加，永不修改、永不删除（ADR-0002）。
 
-    ⚠️ **任务书 §5.2 的清单与状态机、模块清单并不一致，已补两条：**
+    ⚠️ **任务书 §5.2 的清单与状态机、模块清单并不一致，已补四条：**
 
     * ``cognitive_round.cancelled``（ADR-0012）：任务书清单里没有，
       但 §6.1 的状态机存在 ``CANCELLED`` 状态。缺了它，
@@ -689,6 +713,12 @@ class EventType(StrEnum):
       逻辑/因果/辩证/哲理四个分析模块，§5.2 的清单里却没有任何一条
       事件与之对应。缺了它，这些模块的模型调用就**没有地方记录**
       ``model`` 与 ``prompt_version``——直接违反不变量 18。
+    * ``improvement_proposal.approved_for_manual_trial`` 与
+      ``improvement_proposal.rejected``（ADR-0018）：§12.4 要求
+      "批准进行人工试验"与"驳回"两个接口，§5.2 却只给了
+      ``created`` 与 ``evaluated``。缺了它们，**人类做出的那个批准
+      决定本身不会留下任何痕迹**——而整条受控迭代链路存在的理由，
+      正是这个决定要可追溯（不变量 11）。
 
     ``tests/unit/test_enums.py`` 断言每个终态都有对应的事件类型。
     """
@@ -739,6 +769,11 @@ class EventType(StrEnum):
     EXPERIENCE_CREATED = "experience.created"
     IMPROVEMENT_PROPOSAL_CREATED = "improvement_proposal.created"
     IMPROVEMENT_PROPOSAL_EVALUATED = "improvement_proposal.evaluated"
+    #: 任务书 §5.2 清单中缺失（ADR-0018）。
+    #: 🔴 这是**人类**做出的决定。名字里的 ``for_manual_trial``
+    #: 不是修饰：批准的是"做一次人工试验"，不是"上线"（不变量 11）。
+    IMPROVEMENT_PROPOSAL_APPROVED = "improvement_proposal.approved_for_manual_trial"
+    IMPROVEMENT_PROPOSAL_REJECTED = "improvement_proposal.rejected"
 
     # 回合生命周期
     COGNITIVE_ROUND_STARTED = "cognitive_round.started"

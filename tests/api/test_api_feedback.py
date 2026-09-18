@@ -210,10 +210,12 @@ class TestOpenApiContract:
         schema = (await client.get("/openapi.json")).json()
         assert f"{API_PREFIX}/cognitive-rounds/{{round_id}}/feedback" in set(schema["paths"])
 
-    async def test_stage6_proposal_routes_are_still_absent(self, client: httpx.AsyncClient) -> None:
-        """🔴 不建空壳：提案路由随 §12.4 一起落地，不提前出现（ADR-0012）。"""
+    async def test_the_two_stage6_groups_are_separate(self, client: httpx.AsyncClient) -> None:
+        """反馈与提案是两组接口，路径上不互相依赖（ADR-0012）。"""
         schema = (await client.get("/openapi.json")).json()
-        assert not any("improvement-proposals" in path for path in set(schema["paths"]))
+        paths = set(schema["paths"])
+        assert f"{API_PREFIX}/cognitive-rounds/{{round_id}}/feedback" in paths
+        assert f"{API_PREFIX}/improvement-proposals" in paths
 
     async def test_request_schema_forbids_extras(self, client: httpx.AsyncClient) -> None:
         schema = (await client.get("/openapi.json")).json()

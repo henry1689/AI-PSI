@@ -22,12 +22,16 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ai_psi.application.feedback_service import MemoryEffect
 from ai_psi.domain.enums import (
+    ApprovalLevel,
     CognitiveDepth,
     ConfidenceBand,
     EpistemicAction,
+    ErrorType,
+    EvaluationVerdict,
     FeedbackType,
     MemoryStatus,
     MemoryType,
+    ProposalStatus,
     RetentionPolicy,
     RoundState,
     SensitivityLevel,
@@ -35,11 +39,13 @@ from ai_psi.domain.enums import (
 )
 
 __all__ = [
+    "ApproveProposalRequest",
     "ConversationCreatedResponse",
     "CorrectMemoryRequest",
     "CorrectMemoryResponse",
     "DeleteMemoryResponse",
     "DimensionStatus",
+    "EvaluateProposalRequest",
     "FeedbackRequest",
     "FeedbackResponse",
     "HealthResponse",
@@ -47,7 +53,11 @@ __all__ = [
     "MemoryListResponse",
     "MemoryView",
     "ModelInvocationView",
+    "ProposalListResponse",
+    "ProposalTransitionResponse",
+    "ProposalView",
     "ReflectionView",
+    "RejectProposalRequest",
     "ReplayResponse",
     "RoundResponseBody",
     "RoundStatusResponse",
@@ -463,3 +473,113 @@ class FeedbackResponse(BaseModel):
     memory_id: UUID | None = Field(default=None, description="写入的记忆 id（若有）")
     memory_written: bool = Field(description="是否真的产生了新记忆")
     reasons: list[str] = Field(default_factory=list, description="包括「为什么没有写记忆」")
+
+
+# ---------------------------------------------------------------------------
+# 改进提案（任务书 §12.4）
+# ---------------------------------------------------------------------------
+
+
+class ProposalView(BaseModel):
+    """一条改进提案的对外视图。
+
+    🔴 **``status`` 永远不会是"已生效"。**
+
+    这不需要靠约定：``ProposalStatus`` 里根本不存在 ``ACTIVE``
+    （不变量 11）。``APPROVED_FOR_MANUAL_TRIAL`` 的语义是
+    "批准进行**人工试验**"，不是上线。
+    """
+
+    model_config = _STRICT
+
+    id: UUID
+    status: ProposalStatus
+    error_class: ErrorType
+    target_component: str
+    observed_problem: str
+
+    supporting_experience_count: int = Field(
+        ge=0,
+        description="支撑经验条数。**数量决定它是否够格成为提案**（不变量 10）",
+    )
+    counterexamples: list[str] = Field(default_factory=list)
+
+    proposed_change: str
+    expected_benefit: str
+    possible_regressions: list[str] = Field(default_factory=list)
+    applicability: list[str] = Field(default_factory=list)
+    evaluation_plan: list[str] = Field(default_factory=list)
+    success_metrics: list[str] = Field(default_factory=list)
+    rollback_conditions: list[str] = Field(default_factory=list)
+
+    approval_level: ApprovalLevel
+    can_become_active: bool = Field(
+        description="🔴 恒为 false（不变量 11）。这个字段存在是为了让客户端**能检查它**"
+    )
+    is_terminal: bool
+
+    created_at: datetime
+    updated_at: datetime
+    version: int = Field(ge=1)
+
+
+class ProposalListResponse(BaseModel):
+    """提案列表。"""
+
+    model_config = _STRICT
+
+    count: int = Field(ge=0)
+    proposals: list[ProposalView] = Field(default_factory=list)
+
+
+class EvaluateProposalRequest(BaseModel):
+    """记录一次离线评估。"""
+
+    model_config = _STRICT
+
+    verdict: EvaluationVerdict = Field(
+        description="评估结论。⚠️ inconclusive 是「看不出」而不是「没差」，它是必须存在的选项"
+    )
+    evidence: list[str] = Field(
+        default_factory=list,
+        description="对照口径、样本量、参照版本。**没有口径的结论无法被复核**",
+    )
+    notes: str | None = Field(default=None, description="评审说明")
+    actor_id: str = Field(default="reviewer", min_length=1)
+
+
+class ProposalTransitionResponse(BaseModel):
+    """一次状态流转的结果。
+
+    🔴 两个事件 id 都不是可选的——状态变了却没有审批记录，
+    正是这条链路最不能出的一类缺陷。
+    """
+
+    model_config = _STRICT
+
+    proposal_id: UUID
+    status: ProposalStatus
+    version: int = Field(ge=1)
+    audit_event_id: UUID
+    can_become_active: bool = Field(description="🔴 恒为 false（不变量 11）")
+
+
+class ApproveProposalRequest(BaseModel):
+    """批准进行人工试验。"""
+
+    model_config = _STRICT
+
+    approved_by: str = Field(min_length=1, description="批准人标识")
+    note: str | None = Field(default=None, description="批准说明")
+
+
+class RejectProposalRequest(BaseModel):
+    """驳回提案。"""
+
+    model_config = _STRICT
+
+    rejected_by: str = Field(min_length=1, description="驳回人标识")
+    reason: str = Field(
+        min_length=1,
+        description="驳回理由。**必填**：「不想做」与「做不了」对后来者是完全不同的信息",
+    )
