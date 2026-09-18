@@ -22,9 +22,11 @@ from typing import Any
 
 import pytest
 
+from ai_psi.application.proposal_service import ProposalEvaluation
 from ai_psi.domain.enums import (
     CognitiveDepth,
     ErrorType,
+    EvaluationVerdict,
     EventType,
     ExperienceEvaluation,
     FeedbackType,
@@ -266,6 +268,43 @@ class TestThreeRealRoundsCanProduceAProposal:
 
         assert run.patterns == ()
         assert run.created == ()
+
+    async def test_an_adjudicated_pattern_is_not_proposed_again(
+        self, harness_factory
+    ) -> None:
+        """🔴 被驳回过的模式**不会**在下一次运行里重新递上来。
+
+        阶段 6.5 §四 修正了一处与自身文档矛盾的行为：
+        `_covered_keys` 原本排除了终态，而"只有新经验会改变计数、
+        情境签名没变"意味着一条被驳回的提案会**每次运行都重新生成**——
+        恰好是那段代码声称要避免的"浪费评审的时间"。
+
+        这条用例钉住修正后的语义：人做过决定的事，不再自动回到队列里。
+
+        ⚠️ 代价也一并钉住：**即使此后又发生了很多次，也不会再提议。**
+        V0.1 没有"重新开启"机制，因此这是"少打扰评审"与
+        "漏掉新证据"之间的取舍——它是被选择过的，不是被忽略的。
+        """
+        harness: Harness = harness_factory(responses=_scripted_round(missing_counterexample=True))
+        await _rounds_with_correction(harness, count=3, correction=True)
+
+        first = await harness.learning_service.review()
+        assert len(first.created) == 1, first.summary()
+        proposal = first.created[0].proposal
+        await harness.proposal_service.evaluate(
+            proposal.id,
+            evaluation=ProposalEvaluation(
+                verdict=EvaluationVerdict.IMPROVED, evidence=("历史回放 200 回合",)
+            ),
+        )
+        await harness.proposal_service.reject(
+            proposal.id, rejected_by="评审", reason="代价大于收益"
+        )
+
+        second = await harness.learning_service.review()
+
+        assert second.created == ()
+        assert len(second.already_covered) == 1, second.summary()
 
     async def test_disagreement_alone_reaches_supported_not_confirmed(
         self, harness_factory

@@ -385,19 +385,28 @@ class TestReplay:
         with pytest.raises(NotFoundError, match="没有事件"):
             await replay.replay_round(uuid4())
 
-    async def test_incremental_cursor_advances(
+    async def test_replay_reports_a_consistent_projection(
         self, service: CognitiveRoundService, replay: ReplayService
     ) -> None:
+        """🔴 **回放同时是一致性检查**（阶段 6.5 §四接通了这条告警）。
+
+        ``differs_from_projection`` 说的是"从事件流重建出的状态
+        与当前状态表是否一致"。它此前**算出来了但没有任何出口**——
+        路由内联调 `project_round`，把这个信号丢掉了。
+        一条实现了却读不到的告警，与没有这条告警是一样的。
+
+        正常路径下它必须恒为 ``False``：为 ``True`` 意味着
+        有写入绕过了应用服务。
+        """
         started = await service.start_round()
         round_id = started.round.id
-
-        cursor_before = await replay.current_cursor(round_id)
         await service.transition(round_id, RoundState.TRIAGING, reason="go")
-        cursor_after = await replay.current_cursor(round_id)
 
-        assert cursor_after > cursor_before
-        incremental = await replay.replay_round_incremental(round_id, after_sequence=cursor_before)
-        assert len(incremental) == 1
+        result = await replay.replay_round(round_id)
+
+        assert result.differs_from_projection is False
+        assert result.projection.state is RoundState.TRIAGING
+        assert result.projection.transition_count == 1
 
 
 class TestTransactionAtomicity:

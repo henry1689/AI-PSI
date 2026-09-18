@@ -35,6 +35,7 @@ PostgreSQL 后端返回 **500**——**同一个 HTTP 契约，两个后端两�
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from typing import Any
 
 import httpx
 import pytest
@@ -98,7 +99,9 @@ async def _new_round(client: httpx.AsyncClient) -> str:
     return str(response.json()["cognitive_round_id"])
 
 
-def _assert_client_error(response: httpx.Response, *, expected_status: int | None = None) -> dict:
+def _assert_client_error(
+    response: httpx.Response, *, expected_status: int | None = None
+) -> dict[str, Any]:
     """断言这是一次**结构化的**客户端错误。
 
     🔴 三件事一起看，缺一不可：
@@ -115,7 +118,7 @@ def _assert_client_error(response: httpx.Response, *, expected_status: int | Non
     )
     if expected_status is not None:
         assert response.status_code == expected_status, response.text
-    body = response.json()
+    body: dict[str, Any] = response.json()
     assert "code" in body, f"响应体缺少机器可读的 code：{body}"
     assert body["code"] != "internal_error", body
     return body

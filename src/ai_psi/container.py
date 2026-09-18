@@ -34,9 +34,11 @@ from ai_psi.application.experience_reader import ExperienceReader
 from ai_psi.application.feedback_service import FeedbackService
 from ai_psi.application.learning_service import LearningService
 from ai_psi.application.memory_service import MemoryService
+from ai_psi.application.metrics_reader import RoundMetricsReader
 from ai_psi.application.ports import UnitOfWorkFactory
 from ai_psi.application.proposal_gate import ProposalGate
 from ai_psi.application.proposal_service import ProposalService
+from ai_psi.application.replay_service import ReplayService
 from ai_psi.application.round_service import CognitiveRoundService
 from ai_psi.config import Settings, get_settings
 from ai_psi.infrastructure.in_memory.store import InMemoryStore
@@ -66,6 +68,7 @@ class Container:
         embeddings: 向量 Provider（长期记忆检索）。
         uow_factory: 工作单元工厂。
         round_service: 回合服务。
+        replay_service: 回放服务（只读）。
         artifact_service: 产物记录服务。
         memory_service: 记忆服务。
         feedback_service: 反馈服务。
@@ -73,6 +76,7 @@ class Container:
         experience_reader: 经验读取器（读经验 + 评价）。
         proposal_gate: 提案门禁（落库前的权威门槛复核）。
         learning_service: 学习链路入口（从经验到提案草案）。
+        metrics_reader: 回合度量读取器（离线评测的输入）。
         runtime: 认知运行时。
         engine: PostgreSQL 引擎（``storage_backend=memory`` 时为 ``None``）。
         http_client: 共享的 HTTP 客户端（真实 Provider 用；Mock 下也存在但不用）。
@@ -84,6 +88,7 @@ class Container:
     embeddings: EmbeddingProvider
     uow_factory: UnitOfWorkFactory
     round_service: CognitiveRoundService
+    replay_service: ReplayService
     artifact_service: ArtifactService
     memory_service: MemoryService
     feedback_service: FeedbackService
@@ -91,6 +96,7 @@ class Container:
     experience_reader: ExperienceReader
     proposal_gate: ProposalGate
     learning_service: LearningService
+    metrics_reader: RoundMetricsReader
     runtime: CognitiveRuntime
     engine: AsyncEngine | None = field(default=None)
     http_client: httpx.AsyncClient | None = field(default=None)
@@ -157,12 +163,16 @@ def build_container(settings: Settings | None = None) -> Container:
         uow_factory = make_in_memory_unit_of_work_factory(store, embeddings)
 
     round_service = CognitiveRoundService(uow_factory)
+    replay_service = ReplayService(uow_factory)
     artifact_service = ArtifactService(uow_factory)
     # 🔴 **读取经验只有一处实现**（经验与它的评价一起读回）。
     # 学习链路与提案门禁共用它——门禁"从仓储重新查询"这件事
     # 只有在用同一段读取代码时才有意义（见 experience_reader 的文档）。
     experience_reader = ExperienceReader(uow_factory)
     proposal_gate = ProposalGate(experience_reader)
+    # 🔴 回合度量读取器：离线评测的**唯一输入源**。没有它，
+    # `RoundMetrics` 在全仓库没有生产者，§11.3 条件三永远"未评估"。
+    metrics_reader = RoundMetricsReader(uow_factory)
     # 🔴 一个容器一个 MemoryService：它同时被 API 路由与认知运行时使用，
     # 两个实例会各自持有一份写入策略，策略一旦被局部替换就会分家。
     memory_service = MemoryService(uow_factory, embeddings)
@@ -175,7 +185,7 @@ def build_container(settings: Settings | None = None) -> Container:
     # 🔴 学习链路拿到的是**同一个**经验读取器与**同一个**门禁实例：
     # 另造一套不会报错，但会让"门禁复核的是什么"有两种口径。
     learning_service = LearningService(
-        uow_factory, experience_reader, proposal_gate, proposal_service
+        uow_factory, experience_reader, proposal_gate, proposal_service, metrics_reader
     )
     runtime = CognitiveRuntime(
         uow_factory=uow_factory,
@@ -194,6 +204,7 @@ def build_container(settings: Settings | None = None) -> Container:
         embeddings=embeddings,
         uow_factory=uow_factory,
         round_service=round_service,
+        replay_service=replay_service,
         artifact_service=artifact_service,
         memory_service=memory_service,
         feedback_service=feedback_service,
@@ -201,6 +212,7 @@ def build_container(settings: Settings | None = None) -> Container:
         experience_reader=experience_reader,
         proposal_gate=proposal_gate,
         learning_service=learning_service,
+        metrics_reader=metrics_reader,
         runtime=runtime,
         engine=engine,
         http_client=http_client,

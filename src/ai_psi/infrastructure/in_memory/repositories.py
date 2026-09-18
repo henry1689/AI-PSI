@@ -85,6 +85,14 @@ class InMemoryRoundRepository:
                 return round_
         return None
 
+    async def list_all(self, *, limit: int | None = None) -> list[CognitiveRound]:
+        """列出回合（``created_at`` 升序，同刻按 id 升序）。"""
+        ordered = sorted(
+            self._uow.visible_rounds(),
+            key=lambda item: (item.created_at, str(item.id)),
+        )
+        return ordered if limit is None else ordered[:limit]
+
 
 class InMemoryIdempotencyStore:
     """幂等键存储的内存实现。

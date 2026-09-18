@@ -31,6 +31,7 @@ from ai_psi.application.experience_reader import ExperienceReader
 from ai_psi.application.feedback_service import FeedbackService
 from ai_psi.application.learning_service import LearningService
 from ai_psi.application.memory_service import MemoryService
+from ai_psi.application.metrics_reader import RoundMetricsReader
 from ai_psi.application.ports import UnitOfWorkFactory
 from ai_psi.application.proposal_gate import ProposalGate
 from ai_psi.application.proposal_service import ProposalService
@@ -217,6 +218,7 @@ class Harness:
     experience_reader: ExperienceReader
     proposal_gate: ProposalGate
     learning_service: LearningService
+    metrics_reader: RoundMetricsReader
     embeddings: EmbeddingProvider
     prompts: PromptRegistry
     settings: Settings
@@ -314,8 +316,13 @@ def harness_factory() -> Callable[..., Harness]:
         proposal_service = ProposalService(uow_factory)
         experience_reader = ExperienceReader(uow_factory)
         proposal_gate = ProposalGate(experience_reader)
+        metrics_reader = RoundMetricsReader(uow_factory)
         learning_service = LearningService(
-            uow_factory, experience_reader, proposal_gate, proposal_service
+            uow_factory,
+            experience_reader,
+            proposal_gate,
+            proposal_service,
+            metrics_reader,
         )
         return Harness(
             runtime=runtime,
@@ -327,6 +334,7 @@ def harness_factory() -> Callable[..., Harness]:
             experience_reader=experience_reader,
             proposal_gate=proposal_gate,
             learning_service=learning_service,
+            metrics_reader=metrics_reader,
             embeddings=embeddings,
             prompts=prompts,
             settings=resolved,

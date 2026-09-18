@@ -129,6 +129,21 @@ class SqlAlchemyRoundRepository:
         )
         return None if row is None else row_to_round(row)
 
+    async def list_all(self, *, limit: int | None = None) -> list[CognitiveRound]:
+        """列出回合（``created_at`` 升序，同刻按 id 升序）。
+
+        🔴 **排序写在 SQL 里，不在 Python 里。** 在 Python 里排序意味着
+        先把整张表读进内存再切 ``limit``——那样 ``limit`` 一点都没省下
+        读取量，而它存在的理由恰恰是不要全读。
+        """
+        statement = select(CognitiveRoundRow).order_by(
+            CognitiveRoundRow.created_at.asc(), CognitiveRoundRow.id.asc()
+        )
+        if limit is not None:
+            statement = statement.limit(limit)
+        rows = (await self._session.scalars(statement)).all()
+        return [row_to_round(row) for row in rows]
+
 
 class SqlAlchemyIdempotencyStore:
     """幂等键存储（任务书 §13.4）。

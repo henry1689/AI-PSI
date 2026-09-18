@@ -4,6 +4,16 @@
 :func:`~ai_psi.cognition.projection.project_round` 是纯函数：
 它重建状态、**并且审计**每一次转移是否合法。因此回放不只是"重放历史"，
 它同时是"这段历史有没有被绕过状态机"的一致性检查。
+
+⚠️ **阶段 6.5 §四：本路由此前把逻辑写在自己身上。**
+
+它内联调 `project_round`，于是
+:class:`~ai_psi.application.replay_service.ReplayService` 成了死代码，
+而它算出的 ``differs_from_projection``——**"事件流与状态投影是否一致"
+这条数据一致性告警**——**没有任何路径能读到**。
+一条实现了但没有出口的告警，与没有这条告警是一样的。
+
+现在逻辑收回应用层，告警也一并暴露出来。
 """
 
 from __future__ import annotations
@@ -14,9 +24,7 @@ from fastapi import APIRouter
 
 from ai_psi.api.dependencies import ContainerDep
 from ai_psi.api.schemas import ReplayResponse
-from ai_psi.cognition.projection import project_round
 from ai_psi.domain.common import utc_now
-from ai_psi.domain.exceptions import NotFoundError
 
 __all__ = ["router"]
 
@@ -35,21 +43,16 @@ async def replay_round(
         container: 依赖容器。
 
     Returns:
-        重建出的状态、转移序列与失败诊断。
+        重建出的状态、转移序列、失败诊断，
+        以及**与当前状态投影是否一致**。
 
     Raises:
         NotFoundError: 事件流为空。
         IllegalStateTransitionError: 事件流中包含非法转移
             （说明有写入绕过了状态机）。
     """
-    async with container.uow_factory() as uow:
-        events = await uow.events.read_stream(cognitive_round_id=round_id)
-
-    if not events:
-        msg = f"回合没有事件流，无法回放：{round_id}"
-        raise NotFoundError(msg, context={"cognitive_round_id": str(round_id)})
-
-    projection = project_round(events)
+    result = await container.replay_service.replay_round(round_id)
+    projection = result.projection
     return ReplayResponse(
         cognitive_round_id=projection.cognitive_round_id,
         state=projection.state,
@@ -68,5 +71,6 @@ async def replay_round(
         error_category=(
             projection.error_category.value if projection.error_category is not None else None
         ),
+        differs_from_projection=result.differs_from_projection,
         projected_at=utc_now(),
     )

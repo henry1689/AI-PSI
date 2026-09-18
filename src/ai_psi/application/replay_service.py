@@ -77,39 +77,16 @@ class ReplayService:
 
         return ReplayResult(projection=projection, differs_from_projection=differs)
 
-    async def replay_round_incremental(
-        self,
-        round_id: UUID,
-        *,
-        after_sequence: int,
-    ) -> list[UUID]:
-        """增量回放：只取游标之后的事件 id。
-
-        完整重建需要全量事件；但如果调用方已经持有一个游标，
-        用它只拉取增量部分可以避免重复传输。
-
-        Args:
-            round_id: 回合 id。
-            after_sequence: 游标（只返回序号大于它的事件）。
-
-        Returns:
-            增量事件的 id 列表，按序。
-        """
-        async with self._uow_factory() as uow:
-            events = await uow.events.read_stream(
-                cognitive_round_id=round_id,
-                after_sequence=after_sequence,
-            )
-        return [event.id for event in events]
-
-    async def current_cursor(self, round_id: UUID) -> int:
-        """返回该回合当前的游标值（事件流最大序号）。
-
-        Args:
-            round_id: 回合 id。
-
-        Returns:
-            最大序号；无事件时为 0。
-        """
-        async with self._uow_factory() as uow:
-            return await uow.events.latest_sequence_for_round(cognitive_round_id=round_id)
+    # ⚠️ **阶段 6.5 §四删除的两个方法：**
+    #
+    # 这里曾有 `replay_round_incremental` 与 `current_cursor`（增量回放
+    # 的一对），两者在生产代码里**零调用者**，§12.5 与 §18 也都没有
+    # 要求增量回放。
+    #
+    # 保留它们是"看起来这个能力已经做了"——而实际上没有任何入口。
+    # 阶段 6.5 §四.2 给死代码的处置只有三条：接入 / 隔离 / 删除。
+    # 接入意味着新增一个端点，而**本阶段禁止增加新功能**；
+    # 隔离则等于承认它现在没用却继续付维护成本。
+    #
+    # 因此删除。将来真的要增量回放时，需要的是"重新实现 + 一个
+    # 真实需求"，而不是"从注释里翻出一个没人验证过的旧实现"。

@@ -359,6 +359,14 @@ class ReplayResponse(BaseModel):
     stop_reason: str | None = None
     failure_stage: str | None = None
     error_category: str | None = None
+    differs_from_projection: bool = Field(
+        default=False,
+        description=(
+            "🔴 **数据一致性告警**：事件流重建出的状态与当前状态表不一致。"
+            "为 True 通常意味着有写入绕过了应用服务。正常情况下恒为 False；"
+            "阶段 6.5 之前这个信号在代码里算出来了却没有任何出口"
+        ),
+    )
     projected_at: datetime
 
 

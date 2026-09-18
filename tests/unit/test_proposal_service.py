@@ -19,6 +19,7 @@ from ai_psi.application.experience_reader import ExperienceReader
 from ai_psi.application.feedback_service import FeedbackService
 from ai_psi.application.learning_service import LearningService
 from ai_psi.application.memory_service import MemoryService
+from ai_psi.application.metrics_reader import RoundMetricsReader
 from ai_psi.application.ports import UnitOfWorkFactory
 from ai_psi.application.proposal_gate import GateVerdict, ProposalGate
 from ai_psi.application.proposal_service import (
@@ -29,6 +30,7 @@ from ai_psi.application.proposal_service import (
 from ai_psi.application.round_service import CognitiveRoundService
 from ai_psi.domain.enums import ErrorType, EvaluationVerdict, EventType, ProposalStatus
 from ai_psi.domain.exceptions import (
+    ConstitutionViolationError,
     IllegalStateTransitionError,
     InvalidRequestError,
     NotFoundError,
@@ -38,7 +40,7 @@ from ai_psi.domain.improvement_proposals import ImprovementProposal
 from ai_psi.infrastructure.in_memory.store import InMemoryStore
 from ai_psi.infrastructure.in_memory.unit_of_work import make_in_memory_unit_of_work_factory
 from ai_psi.providers.embeddings import LocalHashingEmbedding
-from tests.helpers import seed_learning_evidence
+from tests.helpers import forged, seed_learning_evidence
 
 pytestmark = pytest.mark.unit
 
@@ -128,7 +130,13 @@ def rig(uow_factory: UnitOfWorkFactory) -> _Rig:
     gate = ProposalGate(reader)
     return _Rig(
         service=ProposalService(uow_factory),
-        learning=LearningService(uow_factory, reader, gate, ProposalService(uow_factory)),
+        learning=LearningService(
+            uow_factory,
+            reader,
+            gate,
+            ProposalService(uow_factory),
+            RoundMetricsReader(uow_factory),
+        ),
         gate=gate,
         round_service=CognitiveRoundService(uow_factory),
         artifact_service=ArtifactService(uow_factory),
@@ -507,53 +515,111 @@ class TestConcurrentTransitions:
 
 
 class TestNoPathToActive:
-    """🔴 不变量 11：不是"没实现"，是类型里根本没有那个值。
+    """🔴 不变量 11：不是"没实现"，是**没有可到达的状态**。
 
-    ⚠️ **这里必须是白名单，不能是"名字里没有 activate"。**
+    ⚠️ **阶段 6.5 §四.9 删掉了这里原有的两条名字匹配断言。**
 
-    初版的两条断言全是名字匹配：一条查 `activate_create`/`apply_create`
-    这类**根本不可能存在**的名字（恒真），另一条查名字里有没有
-    `activate`/`promote`/`publish`/`deploy`/`apply` 五个子串。
-    实测：给 `ProposalService` 挂上两个**真的会生效**的方法
-    `go_live()` 与 `ship_it()`，两条断言照样全绿。
+    它们一条查方法名集合、一条查名字里有没有 `activate`/`promote`/
+    `publish`/... 这些子串。实测：给 `ProposalService` 挂上两个
+    **真的会生效**的方法 `go_live()` 与 `ship_it()`，两条断言照样全绿——
+    因为 `"go_live"` 里没有 `live` 之外的任何一个词，而 `live` 那条
+    当时也不在名单里。**名字扫描挡不住改名。**
 
-    现在钉的是**公开方法的集合**：任何新增公开方法都要在这里登记，
-    而"悄悄加一条通往生效的路"再也做不到。
+    §四.10 要求改用**状态图、服务入口、仓储写入与数据库对抗**证明。
+    本类覆盖前三条（第四条需要真实数据库，见
+    ``tests/integration/test_proposal_status_constraints.py``）。
+
+    四道防线各自独立，任何一道都不是"以防万一"：
+
+    | 防线 | 挡的是什么 |
+    |---|---|
+    | 枚举白名单 | 往 `ProposalStatus` 里**加**一个表示"已生效"的值 |
+    | 服务出口的行为断言 | 现有出口把提案推到一个不合法状态 |
+    | 仓储的成员校验 | `model_construct` 绕开校验造出的裸字符串 |
+    | PostgreSQL CHECK | 上面三道全部被绕过时，数据库仍然拒绝 |
+
+    ⚠️ **不在这里断言"公开方法的集合"。** 一个新增的方法如果只是
+    把提案推到**已经合法**的状态，那不是威胁；真正的威胁是推到
+    一个意为"已生效"的状态，而那个状态**在枚举里不存在**。
+    钉住方法名集合会把每次无害的重构都变成一次红灯，
+    却对真正的绕过无能为力。
     """
 
-    #: `ProposalService` 允许拥有的全部公开成员。
-    #:
-    #: 新增任何一项都必须是有意的决定，并在这里同步。
-    _PUBLIC_SURFACE = frozenset(
+    #: `ProposalStatus` 允许拥有的**全部**成员。
+    _LEGAL_STATUSES = frozenset(
         {
-            "create",
-            "get",
-            "list_all",
-            "evaluate",
-            "approve_for_manual_trial",
-            "reject",
+            ProposalStatus.DRAFT,
+            ProposalStatus.PENDING_EVALUATION,
+            ProposalStatus.EVALUATED,
+            ProposalStatus.REJECTED,
+            ProposalStatus.APPROVED_FOR_MANUAL_TRIAL,
         }
     )
 
-    def test_the_public_surface_is_exactly_what_we_agreed_on(self) -> None:
-        public = {name for name in dir(ProposalService) if not name.startswith("_")}
-        assert public == self._PUBLIC_SURFACE
+    def test_the_status_enum_is_exactly_what_we_agreed_on(self) -> None:
+        """🔴 白名单：**任何新增都要在这里显式登记。**
 
-    def test_no_public_method_reads_like_a_promotion(self) -> None:
-        """白名单之外再补一道语义闸——新增的名字若像"上线"会被拦下。"""
-        forbidden = (
-            "activate",
-            "promote",
-            "publish",
-            "deploy",
-            "apply",
-            "live",
-            "ship",
-            "enable",
-            "effective",
+        这是 §四.3 的直接落地。禁用词黑名单（`active`/`enabled`/`live`
+        /`deployed`/`published`）挡不住 `OPERATIONAL = "operational"`
+        这样的新词——而白名单挡住一切没登记过的东西。
+        """
+        assert set(ProposalStatus) == self._LEGAL_STATUSES
+
+    def test_no_status_value_reads_like_a_promotion(self) -> None:
+        """在白名单之上再补一道语义闸——新增的名字若像"已生效"会被拦下。
+
+        ⚠️ 这一条**不是**主要防线（它自己就是一次名字扫描）。
+        它存在的理由是：白名单只保证"这个值是我们讨论过的"，
+        不保证"我们讨论的时候意识到它在说什么"。两道一起才有意义。
+        """
+        forbidden = ("active", "enabled", "live", "deployed", "published", "applied")
+        for status in ProposalStatus:
+            assert not any(word in status.value for word in forbidden), status
+
+    async def test_every_exit_leaves_the_proposal_in_a_legal_state(self, rig: _Rig) -> None:
+        """🔴 **行为断言，不是名字断言。**
+
+        真实地调用三个出口，收集它们产出的状态，断言全部落在合法集合内。
+        这证明的是"这套代码此刻能把提案带到哪里"——
+        而名字扫描证明的只是"这些方法叫什么"。
+        """
+        observed: set[ProposalStatus] = set()
+
+        drafted = await rig.draft(signature="出口一")
+        observed.add(drafted.status)
+
+        evaluated = await rig.draft(signature="出口二")
+        observed.add(
+            (
+                await rig.service.evaluate(
+                    evaluated.id, evaluation=_evaluation(EvaluationVerdict.IMPROVED)
+                )
+            ).proposal.status
         )
-        for name in self._PUBLIC_SURFACE:
-            assert not any(word in name for word in forbidden), name
+
+        approved = await rig.draft(signature="出口三")
+        await rig.service.evaluate(approved.id, evaluation=_evaluation(EvaluationVerdict.IMPROVED))
+        observed.add(
+            (
+                await rig.service.approve_for_manual_trial(approved.id, approved_by="甲")
+            ).proposal.status
+        )
+
+        rejected = await rig.draft(signature="出口四")
+        await rig.service.evaluate(rejected.id, evaluation=_evaluation(EvaluationVerdict.IMPROVED))
+        observed.add(
+            (
+                await rig.service.reject(rejected.id, rejected_by="乙", reason="代价太大")
+            ).proposal.status
+        )
+
+        assert observed <= self._LEGAL_STATUSES, observed
+        assert observed == {
+            ProposalStatus.DRAFT,
+            ProposalStatus.EVALUATED,
+            ProposalStatus.APPROVED_FOR_MANUAL_TRIAL,
+            ProposalStatus.REJECTED,
+        }
 
     async def test_the_terminal_status_is_the_manual_trial_one(self, rig: _Rig) -> None:
         """终点是"批准做人工试验"，不是"生效"——它必须**看得见**地叫这个名字。"""
@@ -563,6 +629,92 @@ class TestNoPathToActive:
         assert transition.proposal.is_terminal is True
         assert transition.proposal.can_become_active is False
         assert proposal.status is not ProposalStatus.APPROVED_FOR_MANUAL_TRIAL
+
+    async def test_no_status_is_reachable_after_a_terminal_one(self, rig: _Rig) -> None:
+        """🔴 状态图：终态是**吸收态**——从它出发没有边。
+
+        上一条证明了"批准之后是 APPROVED_FOR_MANUAL_TRIAL"，
+        这一条证明"到了那里就再也动不了"。少了它，
+        一个"终态还能继续转"的状态图在外部看起来与前者一样。
+        """
+        approved = await _evaluated(rig)
+        await rig.service.approve_for_manual_trial(approved.id, approved_by="甲")
+
+        with pytest.raises(IllegalStateTransitionError):
+            await rig.service.evaluate(
+                approved.id, evaluation=_evaluation(EvaluationVerdict.IMPROVED)
+            )
+        with pytest.raises(IllegalStateTransitionError):
+            await rig.service.reject(approved.id, rejected_by="乙", reason="改主意了")
+        with pytest.raises(IllegalStateTransitionError):
+            await rig.service.approve_for_manual_trial(approved.id, approved_by="丙")
+
+
+class TestTheRepositoryRefusesForgedObjects:
+    """🔴 §四.4：仓储**不得信任** ``model_construct`` 构造的对象。
+
+    `model_construct` 会跳过**全部**校验，构造出一个把 ``status``
+    写成裸字符串的提案。类型注解拦不住它，`model_validate` 也不会被调用——
+    因此"类型里没有 ACTIVE"这句话在那个位置上不成立。
+
+    这条防线必须在**仓储**：它是对象变成持久化数据的那一刻。
+    """
+
+    async def test_a_forged_status_cannot_be_persisted(
+        self, uow_factory: UnitOfWorkFactory
+    ) -> None:
+        bogus = forged(ImprovementProposal, **_forged_payload(status="active"))
+
+        with pytest.raises(ConstitutionViolationError) as excinfo:
+            async with uow_factory() as uow:
+                await uow.proposals.add(bogus)
+                await uow.commit()
+
+        assert excinfo.value.invariant_id == "I11"
+        async with uow_factory() as uow:
+            assert await uow.proposals.get(bogus.id) is None
+
+    @pytest.mark.parametrize("status", ["active", "ACTIVE", "enabled", "go_live", "deployed"])
+    async def test_every_variant_of_a_live_status_is_refused(
+        self, uow_factory: UnitOfWorkFactory, status: str
+    ) -> None:
+        """枚举值、大写、近义词——一视同仁。"""
+        bogus = forged(ImprovementProposal, **_forged_payload(status=status))
+        with pytest.raises(ConstitutionViolationError):
+            async with uow_factory() as uow:
+                await uow.proposals.add(bogus)
+
+    async def test_a_forged_status_cannot_be_saved_over_an_existing_one(
+        self, uow_factory: UnitOfWorkFactory
+    ) -> None:
+        """🔴 **更新路径也要挡。**
+
+        只挡 `add` 的话，一条合法提案可以在 `save` 时被换成非法状态——
+        而 `save` 是状态流转走的路径，正是最该被守的那一条。
+        """
+        bogus = forged(ImprovementProposal, **_forged_payload(status="active"))
+        with pytest.raises(ConstitutionViolationError):
+            async with uow_factory() as uow:
+                await uow.proposals.save(bogus, expected_version=1)
+
+
+def _forged_payload(**overrides: object) -> dict[str, object]:
+    """一份**字段齐全**的提案负载，供 ``model_construct`` 使用。
+
+    ⚠️ 必须齐全：`model_construct` 缺失字段时不会报错，
+    而是留下一个属性不存在的对象——那会让异常变成 `AttributeError`，
+    测试就会因为**错误的原因**通过。
+    """
+    payload: dict[str, object] = {
+        "created_by": "test",
+        "target_component": "prompt:logical_analyzer",
+        "observed_problem": "同类推理错误反复出现",
+        "error_class": ErrorType.REASONING_ERROR,
+        "proposed_change": "检查该情境下的反例检查环节",
+        "expected_benefit": "降低复发率",
+    }
+    payload.update(overrides)
+    return payload
 
 
 class TestTransitionShape:

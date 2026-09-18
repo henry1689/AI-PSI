@@ -45,7 +45,7 @@ from ai_psi.domain.experiences import (
     independence_group_for,
 )
 
-__all__ = ["construct", "rejects", "seed_learning_evidence"]
+__all__ = ["construct", "forged", "rejects", "seed_learning_evidence"]
 
 
 def construct[T: BaseModel](model: type[T], /, **fields: Any) -> T:
@@ -65,6 +65,28 @@ def construct[T: BaseModel](model: type[T], /, **fields: Any) -> T:
         pydantic.ValidationError: 输入非法。
     """
     return model(**fields)
+
+
+def forged[T: BaseModel](model: type[T], /, **fields: Any) -> T:
+    """用 ``model_construct`` 构造一个**绕过全部校验**的对象。
+
+    🔴 **这是"验证防线拦得住绕过"的测试专用出口，不要在别处用。**
+
+    它与 :func:`construct` 的区别是**攻击方式**：
+    ``construct`` 走正常构造（校验会跑，只是静态类型看不出来），
+    而 ``model_construct`` **根本不跑校验**——它是"有人拿到了
+    Python 对象层"时最直接的一招，也是
+    :func:`~ai_psi.domain.improvement_proposals.assert_status_is_a_member`
+    存在的原因。
+
+    Args:
+        model: 目标领域对象类型。
+        **fields: 传给 ``model_construct`` 的字段。
+
+    Returns:
+        构造出的实例；**它可能违反该类型的任何不变量**。
+    """
+    return model.model_construct(**fields)
 
 
 def rejects[T: BaseModel](model: type[T], /, **fields: Any) -> ValidationError:

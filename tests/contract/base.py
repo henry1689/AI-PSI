@@ -216,6 +216,76 @@ class RoundRepositoryContract:
     async def test_get_unknown_returns_none(self, round_repository) -> None:
         assert await round_repository.get(uuid4()) is None
 
+    async def test_list_all_is_empty_when_there_are_no_rounds(
+        self, round_repository
+    ) -> None:
+        assert await round_repository.list_all() == []
+
+    async def test_list_all_returns_rounds_in_time_order(self, round_repository) -> None:
+        """🔴 **顺序是契约的一部分**（阶段 6.5 §四新增）。
+
+        离线评测要把历史切成"基线"与"候选"两段；顺序不确定的话，
+        同一个输入两次运行会得到不同的对照结果——而那种不一致
+        不会报错，只会让每一次评测看起来都略有不同。
+
+        实现被明确定义为 ``created_at`` 升序、同时刻按 id 升序。
+        """
+        base = datetime(2026, 1, 1, tzinfo=UTC)
+        earliest = _round()
+        earliest = earliest.model_copy(
+            update={"created_at": base, "updated_at": base}
+        )
+        latest = _round()
+        latest = latest.model_copy(
+            update={
+                "created_at": base + timedelta(hours=1),
+                "updated_at": base + timedelta(hours=1),
+            }
+        )
+        # 刻意**逆序**写入：顺序若来自插入顺序，这条用例会失败
+        await round_repository.add(latest)
+        await round_repository.add(earliest)
+
+        assert [item.id for item in await round_repository.list_all()] == [
+            earliest.id,
+            latest.id,
+        ]
+
+    async def test_list_all_respects_limit_from_the_earliest_end(
+        self, round_repository
+    ) -> None:
+        """``limit`` 取的是**最早**的 N 条——与升序顺序一致，不是另一套语义。"""
+        base = datetime(2026, 1, 1, tzinfo=UTC)
+        rounds = []
+        for index in range(3):
+            item = _round()
+            rounds.append(
+                item.model_copy(
+                    update={
+                        "created_at": base + timedelta(hours=index),
+                        "updated_at": base + timedelta(hours=index),
+                    }
+                )
+            )
+        for item in reversed(rounds):
+            await round_repository.add(item)
+
+        limited = await round_repository.list_all(limit=2)
+        assert [item.id for item in limited] == [rounds[0].id, rounds[1].id]
+
+    async def test_list_all_does_not_leak_uncommitted_rounds(self, uow_factory) -> None:
+        """🔴 未提交的回合不该出现在列表里——与 ``get`` 的隔离语义一致。
+
+        ⚠️ 内存实现在事务内**看得见**自己暂存的写入（read-your-writes），
+        这是有意的；但事务**放弃之后**必须看不见。这条用例钉的是后者。
+        """
+        round_ = _round()
+        async with uow_factory() as uow:
+            await uow.rounds.add(round_)
+            await uow.rollback()
+        async with uow_factory() as uow:
+            assert await uow.rounds.list_all() == []
+
     async def test_duplicate_add_is_rejected(self, round_repository) -> None:
         round_ = _round()
         await round_repository.add(round_)

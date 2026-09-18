@@ -54,9 +54,26 @@
   ⚠️ 准确的说法是"没有任何一栏**为**承载用户原文而设"，不是"装不下"：
   `applicable_conditions` / `situation_signature` 等仍是自由 `str`，
   靠调用方不往里填原文（残余风险见 ADR-0019 §3.1、risks R51）
-- 学习链路的**门槛计量单位是"在不同回合里发生过几次"**，不是
-  "手上有几个经验对象"——去重键是 `(cognitive_round_id, judgment_id)`，
-  按 `Experience.id` 去重会让一次错误凑满三次门槛（ADR-0019 §2.1）
+- 🔴 **数据库约束来自迁移，不会随 Python 枚举自动同步。**
+  改 `ProposalStatus` 一类的枚举**必须同时改迁移**，否则新值在内存后端
+  跑得好好的、在真实 PostgreSQL 上抛 `CheckViolation`——
+  "两个后端两个结果"。一致性由
+  `tests/integration/test_proposal_status_constraints.py` **双向**核对
+  （枚举 ⊆ 数据库，且数据库 ⊆ 枚举）
+- 🔴 **落库必须携带 `GateVerdict`**（`ProposalService.create`），
+  且它只能由 `ProposalGate.review()` 从仓储重查重算后产出。
+  想"先造一条提案再测它的生命周期"是走不通的——那正是设计意图
+  （ADR-0022）
+- 🔴 **`learning/` 的权重表与门槛只有一处定义**（`DEFAULT_WEIGHTING`）；
+  `PatternDetector` / `PromotionPolicy` / `ProposalGate` 必须用**同一份**。
+  两处不一致的症状是"每次都说发现了 N 个模式，却一条提案也没有"，
+  以及"门禁算出的次数与链路算出的对不上"——两者都不报错
+  （ADR-0020 §1、ADR-0022 §7）
+- 学习链路的**门槛计量单位是"独立发生次数 × 评价权重"**，不是
+  "手上有几个经验对象"——去重键是 `Experience.independence_group`
+  （幂等键优先、否则回合 id），门槛比的是 `ErrorPattern.weighted_count`。
+  两个方向的错都出过：按 `Experience.id` 去重让一次错误凑满三次
+  （ADR-0019 §2.1），只数发生次数让**内部怀疑**自证成规律（ADR-0020 §1）
 - 🔴 **每阶段结束时补做一次独立评审**（子 Agent、只读、对抗性），
   重点是"找出测试在假装验证的地方"与"尝试构造反例"。
   阶段 6 的评审抓到验收条件本身不成立——测试全绿不代表结论成立

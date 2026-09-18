@@ -41,12 +41,14 @@ from typing import Final
 from uuid import UUID, uuid4
 
 from ai_psi.application.experience_reader import ExperienceLoad, ExperienceReader
+from ai_psi.application.metrics_reader import RoundMetricsReader
 from ai_psi.application.ports import UnitOfWorkFactory
 from ai_psi.application.proposal_gate import GateEvidence, ProposalGate
 from ai_psi.application.proposal_service import ProposalService
 from ai_psi.domain.enums import EventType, FeedbackType
 from ai_psi.domain.events import Event
 from ai_psi.domain.improvement_proposals import ImprovementProposal
+from ai_psi.learning.offline_evaluator import EvaluationComparison, OfflineEvaluator
 from ai_psi.learning.pattern_detector import ErrorPattern, PatternDetector
 from ai_psi.learning.proposal_generator import ProposalGenerator
 
@@ -60,6 +62,31 @@ __all__ = ["LearningRun", "LearningService"]
 NEGATIVE_FEEDBACK_TYPES: Final[frozenset[FeedbackType]] = frozenset(
     {FeedbackType.CORRECTION, FeedbackType.DISAGREEMENT}
 )
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationWindow:
+    """离线评测要对照的两组回合（阶段 6.5 §四：把 `OfflineEvaluator` 接通）。
+
+    🔴 **两组都是**已经存在**的回合的 id，不是"造出来的数据"。**
+
+    评测要回答的是"改动前后，历史回合的指标变了没有"。因此它读的是
+    系统自己跑出来的那些回合——调用方只负责指出**哪两段**是基线、
+    哪两段是候选（例如按时间切分，或按某次改动的部署时间切分）。
+
+    这样设计的原因：V0.1 没有 Eval Runner（阶段 7 的事），
+    让调用方"手工构造 RoundMetrics"会把评测变成一次自证——
+    而 :func:`tests.helpers.seed_learning_evidence` 的文档里
+    已经写明那条边界。
+
+    Attributes:
+        baseline: 基线回合 id。
+        candidate: 候选回合 id；``None`` 表示**没有候选数据**——
+            此时对照不可用，而那**不等于**"没有退化"（§七.16）。
+    """
+
+    baseline: tuple[UUID, ...]
+    candidate: tuple[UUID, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +123,13 @@ class LearningRun:
     """
 
     unreadable_evaluations: int = 0
+    offline_evaluation: EvaluationComparison | None = None
+    """离线评测的对照结果（§11.3 条件三的唯一输入源）。
+
+    🔴 ``comparison_available`` 为 ``False`` 时，它带的是**基线单侧数据**——
+    那不是"没有退化"，是"没有对照"。两者的区别必须能从返回值里读出来。
+    """
+
     patterns: tuple[ErrorPattern, ...] = ()
     candidates: tuple[ErrorPattern, ...] = ()
     """达到模式门槛、并**被门禁复核过**的观察。"""
@@ -132,7 +166,9 @@ class LearningService:
         reader: ExperienceReader,
         gate: ProposalGate,
         proposal_service: ProposalService,
+        metrics_reader: RoundMetricsReader,
         *,
+        evaluator: OfflineEvaluator | None = None,
         detector: PatternDetector | None = None,
         generator: ProposalGenerator | None = None,
     ) -> None:
@@ -144,6 +180,8 @@ class LearningService:
             gate: 提案门禁。🔴 与读取器配套。
             proposal_service: 提案服务。**必须是同一个实例**——
                 另造一个不会出错，但会让"提案从哪来"有两种口径。
+            metrics_reader: 回合度量读取器——离线评测的输入。
+            evaluator: 离线评测器；``None`` 时用默认实现。
             detector: 模式发现器；``None`` 时用门禁的门槛。
             generator: 提案生成器；``None`` 时用默认模板。
         """
@@ -151,6 +189,8 @@ class LearningService:
         self._reader = reader
         self._gate = gate
         self._proposals = proposal_service
+        self._metrics = metrics_reader
+        self._evaluator = evaluator if evaluator is not None else OfflineEvaluator()
         # 🔴 检测器默认取**门禁的门槛**。两处门槛不一致时，
         # 本服务会先发现一批模式、再被门禁全部拒掉——症状是
         # "链路每次都说发现了 N 个模式，却一条提案也没有"。
@@ -169,6 +209,7 @@ class LearningService:
         self,
         *,
         fix_direction: str | None = None,
+        evaluation_window: EvaluationWindow | None = None,
         actor_id: str = "learning_service",
         correlation_id: UUID | None = None,
     ) -> LearningRun:
@@ -182,6 +223,10 @@ class LearningService:
 
         Args:
             fix_direction: 严重错误的明确修复方向（若有）。
+            evaluation_window: 离线评测要对照的两组回合。
+                ``None`` 时**只算基线快照**——那仍然是一次真实的评测，
+                只是没有对照，因此它**不会**被判成"未退化"（§11.3 条件三
+                在那一刻是"未评估"，而不是"不成立"）。
             actor_id: 产生者标识，写进事件。
             correlation_id: 关联链标识；整次运行共用一条。
 
@@ -193,6 +238,7 @@ class LearningService:
         scan = self._detector.detect(load.assessments)
         covered = await self._covered_keys()
         corrections = await self._negative_feedback_by_signature(load)
+        evaluation = await self._evaluate_offline(evaluation_window)
 
         candidates: list[ErrorPattern] = []
         created: list[CreatedProposal] = []
@@ -205,6 +251,15 @@ class LearningService:
                 situation_signature=pattern.situation_signature,
                 evidence=GateEvidence(
                     fix_direction=fix_direction,
+                    # 🔴 §11.3 条件三：**只有真的做了对照才回答"有没有退化"。**
+                    # 单侧数据返回 False 会把"没评估"说成"没退化"——
+                    # 那正是 `PromotionEvidence` 用 None 而不是 False
+                    # 表示未评估的理由（"未评估 ≠ 不成立"）。
+                    offline_regression=(
+                        self._evaluator.regressed(evaluation)
+                        if evaluation.comparison_available
+                        else None
+                    ),
                     # 🔴 这里给的是**观测到的计数**（含 0），不是 ``None``。
                     #
                     # ``None`` 表示"没有接入计数的调用方"——而这里**有**
@@ -265,6 +320,7 @@ class LearningService:
             experiences_considered=len(load.assessments),
             unreadable_experiences=load.unreadable_experiences,
             unreadable_evaluations=load.unreadable_evaluations,
+            offline_evaluation=evaluation,
             patterns=scan.patterns,
             candidates=tuple(candidates),
             created=tuple(created),
@@ -275,6 +331,40 @@ class LearningService:
     # ------------------------------------------------------------------
     # 读
     # ------------------------------------------------------------------
+
+    async def _evaluate_offline(
+        self, window: EvaluationWindow | None
+    ) -> EvaluationComparison:
+        """在历史回合上做一次离线评测。
+
+        🔴 **这接通了 §11.3 条件三，而它此前在系统里永远无法成立。**
+
+        在 :class:`~ai_psi.application.metrics_reader.RoundMetricsReader`
+        出现之前，``RoundMetrics`` 在全仓库**没有任何生产者**——
+        只有测试在手工构造它。于是"离线评测暴露稳定退化"这条
+        触发条件在跑起来的系统里恒为"未评估"。
+
+        ⚠️ **没有窗口时算的是"全部回合的基线快照"，不是"随便算一下"。**
+        基线本身是有用的观测（成功率、反刍率、无依据确定性占比），
+        而"没有对照"这件事会在 ``comparison_available`` 里如实反映。
+
+        Args:
+            window: 要对照的两组回合；``None`` 时只用全部回合做基线。
+
+        Returns:
+            对照结果。
+        """
+        if window is None:
+            observed = await self._metrics.load()
+            return self._evaluator.compare(baseline_rounds=observed)
+
+        baseline = await self._metrics.load(window.baseline)
+        candidate = (
+            None if window.candidate is None else await self._metrics.load(window.candidate)
+        )
+        return self._evaluator.compare(
+            baseline_rounds=baseline, candidate_rounds=candidate
+        )
 
     async def _negative_feedback_by_signature(self, load: ExperienceLoad) -> dict[str, int]:
         """统计每个情境签名下收到过否定反馈的**不同回合数**。
@@ -319,12 +409,31 @@ class LearningService:
         return {signature: len(rounds) for signature, rounds in rounds_by_signature.items()}
 
     async def _covered_keys(self) -> set[tuple[str, str]]:
-        """已被**未终结**提案覆盖的 ``(错误类别, 情境签名)``。"""
+        """已被提案覆盖的 ``(错误类别, 情境签名)``——**含终态**。
+
+        🔴 **阶段 6.5 §四 修正了一处与自身文档矛盾的行为。**
+
+        原文写的是"同一个模式只会有一条未终结的提案"，而实现里
+        刻意排除了终态（``if not proposal.status.is_terminal``）。
+        两句话看起来一致，实际后果相反：
+
+        一条提案被驳回之后，**下一次运行会立刻重新生成一条一模一样的**——
+        因为只有新经验会改变计数，而情境签名没变、键就没变。
+        于是"只有未终结的"变成了"每跑一次就再递一遍"，
+        恰好是这段代码声称要避免的那件事（浪费评审的时间，
+        更糟的是让评审开始怀疑这份清单）。
+
+        ⚠️ **代价是明说出来的：** 现在一条被驳回的模式**不会再被提议**，
+        即使此后又发生了很多次。V0.1 没有"重新开启"机制，
+        因此这是"少打扰评审"与"漏掉新证据"之间的取舍。
+        引入重新开启（例如"驳回 N 天后、或新增 M 次发生时可再审"）
+        属于阶段 7 的评测范围，那时改的是这个方法的一行。
+        """
         proposals = await self._proposals.list_all()
         return {
             (proposal.error_class.value, proposal.applicability[0])
             for proposal in proposals
-            if not proposal.status.is_terminal and proposal.applicability
+            if proposal.applicability
         }
 
 
