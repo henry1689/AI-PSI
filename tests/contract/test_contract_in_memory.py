@@ -15,6 +15,7 @@ from tests.contract.base import (
     EventStoreContract,
     IdempotencyContract,
     MemoryRepositoryContract,
+    ProposalRepositoryContract,
     RoundRepositoryContract,
     UnitOfWorkContract,
 )
@@ -57,6 +58,13 @@ async def memory_repository(uow_factory):
         yield uow.memories
 
 
+@pytest.fixture
+async def proposal_repository(uow_factory):
+    """提案仓储（阶段 6 起挂在工作单元上）。"""
+    async with uow_factory() as uow:
+        yield uow.proposals
+
+
 class TestInMemoryEventStore(EventStoreContract):
     """事件存储的内存实现。"""
 
@@ -71,6 +79,10 @@ class TestInMemoryIdempotencyStore(IdempotencyContract):
 
 class TestInMemoryMemoryRepository(MemoryRepositoryContract):
     """长期记忆仓储的内存实现。"""
+
+
+class TestInMemoryProposalRepository(ProposalRepositoryContract):
+    """改进提案仓储的内存实现。"""
 
 
 class TestInMemoryUnitOfWork(UnitOfWorkContract):

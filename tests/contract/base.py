@@ -9,26 +9,35 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
 
 from ai_psi.application.ports import IdempotencyOutcome
 from ai_psi.domain.cognitive_rounds import CognitiveBudget, CognitiveRound
-from ai_psi.domain.enums import CognitiveDepth, EventType, MemoryStatus, MemoryType
+from ai_psi.domain.enums import (
+    CognitiveDepth,
+    ErrorType,
+    EventType,
+    MemoryStatus,
+    MemoryType,
+    ProposalStatus,
+)
 from ai_psi.domain.events import Event
 from ai_psi.domain.exceptions import (
     ConflictError,
     NotFoundError,
     OptimisticLockError,
 )
+from ai_psi.domain.improvement_proposals import ImprovementProposal
 from ai_psi.domain.memories import Memory
 
 __all__ = [
     "EventStoreContract",
     "IdempotencyContract",
     "MemoryRepositoryContract",
+    "ProposalRepositoryContract",
     "RoundRepositoryContract",
     "UnitOfWorkContract",
 ]
@@ -371,6 +380,165 @@ class MemoryRepositoryContract:
             await memory_repository.save(memory.bumped(), expected_version=memory.version + 3)
 
 
+def _proposal(**overrides: object) -> ImprovementProposal:
+    payload: dict[str, object] = {
+        "created_by": "test",
+        "target_component": "prompt:logical_analyzer",
+        "observed_problem": "同类推理错误反复出现",
+        "error_class": ErrorType.REASONING_ERROR,
+        "proposed_change": "检查该情境下的反例检查环节",
+        "expected_benefit": "降低复发率",
+    }
+    payload.update(overrides)
+    return ImprovementProposal(**payload)  # type: ignore[arg-type]
+
+
+#: 契约测试里显式指定的时间戳基准。
+#:
+#: 🔴 **不能依赖"创建时自然产生的 created_at"。**
+#: 一个事务里连着写三条提案时，数据库的 ``now()`` 会给出**同一个**
+#: 时间戳，而内存实现拿到的是三个略有差异的时刻——两边的排序结果
+#: 会在"时间戳相同"这个分支上分道扬镳，而契约测试正是用来发现这种事的。
+_T0 = datetime(2026, 3, 1, 12, 0, 0, tzinfo=UTC)
+
+
+class ProposalRepositoryContract:
+    """改进提案仓储的语义契约（任务书 §5.12、§12.4）。
+
+    🔴 **本契约里没有任何"让提案生效"的断言——因为 Port 上没有那个方法。**
+    不是漏了，是 ``ProposalStatus`` 里根本不存在 ``ACTIVE`` 成员（不变量 11）。
+    """
+
+    async def test_add_and_get(self, proposal_repository) -> None:
+        proposal = _proposal()
+        await proposal_repository.add(proposal)
+        stored = await proposal_repository.get(proposal.id)
+        assert stored is not None
+        assert stored.id == proposal.id
+
+    async def test_get_unknown_returns_none(self, proposal_repository) -> None:
+        assert await proposal_repository.get(uuid4()) is None
+
+    async def test_duplicate_add_is_rejected(self, proposal_repository) -> None:
+        proposal = _proposal()
+        await proposal_repository.add(proposal)
+        with pytest.raises(ConflictError):
+            await proposal_repository.add(proposal)
+
+    async def test_save_bumps_version(self, proposal_repository) -> None:
+        proposal = _proposal()
+        await proposal_repository.add(proposal)
+
+        updated = proposal.bumped(status=ProposalStatus.PENDING_EVALUATION)
+        await proposal_repository.save(updated, expected_version=proposal.version)
+
+        stored = await proposal_repository.get(proposal.id)
+        assert stored is not None
+        assert stored.status is ProposalStatus.PENDING_EVALUATION
+        assert stored.version == proposal.version + 1
+
+    async def test_stale_version_raises_instead_of_overwriting(self, proposal_repository) -> None:
+        """🔴 **绝不静默覆盖。**
+
+        两条并发的状态流转（"批准"与"驳回"同时到达）如果后者覆盖了前者，
+        结果是一条提案**同时**被批准和驳回，而事件流里两条理由都在。
+        乐观锁在这里不是性能优化，是正确性要求。
+        """
+        proposal = _proposal()
+        await proposal_repository.add(proposal)
+        approved = proposal.bumped(status=ProposalStatus.APPROVED_FOR_MANUAL_TRIAL)
+        with pytest.raises(OptimisticLockError):
+            await proposal_repository.save(approved, expected_version=proposal.version + 5)
+
+    async def test_save_unknown_proposal_raises_not_found(self, proposal_repository) -> None:
+        with pytest.raises(NotFoundError):
+            await proposal_repository.save(_proposal(), expected_version=1)
+
+    async def test_list_all_is_empty_before_anything_is_written(self, proposal_repository) -> None:
+        assert await proposal_repository.list_all() == []
+
+    async def test_list_all_filters_by_status(self, proposal_repository) -> None:
+        draft = _proposal(created_at=_T0)
+        evaluated = _proposal(created_at=_T0 + timedelta(seconds=1))
+        await proposal_repository.add(draft)
+        await proposal_repository.add(evaluated)
+        await proposal_repository.save(
+            evaluated.bumped(status=ProposalStatus.EVALUATED),
+            expected_version=evaluated.version,
+        )
+
+        assert [
+            item.id for item in await proposal_repository.list_all(status=ProposalStatus.DRAFT)
+        ] == [draft.id]
+        assert [
+            item.id for item in await proposal_repository.list_all(status=ProposalStatus.EVALUATED)
+        ] == [evaluated.id]
+
+    async def test_list_all_filters_by_error_class(self, proposal_repository) -> None:
+        reasoning = _proposal(created_at=_T0)
+        scope = _proposal(created_at=_T0 + timedelta(seconds=1), error_class=ErrorType.SCOPE_ERROR)
+        await proposal_repository.add(reasoning)
+        await proposal_repository.add(scope)
+
+        found = await proposal_repository.list_all(error_class=ErrorType.SCOPE_ERROR)
+        assert [item.id for item in found] == [scope.id]
+
+    async def test_list_all_orders_newest_first(self, proposal_repository) -> None:
+        oldest = _proposal(created_at=_T0)
+        middle = _proposal(created_at=_T0 + timedelta(seconds=1))
+        newest = _proposal(created_at=_T0 + timedelta(seconds=2))
+        await proposal_repository.add(oldest)
+        await proposal_repository.add(newest)
+        await proposal_repository.add(middle)
+
+        assert [item.id for item in await proposal_repository.list_all()] == [
+            newest.id,
+            middle.id,
+            oldest.id,
+        ]
+
+    async def test_ties_are_broken_by_id(self, proposal_repository) -> None:
+        """同一时间戳的提案顺序由 id 决定——**两个实现必须一致**。
+
+        这条断言看着琐碎，但它钉住的正是"内存按插入顺序、数据库按返回顺序"
+        这类只能靠对比两个实现才发现的差异。
+        """
+        tied = [_proposal(created_at=_T0) for _ in range(3)]
+        for item in tied:
+            await proposal_repository.add(item)
+
+        expected = [item.id for item in sorted(tied, key=lambda proposal: str(proposal.id))]
+        assert [item.id for item in await proposal_repository.list_all()] == expected
+
+    async def test_list_all_order_is_reproducible(self, proposal_repository) -> None:
+        for index in range(4):
+            await proposal_repository.add(_proposal(created_at=_T0 + timedelta(seconds=index)))
+
+        first = [item.id for item in await proposal_repository.list_all()]
+        second = [item.id for item in await proposal_repository.list_all()]
+        assert first == second
+
+    async def test_list_all_respects_limit(self, proposal_repository) -> None:
+        for index in range(4):
+            await proposal_repository.add(_proposal(created_at=_T0 + timedelta(seconds=index)))
+
+        everything = await proposal_repository.list_all()
+        limited = await proposal_repository.list_all(limit=2)
+        assert [item.id for item in limited] == [item.id for item in everything[:2]]
+
+    async def test_limit_zero_returns_nothing(self, proposal_repository) -> None:
+        await proposal_repository.add(_proposal())
+        assert await proposal_repository.list_all(limit=0) == []
+
+    async def test_status_is_written_as_a_plain_string(self, proposal_repository) -> None:
+        """两个实现在**存储层**必须对状态值有一致的理解。"""
+        proposal = _proposal(status=ProposalStatus.PENDING_EVALUATION)
+        await proposal_repository.add(proposal)
+        stored = await proposal_repository.get(proposal.id)
+        assert stored is not None
+        assert stored.status is ProposalStatus.PENDING_EVALUATION
+
+
 class UnitOfWorkContract:
     """工作单元的语义契约（任务书阶段 2 验收条件）。"""
 
@@ -498,6 +666,32 @@ class UnitOfWorkContract:
             await uow.commit()
 
         assert await _latest_for_round(uow_factory, round_id) >= 2
+
+    async def test_uncommitted_proposal_writes_are_discarded(self, uow_factory) -> None:
+        """🔴 提案也必须挂在工作单元上（阶段 6 引入）。
+
+        "生成提案 + 记录 ``improvement_proposal.created`` 事件"
+        必须同生共死——只落了事件而没落提案，会留下一条
+        指向不存在提案的审计记录。
+        """
+        proposal = _proposal()
+        async with uow_factory() as uow:
+            await uow.proposals.add(proposal)
+            # 不调用 commit()
+
+        async with uow_factory() as uow:
+            assert await uow.proposals.get(proposal.id) is None
+
+    async def test_committed_proposal_persists(self, uow_factory) -> None:
+        proposal = _proposal()
+        async with uow_factory() as uow:
+            await uow.proposals.add(proposal)
+            await uow.commit()
+
+        async with uow_factory() as uow:
+            stored = await uow.proposals.get(proposal.id)
+            assert stored is not None
+            assert stored.target_component == proposal.target_component
 
 
 async def _latest_for_round(uow_factory, round_id) -> int:

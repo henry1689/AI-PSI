@@ -89,6 +89,47 @@ class TestHealth:
         detail = next(c["detail"] for c in body["checks"] if c["name"] == "constitution")
         assert "fingerprint=" in detail
 
+    async def test_cognitive_probe_reports_the_vector_space(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """🔴 换 Provider 后旧记忆会**静默地全部检索不到**。
+
+        报告里至少要能看到当前用的是哪个向量空间（risks.md R43）。
+        """
+        body = (await client.get(f"{API_PREFIX}/health/cognitive")).json()
+        detail = next(c["detail"] for c in body["checks"] if c["name"] == "embedding")
+        assert "provider=" in detail and "version=" in detail and "dimension=" in detail
+
+    async def test_cognitive_probe_checks_structural_invariants(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """🔴 阶段 6 的这一项查的是**地基还在不在**。
+
+        "提案不可能自动生效""假设不可能变成事实""门槛不可能低于 2"
+        都是类型级的硬约束——它们被削弱时不该等到某次请求才表现出来。
+        """
+        body = (await client.get(f"{API_PREFIX}/health/cognitive")).json()
+        check = next(c for c in body["checks"] if c["name"] == "invariants")
+        assert check["ok"] is True
+        assert "I11" in check["detail"]
+
+    async def test_unchecked_invariants_are_listed_not_omitted(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """🔴 "报告里没有这一项"与"这一项没检查"必须能区分开。"""
+        body = (await client.get(f"{API_PREFIX}/health/cognitive")).json()
+        check = next(c for c in body["checks"] if c["name"] == "unchecked_invariants")
+        assert "未做运行期检查" in check["detail"]
+        # 运行期检查覆盖的那几条不该出现在这个清单里
+        for covered in ("I01", "I10", "I11"):
+            assert f"{covered}、" not in check["detail"]
+
+    async def test_cognitive_probe_is_not_degraded_in_a_healthy_build(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        body = (await client.get(f"{API_PREFIX}/health/cognitive")).json()
+        assert body["status"] == "ok"
+
 
 class TestConversations:
     async def test_create_conversation_returns_id(self, client: httpx.AsyncClient) -> None:

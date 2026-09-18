@@ -21,6 +21,7 @@ from tests.contract.base import (
     EventStoreContract,
     IdempotencyContract,
     MemoryRepositoryContract,
+    ProposalRepositoryContract,
     RoundRepositoryContract,
     UnitOfWorkContract,
 )
@@ -52,6 +53,12 @@ async def memory_repository(uow_factory: UnitOfWorkFactory):
         yield uow.memories
 
 
+@pytest.fixture
+async def proposal_repository(uow_factory: UnitOfWorkFactory):
+    async with uow_factory() as uow:
+        yield uow.proposals
+
+
 class TestPostgresEventStore(EventStoreContract):
     """事件存储的 PostgreSQL 实现。"""
 
@@ -72,4 +79,13 @@ class TestPostgresMemoryRepository(MemoryRepositoryContract):
     """长期记忆仓储的 PostgreSQL + pgvector 实现。
 
     阶段 3 留下的占位类在这里启用——断言**一行未改**。
+    """
+
+
+class TestPostgresProposalRepository(ProposalRepositoryContract):
+    """改进提案仓储的 PostgreSQL 实现。
+
+    🔴 与内存实现跑的是**同一组断言**。规格里的
+    "同一时间戳的提案按 id 排序"这类条款，正是只能在两个实现的
+    对比中才暴露出来的差异。
     """

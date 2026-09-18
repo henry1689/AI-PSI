@@ -57,7 +57,14 @@ install_selector_loop_policy()
 #: 顺序不再是"仅作防御"：先清被引用的一方会直接违反外键约束。
 #: （``TRUNCATE ... CASCADE`` 会自动带上引用它的表，
 #: 但显式列出更清楚，也避免依赖 CASCADE 的隐式行为。）
-_TABLES = ("events", "cognitive_rounds", "idempotency_keys", "memory_embeddings", "memories")
+_TABLES = (
+    "events",
+    "cognitive_rounds",
+    "idempotency_keys",
+    "memory_embeddings",
+    "memories",
+    "improvement_proposals",
+)
 
 
 def pytest_asyncio_loop_factories(
