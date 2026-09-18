@@ -23,7 +23,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_psi.domain.enums import ErrorType, ProposalStatus
 from ai_psi.domain.exceptions import ConflictError, NotFoundError, OptimisticLockError
-from ai_psi.domain.improvement_proposals import ImprovementProposal
+from ai_psi.domain.improvement_proposals import (
+    ImprovementProposal,
+    assert_status_is_a_member,
+)
 from ai_psi.infrastructure.db.errors import is_unique_violation
 from ai_psi.infrastructure.db.mappers import proposal_to_row, proposal_to_values, row_to_proposal
 from ai_psi.infrastructure.db.models import ImprovementProposalRow
@@ -47,7 +50,9 @@ class SqlAlchemyProposalRepository:
 
         Raises:
             ConflictError: 主键已存在。
+            ConstitutionViolationError: 状态不是 ``ProposalStatus`` 的成员。
         """
+        assert_status_is_a_member(proposal)
         self._session.add(proposal_to_row(proposal))
         try:
             await self._session.flush()
@@ -72,7 +77,9 @@ class SqlAlchemyProposalRepository:
         Raises:
             OptimisticLockError: 版本不匹配。
             NotFoundError: 提案不存在。
+            ConstitutionViolationError: 状态不是 ``ProposalStatus`` 的成员。
         """
+        assert_status_is_a_member(proposal)
         stmt = (
             update(ImprovementProposalRow)
             .where(

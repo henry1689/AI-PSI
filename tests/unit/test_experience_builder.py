@@ -21,7 +21,6 @@ from ai_psi.domain.enums import (
     ErrorType,
     FeedbackType,
     RoundState,
-    SensitivityLevel,
     VerificationStatus,
 )
 from ai_psi.learning.error_classifier import ErrorAttribution, ErrorClassifier, ErrorSignals
@@ -209,7 +208,6 @@ class TestNoFreeTextEntersTheLearningChain:
             "later_evidence_ids",
             "applicable_conditions",
             "counterexamples",
-            "sensitivity",
         }
     )
 
@@ -243,6 +241,26 @@ class TestNoFreeTextEntersTheLearningChain:
         with pytest.raises(dataclasses.FrozenInstanceError):
             record.situation_signature = "改掉了"  # type: ignore[misc]
 
-    def test_sensitivity_defaults_to_internal(self) -> None:
-        """默认不是 ``PUBLIC``：学习记录的默认去向必须是**不外发**。"""
-        assert _record().sensitivity is SensitivityLevel.INTERNAL
+    def test_the_field_set_test_is_not_enough_on_its_own(self) -> None:
+        """⚠️ **这道边界只挡得住"新增一个字段"，挡不住"往已有字段里填原文"。**
+
+        这条用例把那个残余风险**显式钉住**，而不是让它停留在
+        "字段集合检查通过了，所以很安全"的错觉里（ADR-0018 §1 的残余风险）。
+
+        ``applicable_conditions`` 与 ``counterexamples`` 是自由 ``str``，
+        它们会原样进入 Experience、被模式发现汇总、最终列进提案的
+        ``applicability`` 并持久化。**本层没有机制拦住这件事**——
+        它靠的是调用方不往这里填用户原文。
+        """
+        leaky = _record(
+            applicable_conditions=("用户原话：我妈上周确诊了抑郁症",),
+            counterexamples=("模型输出：您母亲需要立刻就医",),
+        )
+        experience, _ = ExperienceBuilder().build(record=leaky, signals=_signals())
+        assert experience.applicable_conditions == ["用户原话：我妈上周确诊了抑郁症"]
+
+    def test_situation_signature_is_the_only_other_free_text_channel(self) -> None:
+        """同理：``situation_signature`` 也是自由 ``str``，由调用方负责只放结构标签。"""
+        leaky = _record(situation_signature="我妈上周确诊了抑郁症")
+        experience, _ = ExperienceBuilder().build(record=leaky, signals=_signals())
+        assert experience.situation_signature == "我妈上周确诊了抑郁症"

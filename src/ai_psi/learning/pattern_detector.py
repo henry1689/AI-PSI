@@ -19,6 +19,18 @@
 ⚠️ **无法归因的经验（``error_type is None``）不参与分组。**
 "不知道错在哪"与"没有错"是两回事，把它们混在一起会让
 "未归因"积累成一个看起来像模式的东西。
+
+🔴 **同一个回合的同一个判断，无论被构建几次，都只算一次。**
+
+去重键是 ``(cognitive_round_id, judgment_id)``，**不是 ``Experience.id``**。
+
+这不是学究式的洁癖：``Experience.id`` 是每次 ``ExperienceBuilder.build()``
+新生成的 ``uuid4``，因此"同一个回合构建三次"会得到三条 id 互不相同的
+经验——按 id 去重的话，**一次错误就能凑满三次的门槛**，而不变量 10
+（单次经验不得推广）在这个位置上直接失效。
+
+门槛的语义是"**这个错误在不同的回合里发生过三次**"，不是
+"我们手上有三个经验对象"。去重键必须与这句话对齐。
 """
 
 from __future__ import annotations
@@ -42,6 +54,22 @@ __all__ = ["ErrorPattern", "PatternDetector"]
 #: 而提案是**会被人认真评估**的东西，用噪声喂它是在浪费评审的时间，
 #: 更糟的是会让评审对提案失去信任。
 _MIN_ATTRIBUTION_CONFIDENCE: Final[int] = 1  # == ConfidenceBand.LOW.rank
+
+
+def _distinct_occurrences(members: Sequence[Experience]) -> dict[tuple[UUID, UUID], Experience]:
+    """把经验按 ``(回合, 判断)`` 去重，返回"这件事发生过几次"。
+
+    🔴 **这是门槛的计量单位。** 同一个回合的同一个判断被构建多次，
+    在这里坍缩成一次——``Experience.id`` 是每次构建新生成的 uuid4，
+    按它去重等于允许用一次错误凑满三次的门槛。
+
+    同一回合内若出现多个判断（当前 V0.1 每回合一个），
+    它们会被算作不同的发生——它们确实是不同的认知产物。
+    """
+    unique: dict[tuple[UUID, UUID], Experience] = {}
+    for item in members:
+        unique.setdefault((item.cognitive_round_id, item.judgment_id), item)
+    return unique
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,7 +145,7 @@ class PatternDetector:
         patterns = [
             self._build_pattern(error_type, signature, members)
             for (error_type, signature), members in grouped.items()
-            if len({item.id for item in members}) >= self._threshold
+            if len(_distinct_occurrences(members)) >= self._threshold
         ]
         patterns.sort(
             key=lambda item: (-item.count, item.error_type.value, item.situation_signature)
@@ -131,9 +159,12 @@ class PatternDetector:
         members: list[Experience],
     ) -> ErrorPattern:
         """把一组同类经验汇成一个模式。"""
-        # 去重：同一条经验被重复传入不算两次重复（同一个 id 只应计一次）
-        unique = {item.id: item for item in members}
-        ordered = [unique[key] for key in sorted(unique, key=str)]
+        unique = _distinct_occurrences(members)
+        # 🔴 按**发生时间**排序，`first/last` 才真的表示"最早/最晚发生的一次"。
+        # 阶段 6 的初版按经验 id 排序，而 id 是 uuid4——所谓"最早/最晚"
+        # 实际是"id 字典序最小/最大"，与时间无关。
+        # `id` 是并列时的确定排序键（同一微秒内创建的两条经验）。
+        ordered = sorted(unique.values(), key=lambda item: (item.created_at, str(item.id)))
         rounds = [item.cognitive_round_id for item in ordered]
         conditions = sorted(
             {condition for item in ordered for condition in item.applicable_conditions}
@@ -141,7 +172,9 @@ class PatternDetector:
         return ErrorPattern(
             error_type=error_type,
             situation_signature=signature,
-            experience_ids=tuple(item.id for item in ordered),
+            # 经验 id 本身仍按字典序排列：列在提案里的证据顺序必须可复现，
+            # 而"哪条最早"由上面那两个字段回答。
+            experience_ids=tuple(sorted((item.id for item in ordered), key=str)),
             counterexample_count=sum(1 for item in ordered if item.counterexamples),
             applicable_conditions=tuple(conditions),
             first_round_id=rounds[0] if rounds else None,

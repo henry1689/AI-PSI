@@ -95,6 +95,32 @@ class UnavailableMetric:
     owner_stage: str
 
 
+#: 退化判定里"**越高越好**"的指标。
+#:
+#: ⚠️ 这三个名字必须与 :meth:`OfflineEvaluator.snapshot` 实际产出的名字逐字一致。
+#: 写错一个字母的后果是**静默漏判**：那个指标涨跌都不会被算作退化，
+#: 而没有任何地方会报错。
+HIGHER_IS_BETTER_METRICS: Final[frozenset[str]] = frozenset(
+    {
+        "cognitive_round_success_rate",
+        "structured_output_parse_rate",
+        "metacognitive_stop_rate",
+    }
+)
+
+#: 退化判定里"**越低越好**"的指标。
+#:
+#: 置信度失准率与反刍率都是方向明确的负向指标——它们上升就是退化，
+#: 没有任何解释空间。阶段 6 的初版漏掉了这两个，结果是**真实退化
+#: 被报成"未暴露稳定退化"**。
+LOWER_IS_BETTER_METRICS: Final[frozenset[str]] = frozenset(
+    {
+        "unsupported_certainty_rate",
+        "rumination_rate",
+    }
+)
+
+
 #: 本阶段**不交付**的指标及其原因。
 UNAVAILABLE_METRICS: Final[tuple[UnavailableMetric, ...]] = (
     UnavailableMetric(
@@ -139,6 +165,29 @@ UNAVAILABLE_METRICS: Final[tuple[UnavailableMetric, ...]] = (
         name="proposal_false_promotion_rate",
         reason="需要跨版本跟踪提案的最终去向，属于长期运行指标，不是单次回放能算的",
         owner_stage="阶段 7 之后（需要生产数据）",
+    ),
+    UnavailableMetric(
+        name="cross_scenario_regression",
+        reason=(
+            "「其他场景的退化程度」需要**先定义场景**才能算细分。"
+            "当前的情境签名（深度|证据量|假设数）是结构特征，"
+            "不是语义场景——用它分组算出来的退化率与 §11.4 想要的东西不同名同实"
+        ),
+        owner_stage="阶段 7（Golden Dataset 定场景边界后）",
+    ),
+    UnavailableMetric(
+        name="average_latency_per_depth",
+        reason=(
+            "§16.1 要求按 D0–D4 分组统计延迟与调用数，"
+            "当前只算了全回合均值。**分组均值能掩盖最贵的深度档**——"
+            "D4 的成本问题（risks R38）正是被全均值淹没的"
+        ),
+        owner_stage="阶段 7",
+    ),
+    UnavailableMetric(
+        name="average_model_calls_per_depth",
+        reason="同 average_latency_per_depth：按深度的调用数分布需要分组口径，当前只有全回合均值",
+        owner_stage="阶段 7",
     ),
     UnavailableMetric(
         name="cross_user_memory_leak_rate",
@@ -300,6 +349,23 @@ class OfflineEvaluator:
                 reasons=("没有历史回合可供评估——Baseline 为空，无从对照",),
             )
 
+        # 🔴 **候选数据为空是一个合法输入，不是调用错误。**
+        #
+        # 候选策略跑到一半崩了、一条回合都没产出，是完全可能发生的事；
+        # 让 `zip(..., strict=True)` 抛一个裸 ValueError，等于把一个
+        # "这次评估没有候选数据"的事实报成一次崩溃——调用方拿到的是
+        # 一句无从解释的 `zip() argument 2 is shorter`。
+        if candidate_rounds is not None and not candidate_rounds:
+            return EvaluationComparison(
+                baseline=baseline,
+                comparison_available=False,
+                reasons=(
+                    "候选策略**没有产出任何回合**，因此没有可对照的数据",
+                    "⚠️ 这不等于「没有退化」——它是一次失败的候选运行，而不是一次成功的对照",
+                ),
+                round_count=len(baseline_rounds),
+            )
+
         if candidate_rounds is None:
             return EvaluationComparison(
                 baseline=baseline,
@@ -341,6 +407,16 @@ class OfflineEvaluator:
         把"没评估"当成"没退化"，而那正是 :class:`PromotionEvidence`
         用 ``None`` 而不是 ``False`` 表示未评估的原因。
 
+        🔴 **只判方向明确的指标，两个方向都算。**
+
+        阶段 6 的初版只把三个"越高越好"的指标算作退化，
+        于是 ``unsupported_certainty_rate`` 与 ``rumination_rate``
+        从 0 涨到 1.0 —— 一次**货真价实的退化** —— 会被报成"未暴露退化"。
+        那正好是这条规则要防的反方向：把真实退化说成没问题。
+
+        方向有争议的指标（调用成本、token、延迟）**仍然不在这里判**：
+        它们上升可能是"用了更多算力换更好的结论"，不是单方向的退化。
+
         Args:
             comparison: 对照结果。
 
@@ -357,13 +433,7 @@ class OfflineEvaluator:
             )
             raise ValueError(msg)
         return any(
-            delta < 0
+            delta > 0 if name in LOWER_IS_BETTER_METRICS else delta < 0
             for name, delta in comparison.deltas
-            # 退化只算「越高越好」的指标：成功率、解析率、元认知停止率
-            if name
-            in {
-                "cognitive_round_success_rate",
-                "structured_output_parse_rate",
-                "metacognitive_stop_rate",
-            }
+            if name in HIGHER_IS_BETTER_METRICS or name in LOWER_IS_BETTER_METRICS
         )

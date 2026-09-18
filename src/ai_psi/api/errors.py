@@ -31,6 +31,7 @@ from ai_psi.domain.exceptions import (
     ConstitutionViolationError,
     DomainError,
     IllegalStateTransitionError,
+    InvalidRequestError,
     InvariantViolationError,
     NotFoundError,
     OptimisticLockError,
@@ -53,6 +54,9 @@ HTTP_STATUS_BY_EXCEPTION: Mapping[type[AIPsiError], int] = {
     OptimisticLockError: 409,
     IllegalStateTransitionError: 409,
     ConflictError: 409,
+    # 🔴 语义无效的输入是**调用方的问题**，不是服务端故障。
+    # 绕过它会让一个纯空白的驳回理由变成 500 + 一整条堆栈。
+    InvalidRequestError: 422,
     BudgetExhaustedError: 503,
     ProviderError: 502,
     # 宪法违反是系统缺陷，不是用户的问题——对用户只说"服务内部错误"，

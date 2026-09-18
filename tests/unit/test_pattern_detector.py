@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
@@ -124,12 +126,72 @@ class TestUnattributableExperiencesAreExcluded:
         assert len(patterns) == 1
 
 
-class TestPatternContent:
+class TestOccurrenceAccounting:
+    """🔴 门槛的计量单位是**"这件事在不同回合里发生过几次"**。
+
+    阶段 6 的初版按 ``Experience.id`` 去重，而 ``Experience.id`` 是
+    每次 ``build()`` 新生成的 ``uuid4``——同一个回合构建三次就是
+    三条"独立经验"，**一次错误足以凑满三次的门槛**，
+    不变量 10 在这个位置上直接失效。
+    """
+
     def test_duplicate_ids_do_not_inflate_the_count(self, detector, make_experience) -> None:
         """同一条经验被重复传入不算两次——否则门槛可以被同一份证据凑满。"""
         experience = _experience(make_experience)
         assert detector.detect([experience, experience, experience]) == []
 
+    def test_the_same_round_rebuilt_is_still_one_occurrence(
+        self, detector, make_experience
+    ) -> None:
+        """🔴 **同一个回合的同一个判断，构建几次都只算一次。**
+
+        这条与上一条看着像，实际差着一个 ``uuid4()``：
+        上一条传的是**同一个对象**，这条传的是**同一回合构建出的三个不同对象**。
+        后者才是真实会发生的重复（重复消费事件、重跑构建、补数据……）。
+        """
+        round_id, judgment_id = uuid4(), uuid4()
+        rebuilt = [
+            _experience(make_experience, cognitive_round_id=round_id, judgment_id=judgment_id)
+            for _ in range(3)
+        ]
+        # 三个对象的 id 互不相同——按 id 去重的话它们会被算成三次
+        assert len({item.id for item in rebuilt}) == 3
+        assert detector.detect(rebuilt) == []
+
+    def test_distinct_rounds_do_count(self, detector, make_experience) -> None:
+        """不同回合的同类错误仍然正常计数——去重不该把真实重复一起抹掉。"""
+        occurrences = [
+            _experience(make_experience, cognitive_round_id=uuid4(), judgment_id=uuid4())
+            for _ in range(3)
+        ]
+        patterns = detector.detect(occurrences)
+        assert len(patterns) == 1
+        assert patterns[0].count == 3
+
+    def test_same_round_different_judgments_count_separately(
+        self, detector, make_experience
+    ) -> None:
+        """同一回合里的不同判断是**不同的认知产物**，各自算一次。"""
+        round_id = uuid4()
+        occurrences = [
+            _experience(make_experience, cognitive_round_id=round_id, judgment_id=uuid4())
+            for _ in range(3)
+        ]
+        assert len(detector.detect(occurrences)) == 1
+
+    def test_three_rebuilds_do_not_reach_the_threshold(self, detector, make_experience) -> None:
+        """上面的组合版：两次真实发生 + 一次重建 = **两次**，不够门槛。"""
+        shared = [(uuid4(), uuid4()), (uuid4(), uuid4())]
+        occurrences = []
+        for round_id, judgment_id in shared:
+            occurrences += [
+                _experience(make_experience, cognitive_round_id=round_id, judgment_id=judgment_id)
+                for _ in range(3)
+            ]
+        assert detector.detect(occurrences) == []
+
+
+class TestPatternContent:
     def test_experience_ids_are_sorted(self, detector, make_experience) -> None:
         patterns = detector.detect(_repeated(make_experience, 3))
         ids = patterns[0].experience_ids
@@ -149,11 +211,40 @@ class TestPatternContent:
         pattern = detector.detect(experiences)[0]
         assert pattern.applicable_conditions == ("中文语料", "仅限单来源")
 
-    def test_first_and_last_round_are_tracked(self, detector, make_experience) -> None:
-        """用于判断"这个问题还活着吗"——久未复现的模式优先级更低。"""
+    def test_first_and_last_round_follow_time_not_id(self, detector, make_experience) -> None:
+        """🔴 ``first``/``last`` 是**时间上**的最早与最晚，不是 id 的最小与最大。
+
+        初版按经验 id 排序（``sorted(unique, key=str)``），而 id 是 uuid4——
+        所谓"最早/最晚"实际是随机顺序。下游用 ``last_round_id``
+        判断"这个问题还活着吗"会取到错误的回合。
+
+        这条用例给出**明确的先后顺序**（时间递增），并要求 first/last
+        与之一致。旧实现下它会以约 2/3 的概率失败。
+        """
+        base = datetime(2026, 3, 1, tzinfo=UTC)
+        rounds = [uuid4() for _ in range(3)]
+        occurrences = [
+            _experience(
+                make_experience,
+                cognitive_round_id=round_id,
+                created_at=base + timedelta(hours=index),
+            )
+            for index, round_id in enumerate(rounds)
+        ]
+
+        pattern = detector.detect(list(reversed(occurrences)))[0]
+        assert pattern.first_round_id == rounds[0]
+        assert pattern.last_round_id == rounds[-1]
+
+    def test_first_and_last_are_always_populated(self, detector, make_experience) -> None:
         patterns = detector.detect(_repeated(make_experience, 3))
         assert patterns[0].first_round_id is not None
         assert patterns[0].last_round_id is not None
+
+    def test_experience_ids_stay_reproducible(self, detector, make_experience) -> None:
+        """证据列表的顺序仍按 id 字典序——它要可复现，不承载时间语义。"""
+        pattern = detector.detect(_repeated(make_experience, 3))[0]
+        assert list(pattern.experience_ids) == sorted(pattern.experience_ids, key=str)
 
     def test_pattern_count_matches_members(self, detector, make_experience) -> None:
         pattern = detector.detect(_repeated(make_experience, 4))[0]

@@ -13,7 +13,10 @@ from uuid import UUID
 
 from ai_psi.domain.enums import ErrorType, ProposalStatus
 from ai_psi.domain.exceptions import ConflictError, NotFoundError, OptimisticLockError
-from ai_psi.domain.improvement_proposals import ImprovementProposal
+from ai_psi.domain.improvement_proposals import (
+    ImprovementProposal,
+    assert_status_is_a_member,
+)
 
 if TYPE_CHECKING:  # 运行期不导入，避免与工作单元互相引用
     from ai_psi.infrastructure.in_memory.unit_of_work import InMemoryUnitOfWork
@@ -37,7 +40,9 @@ class InMemoryProposalRepository:
 
         Raises:
             ConflictError: 主键已存在。
+            ConstitutionViolationError: 状态不是 ``ProposalStatus`` 的成员。
         """
+        assert_status_is_a_member(proposal)
         if self._uow.visible_proposal(proposal.id) is not None:
             msg = f"改进提案已存在：{proposal.id}"
             raise ConflictError(msg, context={"proposal_id": str(proposal.id)})
@@ -53,7 +58,9 @@ class InMemoryProposalRepository:
         Raises:
             NotFoundError: 提案不存在。
             OptimisticLockError: 版本不匹配。
+            ConstitutionViolationError: 状态不是 ``ProposalStatus`` 的成员。
         """
+        assert_status_is_a_member(proposal)
         current = self._uow.visible_proposal(proposal.id)
         if current is None:
             msg = f"改进提案不存在：{proposal.id}"

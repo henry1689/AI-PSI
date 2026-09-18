@@ -22,6 +22,7 @@ from ai_psi.application.proposal_service import (
 from ai_psi.domain.enums import ErrorType, EvaluationVerdict, EventType, ProposalStatus
 from ai_psi.domain.exceptions import (
     IllegalStateTransitionError,
+    InvalidRequestError,
     NotFoundError,
     OptimisticLockError,
 )
@@ -224,7 +225,7 @@ class TestEvaluation:
         而不可推翻的结论会永久影响策略。
         """
         proposal = await _drafted(service)
-        with pytest.raises(ValueError, match="对照口径"):
+        with pytest.raises(InvalidRequestError, match="对照口径"):
             await service.evaluate(
                 proposal.id,
                 evaluation=ProposalEvaluation(verdict=EvaluationVerdict.IMPROVED),
@@ -234,7 +235,7 @@ class TestEvaluation:
         self, service: ProposalService, uow_factory: UnitOfWorkFactory
     ) -> None:
         proposal = await _drafted(service)
-        with pytest.raises(ValueError):
+        with pytest.raises(InvalidRequestError):
             await service.evaluate(
                 proposal.id,
                 evaluation=ProposalEvaluation(verdict=EvaluationVerdict.IMPROVED),
@@ -310,7 +311,7 @@ class TestRejection:
 
     async def test_rejection_reason_is_required(self, service: ProposalService) -> None:
         proposal = await _evaluated(service)
-        with pytest.raises(ValueError, match="理由"):
+        with pytest.raises(InvalidRequestError, match="理由"):
             await service.reject(proposal.id, rejected_by="reviewer", reason="   ")
 
     async def test_rejection_leaves_an_event(
@@ -387,30 +388,64 @@ class TestConcurrentTransitions:
 
 
 class TestNoPathToActive:
-    """🔴 不变量 11：不是"没实现"，是类型里根本没有那个值。"""
+    """🔴 不变量 11：不是"没实现"，是类型里根本没有那个值。
 
-    @pytest.mark.parametrize(
-        "method", ["create", "get", "list_all", "evaluate", "approve_for_manual_trial", "reject"]
+    ⚠️ **这里必须是白名单，不能是"名字里没有 activate"。**
+
+    初版的两条断言全是名字匹配：一条查 `activate_create`/`apply_create`
+    这类**根本不可能存在**的名字（恒真），另一条查名字里有没有
+    `activate`/`promote`/`publish`/`deploy`/`apply` 五个子串。
+    实测：给 `ProposalService` 挂上两个**真的会生效**的方法
+    `go_live()` 与 `ship_it()`，两条断言照样全绿。
+
+    现在钉的是**公开方法的集合**：任何新增公开方法都要在这里登记，
+    而"悄悄加一条通往生效的路"再也做不到。
+    """
+
+    #: `ProposalService` 允许拥有的全部公开成员。
+    #:
+    #: 新增任何一项都必须是有意的决定，并在这里同步。
+    _PUBLIC_SURFACE = frozenset(
+        {
+            "create",
+            "get",
+            "list_all",
+            "evaluate",
+            "approve_for_manual_trial",
+            "reject",
+        }
     )
-    def test_the_service_exposes_no_promotion_method(
-        self, service: ProposalService, method: str
-    ) -> None:
-        assert not hasattr(ProposalService, f"activate_{method}")
-        assert not hasattr(ProposalService, f"apply_{method}")
 
-    def test_no_public_method_mentions_activating(self, service: ProposalService) -> None:
-        public = [name for name in dir(ProposalService) if not name.startswith("_")]
-        forbidden = ("activate", "promote", "publish", "deploy", "apply")
-        for name in public:
+    def test_the_public_surface_is_exactly_what_we_agreed_on(self) -> None:
+        public = {name for name in dir(ProposalService) if not name.startswith("_")}
+        assert public == self._PUBLIC_SURFACE
+
+    def test_no_public_method_reads_like_a_promotion(self) -> None:
+        """白名单之外再补一道语义闸——新增的名字若像"上线"会被拦下。"""
+        forbidden = (
+            "activate",
+            "promote",
+            "publish",
+            "deploy",
+            "apply",
+            "live",
+            "ship",
+            "enable",
+            "effective",
+        )
+        for name in self._PUBLIC_SURFACE:
             assert not any(word in name for word in forbidden), name
 
-    async def test_every_reachable_status_is_a_real_proposal_status(
+    async def test_the_terminal_status_is_the_manual_trial_one(
         self, service: ProposalService
     ) -> None:
+        """终点是"批准做人工试验"，不是"生效"——它必须**看得见**地叫这个名字。"""
         proposal = await _evaluated(service)
         transition = await service.approve_for_manual_trial(proposal.id, approved_by="甲")
-        assert transition.proposal.status in set(ProposalStatus)
+        assert transition.proposal.status is ProposalStatus.APPROVED_FOR_MANUAL_TRIAL
+        assert transition.proposal.is_terminal is True
         assert transition.proposal.can_become_active is False
+        assert proposal.status is not ProposalStatus.APPROVED_FOR_MANUAL_TRIAL
 
 
 class TestTransitionShape:

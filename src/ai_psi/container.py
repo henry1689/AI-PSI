@@ -47,6 +47,7 @@ from ai_psi.providers.registry import (
     build_provider_with_client,
     provider_health,
 )
+from ai_psi.reliability.invariants import assert_structural_invariants
 
 __all__ = ["Container", "build_container"]
 
@@ -113,6 +114,18 @@ def build_container(settings: Settings | None = None) -> Container:
     Returns:
         装配好的容器。
     """
+    # 🔴 **地基被改坏时进程不该起来。**
+    #
+    # 这一段此前只在文档里写着"适合放在进程启动路径上"，而
+    # `assert_structural_invariants` 在 `src/` 里**没有任何调用者**——
+    # 实际效果是"某次请求 /health/cognitive 时才被发现"，
+    # 正是那份文档说要避免的事。
+    #
+    # 检查的是类型级的硬约束（提案不可能生效、假设不可能变成事实、
+    # 门槛不可能低于 2）还在不在。它们被削弱时，进程带病启动
+    # 只会让问题以更晚、更难解释的形式出现。
+    assert_structural_invariants()
+
     resolved = settings if settings is not None else get_settings()
     prompts = build_default_registry()
     # 一个进程一个 HTTP 客户端：连接复用、生命周期可控。

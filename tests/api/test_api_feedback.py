@@ -102,6 +102,34 @@ class TestFeedbackEndpoint:
         round_id = await _round_for(client, uuid4())
         assert (await _feedback(client, round_id, content="")).status_code == 422
 
+    @pytest.mark.parametrize("blank", ["   ", "\t\n", " "])
+    async def test_whitespace_content_is_rejected_not_a_500(
+        self, client: httpx.AsyncClient, blank: str
+    ) -> None:
+        """🔴 **用户输入造成的 500 一律是缺陷。**
+
+        ``min_length=1`` 挡不住 ``"   "``：它过得了 schema，然后在
+        "要求更新记忆"的分支里撞出 `Memory.content` 的去空白校验失败——
+        那是一个 pydantic `ValidationError`，不是领域异常，
+        于是一个填错内容的请求被报成 **服务端故障**。
+        """
+        round_id = await _round_for(client, uuid4())
+        for payload in ({}, {"allow_memory_update": True}):
+            response = await _feedback(client, round_id, content=blank, **payload)
+            assert response.status_code == 422, response.text
+            assert "internal_error" not in response.text
+
+    async def test_whitespace_content_never_reaches_the_write_policy(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """连"策略对它说了什么"都不该发生——它在 schema 层就被挡住了。"""
+        user_id = uuid4()
+        round_id = await _round_for(client, user_id)
+        await _feedback(client, round_id, content="   ", allow_memory_update=True)
+
+        listed = (await client.get(f"{API_PREFIX}/users/{user_id}/memories")).json()
+        assert listed["count"] == 0
+
     async def test_unknown_feedback_type_is_rejected(self, client: httpx.AsyncClient) -> None:
         round_id = await _round_for(client, uuid4())
         response = await _feedback(client, round_id, feedback_type="表扬")

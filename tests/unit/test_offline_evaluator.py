@@ -15,6 +15,8 @@ import pytest
 
 from ai_psi.domain.enums import CognitiveDepth, RoundState
 from ai_psi.learning.offline_evaluator import (
+    HIGHER_IS_BETTER_METRICS,
+    LOWER_IS_BETTER_METRICS,
     UNAVAILABLE_METRICS,
     EvaluationComparison,
     MetricSnapshot,
@@ -131,7 +133,7 @@ class TestComputableMetrics:
         assert values["average_token_cost_per_round"] == 40.0
         assert values["average_latency_ms"] == 200.0
 
-    def test_metric_names_match_the_task_spec(self, evaluator) -> None:
+    def test_metric_names_are_the_ones_this_module_actually_computes(self, evaluator) -> None:
         names = {item.name for item in evaluator.snapshot([_round()])}
         assert {
             "cognitive_round_success_rate",
@@ -192,6 +194,29 @@ class TestComparison:
         assert comparison.round_count == 2
         assert comparison.candidate_round_count == 1
 
+    def test_an_empty_candidate_run_is_not_a_crash(self, evaluator) -> None:
+        """🔴 候选策略跑到一半崩了、一条回合都没产出，是**合法输入**。
+
+        让 ``zip(..., strict=True)`` 抛一个裸 ``ValueError``（"argument 2
+        is shorter than argument 1"）等于把"这次评估没有候选数据"
+        报成一次崩溃，调用方拿到一句无从解释的话。
+        """
+        comparison = evaluator.compare(baseline_rounds=[_round(), _round()], candidate_rounds=[])
+        assert comparison.comparison_available is False
+        assert comparison.deltas == ()
+        assert any("没有产出任何回合" in reason for reason in comparison.reasons)
+
+    def test_an_empty_candidate_run_is_not_reported_as_no_regression(self, evaluator) -> None:
+        """🔴 它是**失败的候选运行**，不是"对照通过"。"""
+        comparison = evaluator.compare(baseline_rounds=[_round()], candidate_rounds=[])
+        with pytest.raises(ValueError, match="没有对照数据"):
+            evaluator.regressed(comparison)
+
+    def test_an_empty_candidate_run_keeps_the_baseline(self, evaluator) -> None:
+        comparison = evaluator.compare(baseline_rounds=[_round()], candidate_rounds=[])
+        assert comparison.baseline
+        assert comparison.round_count == 1
+
 
 class TestRegressionDetection:
     def test_no_comparison_raises_instead_of_answering(self, evaluator) -> None:
@@ -226,6 +251,55 @@ class TestRegressionDetection:
         )
         assert evaluator.regressed(comparison) is True
 
+    def test_certainty_regression_is_a_regression(self, evaluator) -> None:
+        """🔴 ``unsupported_certainty_rate`` 是**越低越好**，它上升就是退化。
+
+        初版只把三个"越高越好"的指标算作退化，于是置信度失准率从 0
+        涨到 1.0 这种货真价实的退化会被报成"未暴露稳定退化"——
+        正好是这条规则要防的反方向。
+        """
+        comparison = evaluator.compare(
+            baseline_rounds=[_round(), _round()],
+            candidate_rounds=[_round(unsupported_certainty_detected=True), _round()],
+        )
+        assert comparison.delta_for("unsupported_certainty_rate") == pytest.approx(0.5)
+        assert evaluator.regressed(comparison) is True
+
+    def test_rumination_regression_is_a_regression(self, evaluator) -> None:
+        comparison = evaluator.compare(
+            baseline_rounds=[_round(), _round()],
+            candidate_rounds=[
+                _round(metacognitive_loops=OfflineEvaluator.RUMINATION_LOOP_THRESHOLD),
+                _round(),
+            ],
+        )
+        assert comparison.delta_for("rumination_rate") == pytest.approx(0.5)
+        assert evaluator.regressed(comparison) is True
+
+    def test_lower_is_better_metrics_improving_is_not_a_regression(self, evaluator) -> None:
+        comparison = evaluator.compare(
+            baseline_rounds=[_round(unsupported_certainty_detected=True), _round()],
+            candidate_rounds=[_round(), _round()],
+        )
+        assert evaluator.regressed(comparison) is False
+
+    def test_every_directional_metric_is_classified(self, evaluator) -> None:
+        """🔴 每个指标要么在"越高越好"里，要么在"越低越好"里，要么被显式排除。
+
+        把某个指标的两个集合都漏掉，后果是**静默漏判**：它涨跌都不算退化，
+        而没有任何地方会报错。这条用例把"排除了哪些"变成一个可见的决定。
+        """
+        names = {item.name for item in evaluator.snapshot([_round()])}
+        classified = HIGHER_IS_BETTER_METRICS | LOWER_IS_BETTER_METRICS
+        # 成本类指标方向有争议（可能是"用更多算力换更好结论"），刻意不判
+        deliberately_excluded = {
+            "average_model_calls_per_round",
+            "average_token_cost_per_round",
+            "average_latency_ms",
+        }
+        assert classified | deliberately_excluded == names
+        assert classified & deliberately_excluded == set()
+
     def test_cost_increase_alone_is_not_reported_here(self, evaluator) -> None:
         """⚠️ **这条断言描述的是当前口径的边界，而不是一个理想性质。**
 
@@ -249,6 +323,39 @@ class TestUnavailableMetricsAreListed:
 
     def test_the_list_is_not_empty(self) -> None:
         assert UNAVAILABLE_METRICS
+
+    def test_the_list_covers_every_metric_that_is_neither_computed_nor_excluded(
+        self, evaluator
+    ) -> None:
+        """⚠️ 这份清单的价值取决于它**不漏项**。
+
+        它自己的文档说：让人"一眼看到哪些没算，而不是从'报告里没有这一项'
+        去推断"。因此"既没算、也没列"是最坏的情况——它会被读成"这一项
+        要么算出来了、要么不存在"。
+
+        初版就漏了两处：§11.4 的「其他场景退化程度」与 §16.1 的
+        「按深度分组的延迟/调用数」。
+        """
+        listed = {item.name for item in UNAVAILABLE_METRICS}
+        assert "cross_scenario_regression" in listed
+        assert "average_latency_per_depth" in listed
+        assert "average_model_calls_per_depth" in listed
+
+    def test_section_11_4_metrics_all_have_a_home(self, evaluator) -> None:
+        """§11.4 的八项指标，每一项要么被算出来，要么在这份清单里。"""
+        computed = {item.name for item in evaluator.snapshot([_round()])}
+        listed = {item.name for item in UNAVAILABLE_METRICS}
+        section_11_4 = {
+            "cognitive_round_success_rate",
+            "structured_output_parse_rate",
+            "fact_hypothesis_confusion_rate",
+            "conflict_preservation_rate",
+            "user_correction_recurrence_rate",
+            "unsupported_certainty_rate",
+            "rumination_rate",
+            "cross_scenario_regression",
+        }
+        assert section_11_4 <= (computed | listed)
 
     def test_every_entry_says_why_and_who(self) -> None:
         for item in UNAVAILABLE_METRICS:

@@ -14,9 +14,11 @@ from enum import StrEnum
 import pytest
 
 from ai_psi.cognition.constitution import INVARIANTS
+from ai_psi.domain.enums import ProposalStatus
 from ai_psi.domain.exceptions import ConstitutionViolationError
 from ai_psi.reliability import invariants as selfcheck
 from ai_psi.reliability.invariants import (
+    EXPECTED_PROPOSAL_STATUSES,
     RUNTIME_CHECKED_INVARIANTS,
     assert_structural_invariants,
     check_structural_invariants,
@@ -24,6 +26,42 @@ from ai_psi.reliability.invariants import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+class _ExtendedProposalStatus(StrEnum):
+    """真实成员 + 一个**名字无辜但语义就是"已生效"**的新成员。
+
+    它就是评审用来骗过初版自检的那个反例（``ENABLED``）。
+    写成字面量枚举而不是动态构造，是为了让 mypy 能看懂它。
+    """
+
+    DRAFT = "draft"
+    PENDING_EVALUATION = "pending_evaluation"
+    EVALUATED = "evaluated"
+    REJECTED = "rejected"
+    APPROVED_FOR_MANUAL_TRIAL = "approved_for_manual_trial"
+    ENABLED = "enabled"
+
+
+class _ShrunkProposalStatus(StrEnum):
+    """少了"批准进行人工试验"那条——同样是结构性变化。"""
+
+    DRAFT = "draft"
+    PENDING_EVALUATION = "pending_evaluation"
+    EVALUATED = "evaluated"
+    REJECTED = "rejected"
+
+
+def _always_rejects() -> object:
+    """一个"永远抛 ValueError，但抛的原因与门槛无关"的替身。"""
+
+    class _Guard:
+        def meets_escalation_threshold(self, *, threshold: int = 3) -> bool:
+            del threshold
+            msg = "提案必须至少有一条支撑经验"
+            raise ValueError(msg)
+
+    return _Guard()
 
 
 class TestCheckInventory:
@@ -102,7 +140,7 @@ class TestTheCheckCanActuallyFail:
         assert "threshold=1" in result.detail
 
     def test_i11_notices_an_active_like_status(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """枚举里多出一个表示"已生效"的成员——不变量 11 的类型级保证就此消失。"""
+        """枚举里多出一个**名字就在禁止名单上**的成员。"""
         monkeypatch.setattr(
             selfcheck,
             "AUTO_PROMOTION_FORBIDDEN_VALUES",
@@ -111,6 +149,137 @@ class TestTheCheckCanActuallyFail:
         result = selfcheck._check_i11()
         assert result.ok is False
         assert "draft" in result.detail
+
+    def test_i11_notices_any_new_status_even_with_an_innocent_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """🔴 **主检查是白名单：不认识名字，只认识"集合变了"。**
+
+        上一条用例 monkeypatch 的是**禁止名单本身**，所以它只证明了
+        "检查会读那份名单"，完全没有证明"检查能发现新成员"。
+        实测：给 ``ProposalStatus`` 加一个 ``ENABLED = "enabled"``
+        （语义就是已生效）能同时骗过类型层与兜底层——两层共用同一份
+        四个词的名单，而自检照绿，detail 里还在宣称
+        "7 个提案状态中无一可表示已生效"。
+        """
+        # 替身必须真的只多出那一个成员，否则这条用例证明的是别的东西
+        assert {item.value for item in _ExtendedProposalStatus} == {
+            item.value for item in ProposalStatus
+        } | {"enabled"}
+        monkeypatch.setattr(selfcheck, "ProposalStatus", _ExtendedProposalStatus)
+
+        result = selfcheck._check_i11()
+        assert result.ok is False
+        assert "enabled" in result.detail
+
+    def test_i11_notices_a_removed_status_too(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """少一个状态同样是结构性变化——它可能正是"批准"那一条。"""
+        assert {item.value for item in _ShrunkProposalStatus} == {
+            item.value for item in ProposalStatus
+        } - {"approved_for_manual_trial"}
+        monkeypatch.setattr(selfcheck, "ProposalStatus", _ShrunkProposalStatus)
+
+        result = selfcheck._check_i11()
+        assert result.ok is False
+        assert "approved_for_manual_trial" in result.detail
+
+    def test_the_expected_set_matches_the_real_enum(self) -> None:
+        """预期集合必须与真实枚举一致，否则自检会永远报红。"""
+        assert {item.value for item in ProposalStatus} == EXPECTED_PROPOSAL_STATUSES
+
+    def test_i10_probe_checks_more_than_the_rejection(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """🔴 只捕获"抛 ValueError"的探针，任何一条无关的 ValueError 都能骗过它。
+
+        实测：把 ``meets_escalation_threshold`` 改成
+        ``raise ValueError("提案必须至少有一条支撑经验")``（删掉 threshold<2
+        的守卫，只留一个无关的抛错）之后，初版自检照样报绿，
+        detail 还在宣称"拒绝低于 2 的取值"——它给出了一条**自己没验证过的**断言。
+
+        现在探针还会问正向路径，那个替身在第二次调用时抛出的异常
+        会被 :func:`_guarded` 接住并报为"检查跑不起来"。
+        """
+        monkeypatch.setattr(
+            selfcheck,
+            "ImprovementProposal",
+            lambda **_: _always_rejects(),  # 永远抛，但原因与门槛无关
+        )
+        checks = {item.invariant_id: item for item in check_structural_invariants()}
+        assert checks["I10"].ok is False
+
+    def test_i10_notices_a_threshold_that_nobody_can_pass(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """正向路径也要验：门槛被抬到没人能过，等于永远不产生提案。"""
+
+        class _NeverMeets:
+            def meets_escalation_threshold(self, *, threshold: int = 3) -> bool:
+                if threshold < 2:
+                    msg = "提案门槛不得低于 2"
+                    raise ValueError(msg)
+                return False
+
+        monkeypatch.setattr(selfcheck, "ImprovementProposal", lambda **_: _NeverMeets())
+        result = selfcheck._check_i10()
+        assert result.ok is False
+        assert "未达门槛" in result.detail
+
+    def test_a_crashing_check_is_reported_as_a_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """🔴 检查自己崩了 = 这条保证**没有被验证**，必须以不健康的形式报出来。
+
+        初版让非 ``ValueError`` 的异常直接穿出去：守卫改成抛
+        ``ConstitutionViolationError``（比 ``ValueError`` 更贴切）之后，
+        ``/health/cognitive`` 会返回 **500**，而不是把"地基坏了"
+        报成 ``degraded``——那恰好是这个端点存在的理由。
+        """
+
+        def _explode() -> object:
+            msg = "模拟自检自身崩溃"
+            raise ConstitutionViolationError(msg, invariant_id="I11")
+
+        monkeypatch.setattr(selfcheck, "_check_i11", _explode)
+        checks = selfcheck.check_structural_invariants()
+        i11 = next(item for item in checks if item.invariant_id == "I11")
+        assert i11.ok is False
+        assert "模拟自检自身崩溃" in i11.detail
+
+    def test_a_crashing_check_does_not_take_down_the_health_endpoint(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ai_psi.reliability.health import invariant_dimension
+
+        def _explode() -> object:
+            msg = "模拟自检自身崩溃"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(selfcheck, "_check_i10", _explode)
+        dimension = invariant_dimension()  # 不抛，报 degraded
+        assert dimension.ok is False
+        assert "I10" in dimension.detail
+
+    def test_i01_notices_a_status_that_can_be_written_as_fact(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``can_be_written_as_fact`` 一旦不再恒为 False，自检必须发现。
+
+        这条分支此前从未被任何用例触发过（覆盖率报告里是一个缺口）——
+        而它正是"假设不能被写成事实"这条保证的**最后一层**。
+        """
+
+        class _LeakyHypothesis:
+            def __init__(self, **_: object) -> None:
+                pass
+
+            def can_be_written_as_fact(self) -> bool:
+                return True
+
+        monkeypatch.setattr(selfcheck, "Hypothesis", _LeakyHypothesis)
+        result = selfcheck._check_i01()
+        assert result.ok is False
+        assert "写成事实" in result.detail
 
     def test_i11_notices_a_proposal_that_can_become_active(
         self, monkeypatch: pytest.MonkeyPatch

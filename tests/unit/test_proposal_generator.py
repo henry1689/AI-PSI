@@ -65,6 +65,43 @@ class TestGateIsEnforcedHereToo:
     def test_allowed_decision_produces_a_proposal(self, generator) -> None:
         assert generator.generate(pattern=_pattern(), decision=_allowed()) is not None
 
+    def test_a_decision_without_triggers_produces_nothing(self, generator) -> None:
+        """``allowed=True`` 但没有任何触发条件——自相矛盾的裁决，不产出。"""
+        fabricated = PromotionDecision(allowed=True, triggers=())
+        assert generator.generate(pattern=_pattern(), decision=fabricated) is None
+
+    def test_a_fabricated_decision_cannot_promote_a_single_experience(self, generator) -> None:
+        """🔴 **不变量 10 在生成侧的第二道保险，此前只是一句转发。**
+
+        初版只检查 ``decision.allowed``，于是手工构造一个
+        ``PromotionDecision(allowed=True)`` 加上**一条经验**的模式，
+        就能生成一条可落库的提案——单次经验推广为全局策略。
+
+        现在这里会核对"裁决声称命中的条件，证据撑不撑得起"：
+        声称命中重复、却只有一条经验，那是被构造出来的裁决，必须响。
+        """
+        fabricated = PromotionDecision(
+            allowed=True,
+            triggers=(PromotionTrigger.REPEATED_SAME_ERROR,),
+        )
+        with pytest.raises(ValueError, match="门槛"):
+            generator.generate(pattern=_pattern(count=1), decision=fabricated)
+
+    def test_a_decision_without_a_pattern_produces_nothing(self, generator) -> None:
+        """🔴 没有模式就没有支撑证据，提案无从构造。
+
+        §11.3 的条件三（离线评测暴露稳定退化）可以在没有错误模式的情况下
+        成立——`PromotionPolicy` 会判它 allowed。但提案的核心是它引用的
+        那几条经验；一条没有证据的提案既不能被评估，也不该占用评审时间。
+
+        初版在这里抛 ``AttributeError``（对 ``None`` 取 ``error_type``）。
+        """
+        decision = PromotionPolicy().decide(PromotionEvidence(offline_regression=True))
+        assert decision.allowed is True
+        assert PromotionTrigger.OFFLINE_REGRESSION in decision.triggers
+        # 调用方手里没有模式可传——这正是 `pattern` 参数要允许 None 的原因
+        assert generator.generate(pattern=None, decision=decision) is None
+
 
 class TestDraftStatus:
     def test_status_is_draft(self, generator) -> None:

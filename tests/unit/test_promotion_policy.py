@@ -181,6 +181,29 @@ class TestConditionFourUserCorrections:
         )
         assert PromotionTrigger.USER_CORRECTION_PATTERN in decision.triggers
 
+    def test_the_default_is_not_an_observation(self) -> None:
+        """默认构造出来的证据里，条件 3/4/5 都是"未评估"。"""
+        evidence = PromotionEvidence()
+        assert evidence.offline_regression is None
+        assert evidence.module_streak is None
+        assert evidence.user_corrections is None
+
+    def test_not_observed_is_reported(self, policy) -> None:
+        """🔴 ``None`` 是"未观测"，与 ``0``（观测过、没有）不是一回事。
+
+        条件 4 的计数与条件 5 的连续次数是同一类东西（"观测到的次数"），
+        两者对"未观测"的表达必须一致。
+        """
+        decision = policy.decide(PromotionEvidence())
+        condition_four = next(reason for reason in decision.reasons if reason.startswith("条件四"))
+        assert "未观测" in condition_four
+
+    def test_zero_corrections_is_an_observation_not_an_absence(self, policy) -> None:
+        decision = policy.decide(PromotionEvidence(user_corrections=0))
+        condition_four = next(reason for reason in decision.reasons if reason.startswith("条件四"))
+        assert "未观测" not in condition_four
+        assert "未达门槛" in condition_four
+
     def test_defaults_do_not_trigger(self, policy) -> None:
         assert policy.decide(PromotionEvidence()).allowed is False
 
@@ -197,9 +220,9 @@ class TestConditionFiveModuleStreak:
     def test_zero_streak_is_an_observation_not_an_absence(self, policy) -> None:
         """``0`` 是"看了，没低于阈值"，它与 ``None``（没看）不同。"""
         decision = policy.decide(PromotionEvidence(module_streak=0))
-        joined = "".join(decision.reasons)
-        assert "未观测" not in joined
-        assert "未达门槛" in joined
+        condition_five = next(reason for reason in decision.reasons if reason.startswith("条件五"))
+        assert "未观测" not in condition_five
+        assert "未达门槛" in condition_five
 
     def test_not_observed_is_reported(self, policy) -> None:
         decision = policy.decide(PromotionEvidence(module_streak=None))

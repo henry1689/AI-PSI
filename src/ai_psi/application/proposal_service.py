@@ -44,7 +44,11 @@ from ai_psi.domain.enums import (
     SensitivityLevel,
 )
 from ai_psi.domain.events import Event
-from ai_psi.domain.exceptions import IllegalStateTransitionError, NotFoundError
+from ai_psi.domain.exceptions import (
+    IllegalStateTransitionError,
+    InvalidRequestError,
+    NotFoundError,
+)
 from ai_psi.domain.improvement_proposals import ImprovementProposal
 
 __all__ = [
@@ -217,15 +221,22 @@ class ProposalService:
         Raises:
             NotFoundError: 提案不存在。
             IllegalStateTransitionError: 提案已处于终态。
-            ValueError: ``evidence`` 为空。
+            InvalidRequestError: ``evidence`` 为空，或含有空白项。
         """
-        if not evaluation.evidence:
+        blank = [index for index, item in enumerate(evaluation.evidence) if not item.strip()]
+        if not evaluation.evidence or blank:
+            # 🔴 判据是"**每一条都说了点什么**"，不是"列表长度大于零"。
+            # `evidence=[""]` 的列表长度是 1，落库后正是这个字段要防的
+            # 那类"无法被复核、因而也无法被推翻的记录"。
             msg = (
-                "评估必须给出对照口径（evidence 不得为空）："
+                "评估必须给出对照口径（evidence 不得为空、也不得全是空白）："
                 "「结论：改善」而没有说跟什么比、比了多少个样本，"
                 "是一条无法被复核、因而也无法被推翻的记录"
             )
-            raise ValueError(msg)
+            raise InvalidRequestError(
+                msg,
+                context={"blank_evidence_indexes": blank},
+            )
 
         async with self._uow_factory() as uow:
             proposal = await self._require(uow, proposal_id)
@@ -326,11 +337,16 @@ class ProposalService:
         Raises:
             NotFoundError: 提案不存在。
             IllegalStateTransitionError: 提案尚未评估，或已处于终态。
-            ValueError: 理由为空。
+            InvalidRequestError: 理由为空或只有空白。
+
+        🔴 **空理由抛的是领域异常，不是裸 ``ValueError``。**
+        裸 ``ValueError`` 不在 HTTP 状态映射表里，会让一个纯空白的
+        理由变成 **500 + 一整条堆栈**——把"用户填错了"报成服务端故障，
+        还会触发 `api_unexpected_error` 告警。
         """
         if not reason.strip():
             msg = "驳回必须给出理由：「不想做」与「做不了」对后来者是完全不同的信息"
-            raise ValueError(msg)
+            raise InvalidRequestError(msg, context={"proposal_id": str(proposal_id)})
 
         return await self._transition(
             proposal_id,

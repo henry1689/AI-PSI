@@ -23,9 +23,12 @@ from __future__ import annotations
 from typing import Final
 
 from ai_psi.domain.enums import ApprovalLevel, ErrorType, ProposalStatus
-from ai_psi.domain.improvement_proposals import ImprovementProposal
+from ai_psi.domain.improvement_proposals import (
+    PROPOSAL_ESCALATION_THRESHOLD,
+    ImprovementProposal,
+)
 from ai_psi.learning.pattern_detector import ErrorPattern
-from ai_psi.learning.promotion_policy import PromotionDecision
+from ai_psi.learning.promotion_policy import PromotionDecision, PromotionTrigger
 
 __all__ = ["ProposalGenerator", "triggered_by"]
 
@@ -76,26 +79,57 @@ class ProposalGenerator:
     def generate(
         self,
         *,
-        pattern: ErrorPattern,
+        pattern: ErrorPattern | None,
         decision: PromotionDecision,
         fix_direction: str | None = None,
         created_by: str = "proposal_generator",
     ) -> ImprovementProposal | None:
         """生成一条提案草案。
 
+        🔴 **本层会重新核对裁决与证据是否自洽，不盲信 ``decision``。**
+
+        初版只检查 ``decision.allowed`` 就直接产出提案，于是
+        一个手工构造的 ``PromotionDecision(allowed=True)`` 加上
+        一条经验的模式就能生成提案——"第二道保险"只是一句转发。
+        现在多两问：**裁决列出来的触发条件，证据撑得起吗？**
+
         Args:
-            pattern: 达到门槛的模式。
-            decision: 门槛裁决。**未获准许时返回 ``None``**——
-                这是不变量 10 在生成侧的第二道保险：
-                即使调用方忘了先问门槛，这里也不会产出提案。
+            pattern: 达到门槛的模式。``None`` 表示这次裁决不是由模式
+                触发的（例如"离线评测暴露稳定退化"）——**那种情况下
+                没有支撑证据，也就构造不出提案**，返回 ``None``。
+            decision: 门槛裁决。未获准许时返回 ``None``。
             fix_direction: 严重错误的修复方向（若有）。
             created_by: 产生该提案的组件。
 
         Returns:
-            提案（``status=DRAFT``）；裁决不允许时返回 ``None``。
+            提案（``status=DRAFT``）；无法构造时返回 ``None``。
+
+        Raises:
+            ValueError: 裁决与证据不自洽（见下）。
         """
-        if not decision.allowed:
+        if not decision.allowed or not decision.triggers:
             return None
+
+        if pattern is None:
+            # "离线评测退化"这类触发条件不来自某个错误模式，
+            # 因此没有支撑经验——而提案的核心就是它引用的证据。
+            # 没有证据的提案既不能被评估，也不该占用评审的时间。
+            return None
+
+        if (
+            PromotionTrigger.REPEATED_SAME_ERROR in decision.triggers
+            and pattern.count < PROPOSAL_ESCALATION_THRESHOLD
+        ):
+            # 🔴 这是被**伪造**或**篡改**的裁决，不是运行时状态。
+            # 静默返回 None 会让它看起来像"没什么可生成的"，
+            # 而真相是有人绕过了门槛——那必须响。
+            msg = (
+                f"裁决声称命中「同类错误重复出现」，但模式只支持 "
+                f"{pattern.count} 条（门槛 {PROPOSAL_ESCALATION_THRESHOLD}）。"
+                "这不是运行时状态，而是被构造出来的裁决——"
+                "不变量 10 不允许从它产出提案"
+            )
+            raise ValueError(msg)
 
         error_type = pattern.error_type
         component = _TARGET_COMPONENT[error_type]

@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Final
 from uuid import UUID
@@ -39,8 +40,10 @@ from ai_psi.domain.improvement_proposals import (
 )
 
 __all__ = [
+    "EXPECTED_PROPOSAL_STATUSES",
     "RUNTIME_CHECKED_INVARIANTS",
     "InvariantCheck",
+    "assert_structural_invariants",
     "check_structural_invariants",
     "failing_checks",
 ]
@@ -71,17 +74,68 @@ def _statement_of(invariant_id: str) -> str:
     return "（宪法中未登记）"  # pragma: no cover - 只有改动宪法时才会发生
 
 
+#: ``ProposalStatus`` **应当**恰好包含的成员。
+#:
+#: 🔴 **白名单，不是黑名单。**
+#:
+#: 初版用 ``AUTO_PROMOTION_FORBIDDEN_VALUES``（``active``/``applied``/
+#: ``promoted``/``live`` 四个词）来判断"有没有表示已生效的成员"——
+#: 那是一份**四个词的名单**，不是"状态集合必须恰好是这五个"。
+#: 往枚举里加一个 ``ENABLED = "enabled"``（语义就是已生效）能同时
+#: 骗过类型层与兜底层，而自检照绿、还在 detail 里声称"7 个提案状态中
+#: 无一可表示已生效"。
+#:
+#: 现在改成钉死成员集合：**任何新增都必须在两处同时改**，
+#: 而"给提案加一个能生效的状态"这件事就再也无法悄悄发生。
+EXPECTED_PROPOSAL_STATUSES: Final[frozenset[str]] = frozenset(
+    {
+        "draft",
+        "pending_evaluation",
+        "evaluated",
+        "rejected",
+        "approved_for_manual_trial",
+    }
+)
+
+
 def check_structural_invariants() -> tuple[InvariantCheck, ...]:
     """对全部**可运行期检查**的结构性保证做一次自检。
+
+    🔴 **任何一项检查自己崩掉，都算这项检查未通过。**
+
+    检查的目的是回答"这个保证还在不在"。如果检查代码本身抛了异常，
+    答案是"不知道"——而"不知道"必须以**不健康**的形式报出来，
+    而不是穿到调用方去。
+
+    初版让非 ``ValueError`` 的异常直接穿出：守卫改成抛
+    ``ConstitutionViolationError``（比 ``ValueError`` 更贴切）之后，
+    ``/health/cognitive`` 会返回 **500**，而不是把"地基坏了"报成
+    ``degraded``——那恰好是这个端点存在的理由。
 
     Returns:
         检查结果元组，顺序确定（按不变量编号）。
     """
     return (
-        _check_i01(),
-        _check_i10(),
-        _check_i11(),
+        _guarded("I01", _check_i01),
+        _guarded("I10", _check_i10),
+        _guarded("I11", _check_i11),
     )
+
+
+def _guarded(invariant_id: str, check: Callable[[], InvariantCheck]) -> InvariantCheck:
+    """跑一项检查；它自己崩了就是它没通过。"""
+    try:
+        return check()
+    except Exception as exc:
+        return InvariantCheck(
+            invariant_id=invariant_id,
+            statement=_statement_of(invariant_id),
+            ok=False,
+            detail=(
+                f"自检本身执行失败（{type(exc).__name__}: {exc}）——"
+                "检查跑不起来，就等于这条保证没有被验证"
+            ),
+        )
 
 
 def failing_checks() -> tuple[InvariantCheck, ...]:
@@ -178,77 +232,131 @@ def _check_i10() -> InvariantCheck:
             ),
         )
 
-    # 门槛本身也必须拒绝小于 2 的取值，否则它只是"当前恰好是 3"
-    probe = ImprovementProposal(
+    # 🔴 探针必须**同时**验证正向与负向，否则任何一条无关的 ValueError 都能骗过它。
+    #
+    # 初版只捕获 `threshold=1` 抛出的 ValueError，于是把守卫改成
+    # `raise ValueError("提案必须至少有一条支撑经验")`（删掉 threshold<2 的判断）
+    # 之后自检照样报绿，detail 还在宣称"拒绝低于 2 的取值"——
+    # 它给出了一条**自己没验证过**的断言。
+    #
+    # 现在三问缺一不可：
+    #   1) 单条经验 + threshold=1 → 必须抛（守卫在）；
+    #   2) 单条经验 + 默认门槛 → 必须为 False（门槛是 3，不是说 1 会被拒就完事）；
+    #   3) 三条经验 + 默认门槛 → 必须为 True（正向路径真的通）。
+    one = _probe_proposal(1)
+    three = _probe_proposal(PROPOSAL_ESCALATION_THRESHOLD)
+
+    try:
+        one.meets_escalation_threshold(threshold=1)
+    except ValueError:
+        pass
+    else:
+        return InvariantCheck(
+            invariant_id="I10",
+            statement=_statement_of("I10"),
+            ok=False,
+            detail="meets_escalation_threshold 接受了 threshold=1，单次经验可被推广",
+        )
+
+    if one.meets_escalation_threshold():
+        return InvariantCheck(
+            invariant_id="I10",
+            statement=_statement_of("I10"),
+            ok=False,
+            detail=(
+                f"单条经验在门槛 {PROPOSAL_ESCALATION_THRESHOLD} 下被判为已达到门槛——"
+                "拒绝 threshold=1 只是形式，真正的门槛没有生效"
+            ),
+        )
+
+    if not three.meets_escalation_threshold():
+        return InvariantCheck(
+            invariant_id="I10",
+            statement=_statement_of("I10"),
+            ok=False,
+            detail=(
+                f"{PROPOSAL_ESCALATION_THRESHOLD} 条经验仍判为未达门槛——"
+                "门槛被抬到了没人能过的位置，等于永远不产生提案"
+            ),
+        )
+
+    return InvariantCheck(
+        invariant_id="I10",
+        statement=_statement_of("I10"),
+        ok=True,
+        detail=(
+            f"门槛为 {PROPOSAL_ESCALATION_THRESHOLD}：拒绝低于 2 的取值，"
+            f"单条不达标，{PROPOSAL_ESCALATION_THRESHOLD} 条达标"
+        ),
+    )
+
+
+def _probe_proposal(experience_count: int) -> ImprovementProposal:
+    """构造一个带指定条数支撑经验的自检探针。"""
+    return ImprovementProposal(
         created_by="invariants_check",
         target_component="probe",
         observed_problem="运行期自检",
         error_class=_PROBE_ERROR_TYPE,
         proposed_change="运行期自检",
         expected_benefit="运行期自检",
-    )
-    try:
-        probe.meets_escalation_threshold(threshold=1)
-    except ValueError:
-        return InvariantCheck(
-            invariant_id="I10",
-            statement=_statement_of("I10"),
-            ok=True,
-            detail=f"门槛为 {PROPOSAL_ESCALATION_THRESHOLD}，且拒绝低于 2 的取值",
-        )
-    return InvariantCheck(
-        invariant_id="I10",
-        statement=_statement_of("I10"),
-        ok=False,
-        detail="meets_escalation_threshold 接受了 threshold=1，单次经验可被推广",
+        supporting_experience_ids=[UUID(int=index + 1) for index in range(experience_count)],
     )
 
 
 def _check_i11() -> InvariantCheck:
     """I11：ImprovementProposal 不能自动生效。
 
-    两层检查，缺一不可：
+    三层检查，缺一不可：
 
-    1. **类型层**——试着构造一个"已生效"状态。构造失败本身就是
+    1. **白名单层**——``ProposalStatus`` 的成员集合必须**恰好**等于
+       :data:`EXPECTED_PROPOSAL_STATUSES`。这是主检查：它不认识"已生效"
+       这个词，它只认识"集合变了"。
+    2. **类型层**——试着构造一个"已生效"状态。构造失败本身就是
        "``ProposalStatus`` 里没有这个成员"的直接证据，比读一遍成员列表更硬：
        它验证的是运行期行为，而不是我们**以为**枚举里有什么。
-    2. **兜底层**——宪法里的断言函数是否还拦得住。类型层已经保证了
+    3. **兜底层**——宪法里的断言函数是否还拦得住。类型层已经保证了
        真实状态里构造不出"已生效"，因此这一层只能用一个**鸭子类型的替身**
        来验证：它的存在意义正是"万一类型层被绕过"。
     """
-    forbidden = AUTO_PROMOTION_FORBIDDEN_VALUES
-    present = sorted(item.value for item in ProposalStatus if item.value in forbidden)
-    if present:
+    actual = frozenset(item.value for item in ProposalStatus)
+    added = sorted(actual - EXPECTED_PROPOSAL_STATUSES)
+    removed = sorted(EXPECTED_PROPOSAL_STATUSES - actual)
+    if added or removed:
+        parts: list[str] = []
+        if added:
+            parts.append(f"多出 {added}（其中任何一个都可能就是通往「已生效」的那一个）")
+        if removed:
+            parts.append(f"少了 {removed}")
         return InvariantCheck(
             invariant_id="I11",
             statement=_statement_of("I11"),
             ok=False,
-            detail=f"ProposalStatus 出现了表示「已生效」的成员：{present}",
+            detail=(
+                "ProposalStatus 的成员集合已改变：" + "；".join(parts) + "。"
+                "增删状态必须是一个有意的决定——"
+                "确认之后同步更新 EXPECTED_PROPOSAL_STATUSES 与数据库 CHECK"
+            ),
         )
 
-    probe = ImprovementProposal(
-        created_by="invariants_check",
-        target_component="probe",
-        observed_problem="运行期自检",
-        error_class=_PROBE_ERROR_TYPE,
-        proposed_change="运行期自检",
-        expected_benefit="运行期自检",
+    constructible = sorted(
+        value for value in AUTO_PROMOTION_FORBIDDEN_VALUES if _enum_accepts(ProposalStatus, value)
     )
-    if probe.can_become_active:
-        return InvariantCheck(
-            invariant_id="I11",
-            statement=_statement_of("I11"),
-            ok=False,
-            detail="ImprovementProposal.can_become_active 为 True",
-        )
-
-    constructible = sorted(value for value in forbidden if _enum_accepts(ProposalStatus, value))
     if constructible:
         return InvariantCheck(
             invariant_id="I11",
             statement=_statement_of("I11"),
             ok=False,
             detail=f"可以构造出表示「已生效」的提案状态：{constructible}",
+        )
+
+    probe = _probe_proposal(1)
+    if probe.can_become_active:
+        return InvariantCheck(
+            invariant_id="I11",
+            statement=_statement_of("I11"),
+            ok=False,
+            detail="ImprovementProposal.can_become_active 为 True",
         )
 
     if not _backstop_rejects_active():
@@ -264,7 +372,8 @@ def _check_i11() -> InvariantCheck:
         statement=_statement_of("I11"),
         ok=True,
         detail=(
-            f"{len(list(ProposalStatus))} 个提案状态中无一可表示「已生效」；"
+            f"{len(list(ProposalStatus))} 个提案状态与预期集合逐字相等"
+            f"（{sorted(EXPECTED_PROPOSAL_STATUSES)}）；"
             f"构造 active 会失败；can_become_active 恒为 False；"
             f"宪法兜底断言仍在（拦下替身）"
         ),

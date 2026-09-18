@@ -22,8 +22,54 @@ from pydantic import Field, model_validator
 
 from ai_psi.domain.common import EntityMetadata
 from ai_psi.domain.enums import ApprovalLevel, ErrorType, ProposalStatus
+from ai_psi.domain.exceptions import ConstitutionViolationError
 
-__all__ = ["PROPOSAL_ESCALATION_THRESHOLD", "ImprovementProposal"]
+__all__ = [
+    "PROPOSAL_ESCALATION_THRESHOLD",
+    "ImprovementProposal",
+    "assert_status_is_a_member",
+]
+
+
+def assert_status_is_a_member(proposal: ImprovementProposal) -> None:
+    """🔴 拒绝任何**不是** :class:`ProposalStatus` 成员的状态值。
+
+    本模块的文档说"只要类型里没有 ACTIVE，就不可能有代码把它设进去"。
+    这句话在一个地方不成立：``model_construct``。
+
+    ```python
+    ImprovementProposal.model_construct(status="active")   # 成功
+    ```
+
+    ``model_construct`` 会跳过全部校验，构造出一个 ``status`` 是**裸字符串**
+    ``"active"`` 的提案。类型注解拦不住它，``model_validate`` 也不会被调用。
+
+    因此"类型里没有"必须再补一道**运行期**的检查，位置就在对象变成
+    持久化数据的那一刻——仓储层。内存实现此前会把它原样存下来并读回，
+    SQL 实现则会以一个 `AttributeError: 'str' object has no attribute 'value'`
+    崩溃——**两种都不是"有意拦截"**。
+
+    Raises:
+        ConstitutionViolationError: 状态不是枚举成员。
+    """
+    # ⚠️ 先赋给 `object` 再判断：直接写 `isinstance(proposal.status, ...)`
+    # 会被静态检查判为"恒真"，因而把下面的分支标成不可达——
+    # 而这条检查针对的恰恰是**静态检查看不见的那个构造方式**。
+    status: object = proposal.status
+    if isinstance(status, ProposalStatus):
+        return
+    msg = (
+        f"提案 {proposal.id} 的 status 不是 ProposalStatus 的成员："
+        f"{status!r}（类型 {type(status).__name__}）。"
+        "这通常意味着对象是用 model_construct 绕开校验构造的——"
+        "不变量 11 要求提案状态只能是枚举里那五个值之一"
+    )
+    raise ConstitutionViolationError(
+        msg,
+        invariant_id="I11",
+        context={"proposal_id": str(proposal.id), "status_repr": repr(status)},
+    )
+
 
 #: 同类错误达到该次数才允许产生提案（任务书 §11.3）。
 #: 这是不变量 10 的**数值落点**——改成 1 就等于允许单次经验推广为策略。

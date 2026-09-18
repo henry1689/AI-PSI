@@ -161,6 +161,34 @@ class TestEvaluate:
         response = await _evaluate(client, proposal_id, evidence=[])
         assert response.status_code == 422
 
+    @pytest.mark.parametrize("blank", [[""], ["   "], ["历史回放 200 回合", "  "]])
+    async def test_blank_evidence_items_are_rejected(
+        self, client: httpx.AsyncClient, blank: list[str]
+    ) -> None:
+        """🔴 判据是"**每一条都说了点什么**"，不是"列表长度大于零"。
+
+        `evidence=[""]` 的列表长度是 1，会带着一句空白被永久写进事件负载——
+        而它正是这个字段要防的那类"无法被复核的记录"。
+        """
+        proposal_id = await _seed(client)
+        response = await _evaluate(client, proposal_id, evidence=blank)
+        assert response.status_code == 422
+
+    async def test_an_over_long_actor_id_is_rejected_not_a_500(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """🔴 请求 schema 接受的长度必须 ≤ 事件表的列宽。
+
+        事件表的 `actor_id` 是 `varchar(128)`。schema 只写 `min_length=1`
+        时，同一个请求在**内存后端成功、在 PostgreSQL 后端 500**——
+        两个后端对同一个 HTTP 契约给出不同结果，而契约测试只看仓储层，
+        抓不到这条。
+        """
+        proposal_id = await _seed(client)
+        response = await _evaluate(client, proposal_id, actor_id="x" * 200)
+        assert response.status_code == 422
+        assert "internal_error" not in response.text
+
     async def test_unknown_proposal_is_404(self, client: httpx.AsyncClient) -> None:
         assert (await _evaluate(client, uuid4())).status_code == 404
 
@@ -227,14 +255,49 @@ class TestApprovalRequiresEvaluation:
 
 
 class TestReject:
-    async def test_rejection_requires_a_reason(self, client: httpx.AsyncClient) -> None:
+    @pytest.mark.parametrize("reason", ["", "   ", "\t"])
+    async def test_rejection_requires_a_reason(
+        self, client: httpx.AsyncClient, reason: str
+    ) -> None:
+        """🔴 空白理由必须是 422，**不能是 500**。
+
+        服务层的判据是 `not reason.strip()`，而 schema 上是 `min_length=1`——
+        两层判据不一致时，`"   "` 会走到服务层抛出的异常那里；
+        如果那个异常是裸 `ValueError`，它不在 HTTP 状态映射表里，
+        结果是一个用户输入造成的 **500 + 一整条堆栈**。
+        """
         proposal_id = await _seed(client)
         await _evaluate(client, proposal_id)
         response = await client.post(
             f"{API_PREFIX}/improvement-proposals/{proposal_id}/reject",
-            json={"rejected_by": "评审", "reason": ""},
+            json={"rejected_by": "评审", "reason": reason},
+        )
+        assert response.status_code == 422, response.text
+        assert "internal_error" not in response.text
+
+    async def test_a_blank_reason_does_not_mask_a_state_error(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """空白理由在 DRAFT（本该 409）上也不该变成 500。"""
+        proposal_id = await _seed(client)
+        response = await client.post(
+            f"{API_PREFIX}/improvement-proposals/{proposal_id}/reject",
+            json={"rejected_by": "评审", "reason": "   "},
+        )
+        assert response.status_code in {409, 422}
+        assert "internal_error" not in response.text
+
+    async def test_an_over_long_reviewer_id_is_rejected_not_a_500(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        proposal_id = await _seed(client)
+        await _evaluate(client, proposal_id)
+        response = await client.post(
+            f"{API_PREFIX}/improvement-proposals/{proposal_id}/reject",
+            json={"rejected_by": "x" * 200, "reason": "对照指标预计会退化"},
         )
         assert response.status_code == 422
+        assert "internal_error" not in response.text
 
     async def test_rejection_after_evaluation(self, client: httpx.AsyncClient) -> None:
         proposal_id = await _seed(client)

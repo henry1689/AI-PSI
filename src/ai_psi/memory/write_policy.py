@@ -187,6 +187,21 @@ class WritePolicy:
         Returns:
             裁决结果。
         """
+        if not proposal.content.strip():
+            # 🔴 策略放行的东西，下游必须**能构造出一个 Memory**。
+            #
+            # 空白内容连 `Memory` 都构造不出来（`content` 有 min_length=1），
+            # 让策略对它说"批准"等于把失败推迟到一个更晚、更难看的位置：
+            # 应用服务会撞上 pydantic 的 ValidationError，而那不是一个
+            # 领域异常，最终表现为 **500**——一次用户输入被报成服务端故障。
+            return WritePolicyDecision(
+                decision=WriteDecision.REJECTED,
+                reasons=(
+                    "内容为空（或只有空白字符）",
+                    "空白内容连一条记忆都构造不出来，在策略层拒绝它比让下游崩溃早一步",
+                ),
+            )
+
         forbidden = _matched_forbidden_class(proposal.content)
         if forbidden is not None:
             return WritePolicyDecision(

@@ -141,7 +141,11 @@ INVARIANTS: Final[tuple[Invariant, ...]] = (
     Invariant(
         "I12",
         "认知宪法不能被学习模块修改",
-        "本模块常量为 Final/不可变；learning/ 只读（阶段 6 导入依赖测试固定）",
+        (
+            "本模块常量为 Final/不可变；learning/ 只从本模块**读取**"
+            "（由 tests/unit/test_learning_constitution_boundary.py 的导入扫描与"
+            "指纹前后比对共同固定）"
+        ),
         1,
     ),
     Invariant(

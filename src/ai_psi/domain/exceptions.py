@@ -24,6 +24,7 @@ __all__ = [
     "ConstitutionViolationError",
     "DomainError",
     "IllegalStateTransitionError",
+    "InvalidRequestError",
     "InvariantViolationError",
     "NotFoundError",
     "OptimisticLockError",
@@ -239,6 +240,25 @@ class NotFoundError(ApplicationError):
     """
 
     default_code = "not_found"
+
+
+class InvalidRequestError(ApplicationError):
+    """请求语义无效——**schema 挡不住的、由调用方负责的那一类**。
+
+    🔴 **这个类型的存在理由：不能拿裸 ``ValueError`` 表示"输入不对"。**
+
+    ``ValueError`` 不是 :class:`AIPsiError`，所以它不在
+    :data:`~ai_psi.api.errors.HTTP_STATUS_BY_EXCEPTION` 里——
+    一个纯空白的驳回理由会让 API 返回 **500 并打一整条堆栈**，
+    把"用户填错了"报成"服务端故障"。
+
+    它与 pydantic 的 schema 校验的分工是：
+    schema 管**形状**（长度、类型、枚举取值），这里管**语义**
+    （"长度 ≥ 1 但全是空格"、"驳回必须给出理由"）。
+    两者都应当以 4xx 结束。
+    """
+
+    default_code = "invalid_request"
 
 
 class ConflictError(ApplicationError):

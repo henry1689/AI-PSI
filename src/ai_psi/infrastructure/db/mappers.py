@@ -41,7 +41,6 @@ from ai_psi.infrastructure.db.models import (
 __all__ = [
     "apply_event",
     "apply_memory",
-    "apply_proposal",
     "apply_round",
     "memory_to_row",
     "memory_to_values",
@@ -392,13 +391,6 @@ def proposal_to_row(proposal: ImprovementProposal) -> ImprovementProposalRow:
     values = proposal_to_values(proposal)
     values["id"] = proposal.id
     return ImprovementProposalRow(**values)
-
-
-def apply_proposal(row: ImprovementProposalRow, proposal: ImprovementProposal) -> None:
-    """把领域提案的全部字段写入已存在的 ORM 行。"""
-    row.id = proposal.id
-    for column, value in proposal_to_values(proposal).items():
-        setattr(row, column, value)
 
 
 def row_to_proposal(row: ImprovementProposalRow) -> ImprovementProposal:

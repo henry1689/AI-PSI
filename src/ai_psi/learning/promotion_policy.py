@@ -96,6 +96,9 @@ class PromotionEvidence:
         module_streak: 同一模块连续低于阈值的次数。
             ``None`` 表示**未观测**（与 ``0`` 不同）。
         user_corrections: 用户纠正的次数。
+            ``None`` 表示**未观测**（与 ``0`` 不同）——它与
+            ``module_streak`` 是同一类东西（"观测到的次数"），
+            两者对"未观测"的表达必须一致。
         user_correction_shows_systemic_issue: 这些纠正是否指向
             系统性问题（而不是单次口误）。
     """
@@ -104,7 +107,7 @@ class PromotionEvidence:
     fix_direction: str | None = None
     offline_regression: bool | None = None
     module_streak: int | None = None
-    user_corrections: int = 0
+    user_corrections: int | None = None
     user_correction_shows_systemic_issue: bool = False
 
 
@@ -259,6 +262,12 @@ class PromotionPolicy:
         triggers: list[PromotionTrigger],
         reasons: list[str],
     ) -> None:
+        if evidence.user_corrections is None:
+            reasons.append(
+                "条件四（用户纠正显示系统性问题）：**未观测**——"
+                "没有接入用户纠正计数的调用方，不要用 0 冒充「观测过且没有」"
+            )
+            return
         if evidence.user_corrections < self._threshold:
             reasons.append(
                 f"条件四（用户纠正显示系统性问题）：用户纠正 "

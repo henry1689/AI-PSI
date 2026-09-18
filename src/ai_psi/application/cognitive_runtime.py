@@ -69,6 +69,7 @@ from ai_psi.domain.enums import (
     CognitiveDepth,
     ErrorType,
     EventType,
+    OrdinalLevel,
     RoundState,
     SensitivityLevel,
     SourceType,
@@ -87,7 +88,8 @@ from ai_psi.domain.judgments import Judgment
 from ai_psi.domain.memories import Memory
 from ai_psi.domain.observations import Observation
 from ai_psi.domain.reflections import Reflection
-from ai_psi.learning.error_classifier import STAGE_ERROR_CATEGORY
+from ai_psi.learning.error_classifier import STAGE_ERROR_CATEGORY, ErrorSignals
+from ai_psi.learning.experience_builder import ExperienceBuilder, RoundRecord
 from ai_psi.prompts.registry import PromptRegistry
 from ai_psi.prompts.schemas import ResponsePlan
 from ai_psi.providers.base import LLMProvider
@@ -417,6 +419,10 @@ class _RoundExecution:
             tail_reserve=_initial_tail_reserve(_INITIAL_BUDGET_DEPTH),
         )
         self._gateway = self._make_gateway()
+        # 🔴 学习链路在这里接上。在此之前 `ExperienceBuilder` 在生产里
+        # **没有任何调用者**，回合结束写的是硬编码负载——于是每一条经验
+        # 都不可归因，模式发现永远沉默（见 `_close_round` 的文档）。
+        self._experience_builder = ExperienceBuilder()
 
     # ------------------------------------------------------------------
     # 总入口
@@ -1083,35 +1089,103 @@ class _RoundExecution:
         await self._close_round()
 
     async def _close_round(self) -> None:
-        """回合正常结束后的收尾：生成 Experience 记录。
+        """回合正常结束后的收尾：构建 ``Experience`` 记录。
 
-        ⚠️ 阶段 3 的实现是**最小版本**：它记录"这次回合发生了什么"，
-        但还不做错误归因（``error_type`` 恒为 ``None``）。
-        完整的经验构建与错误分类属于阶段 6（ADR-0009 的同一模式）。
+        🔴 **阶段 6 起走真正的学习链路。**
+
+        阶段 3 的实现手写事件负载，把 ``error_type`` 与
+        ``attribution_confidence`` **硬编码**成 ``None`` / ``"very_low"``。
+        那意味着生产里产出的每一条经验都不可归因，而
+        :class:`~ai_psi.learning.pattern_detector.PatternDetector` 会把
+        不可归因的经验全部过滤掉——于是"三次同类错误生成提案"这条
+        验收条件在**跑起来的系统里永远不可能发生**。
+        现在归因由 :class:`~ai_psi.learning.error_classifier.ErrorClassifier`
+        按确定性判据做，理由随事件一起留档。
+
+        ⚠️ **``applicable_conditions`` 与 ``counterexamples`` 刻意留空。**
+
+        它们看着像是该从 ``Judgment.applicability`` 与
+        ``strongest_counterarguments`` 填进来的——但后者是**模型输出**，
+        填进去就等于让模型的措辞进入学习链路，并随事件永久留档
+        （ADR-0018 §1 的边界）。本方法只填**结构信号**：
+        情境签名、模块名、证据 id。
         """
         if not self._request.allow_long_term_memory:
             return
-        experience = {
-            "cognitive_round_id": str(self._round_id),
-            "judgment_id": str(self._state.judgment.id) if self._state.judgment else None,
-            "situation_signature": _situation_signature(
+        judgment = self._state.judgment
+        if judgment is None:
+            # 没有判断就没有"当时判断得对不对"这回事，经验无从谈起。
+            return
+
+        record = RoundRecord(
+            cognitive_round_id=self._round_id,
+            judgment_id=judgment.id,
+            situation_signature=_situation_signature(
                 depth=self._state.depth,
                 evidence_count=len(self._request.evidence),
                 hypothesis_count=len(self._state.hypotheses),
             ),
-            "inquiry_type": (
+            inquiry_type=(
                 self._state.inquiry.expected_output_type.value
                 if self._state.inquiry is not None
                 else "unknown"
             ),
-            "stop_reason": self._state.round_.stop_reason,
-            "error_type": None,
-            "attribution_confidence": "very_low",
-        }
+            # 🔴 **判断发生时**就已掌握的证据。它区分"当时判断错了"与
+            # "当时信息本就不足"——少了它，系统会把所有后来被推翻的
+            # 判断都记成错误，从而学到"这类问题要更保守"。
+            evidence_ids=tuple(item.id for item in self._request.evidence),
+            # 模块名（结构标签），不是模型的措辞
+            strategy_used=tuple(sorted(self._state.analysis_signature)),
+        )
+        experience, attribution = self._experience_builder.build(
+            record=record, signals=self._error_signals()
+        )
+
+        payload = experience.model_dump(mode="json")
+        payload["stop_reason"] = self._state.round_.stop_reason
+        # 归因理由一并留档：只把 error_type 存下来，理由就丢了，
+        # 而**不可解释的归因日后无法被推翻**。
+        payload["attribution_reasons"] = list(attribution.reasons)
+
         await self._record(
             event_type=EventType.EXPERIENCE_CREATED,
             actor_id="cognitive_runtime",
-            payload={"experience": experience},
+            payload={"experience": payload},
+        )
+
+    def _error_signals(self) -> ErrorSignals:
+        """把本回合的可观察状态翻译成归因判据。
+
+        🔴 **只翻译结构信号，不翻译任何文本。**
+
+        ⚠️ ``budget_exhausted`` 恒为 ``False``，这是有意的：
+        ``StopReason.BUDGET_CONSTRAINT`` 表示"元认知判定预算不足以
+        再跑一轮"——**那是正常收尾，不是流程没跑完**
+        （:class:`~ai_psi.cognition.metacognition.StopReason` 的文档原话）。
+        真正的预算击穿走的是 ``_fail`` 那条路径，根本不经过本方法。
+        把它当作"预算耗尽"上报，会让每一个受预算约束的正常回合
+        都被归成过程错误，进而淹没整个模式发现。
+        """
+        reflection = self._state.reflection
+        judgment = self._state.judgment
+        if reflection is None:
+            return ErrorSignals(
+                round_state=self._state.round_.state,
+                uncertainty_type=judgment.uncertainty_type if judgment else None,
+                epistemic_action=judgment.recommended_epistemic_action if judgment else None,
+            )
+
+        return ErrorSignals(
+            round_state=self._state.round_.state,
+            scope_drift_detected=reflection.scope_drift_detected,
+            unsupported_certainty_detected=reflection.unsupported_certainty_detected,
+            missing_counterexample_detected=reflection.missing_counterexample_detected,
+            high_confirmation_bias=reflection.confirmation_bias_risk.at_least(OrdinalLevel.HIGH),
+            high_user_pleasing_bias=reflection.user_pleasing_bias_risk.at_least(OrdinalLevel.HIGH),
+            uncertainty_type=judgment.uncertainty_type if judgment else None,
+            epistemic_action=judgment.recommended_epistemic_action if judgment else None,
+            # 反馈在回合结束后才到达，此刻还没有——它经由
+            # `FeedbackService` 单独进入学习链路。
         )
 
     # ------------------------------------------------------------------

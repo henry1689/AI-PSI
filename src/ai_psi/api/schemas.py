@@ -18,7 +18,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ai_psi.application.feedback_service import MemoryEffect
 from ai_psi.domain.enums import (
@@ -69,6 +69,23 @@ __all__ = [
 ]
 
 _STRICT = ConfigDict(extra="forbid")
+
+#: 请求体的配置：额外字段一律拒绝，**并且去掉字符串首尾空白**。
+#:
+#: 🔴 `min_length=1` 挡不住 `"   "`。
+#:
+#: 这是被真实攻击面验证过的一条：`content="   "` 过得了 `min_length=1`，
+#: 然后在下游撞出一个 pydantic `ValidationError`（`Memory.content` 也是
+#: `min_length=1`，但它在**去空白之后**为空）——那不是领域异常，
+#: 最终表现为 **500**。用户输入造成的 500 一律是缺陷。
+_STRICT_TRIMMED = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+#: 事件表里 `actor_id` 列的长度。
+#:
+#: 请求 schema 接受的长度必须 ≤ 它，否则同一个请求在内存后端成功、
+#: 在 PostgreSQL 后端因为 `value too long for type character varying(128)`
+#: 炸成 500——**两个后端对同一个 HTTP 契约给出不同结果**。
+_ACTOR_ID_MAX = 128
 
 
 # ---------------------------------------------------------------------------
@@ -431,10 +448,13 @@ class UserDataDeletionResponse(BaseModel):
 class FeedbackRequest(BaseModel):
     """对某个认知回合的反馈。"""
 
-    model_config = _STRICT
+    model_config = _STRICT_TRIMMED
 
     feedback_type: FeedbackType = Field(description="反馈类型")
-    content: str = Field(min_length=1, description="反馈正文")
+    content: str = Field(
+        min_length=1,
+        description=("反馈正文。⚠️ 首尾空白会被去掉，因此「   」是一个 422 而不是一个 500"),
+    )
     related_claim: str | None = Field(
         default=None,
         description="用户指出的、被纠正的具体说法",
@@ -535,7 +555,7 @@ class ProposalListResponse(BaseModel):
 class EvaluateProposalRequest(BaseModel):
     """记录一次离线评估。"""
 
-    model_config = _STRICT
+    model_config = _STRICT_TRIMMED
 
     verdict: EvaluationVerdict = Field(
         description="评估结论。⚠️ inconclusive 是「看不出」而不是「没差」，它是必须存在的选项"
@@ -543,13 +563,28 @@ class EvaluateProposalRequest(BaseModel):
     evidence: list[str] = Field(
         min_length=1,
         description=(
-            "对照口径、样本量、参照版本。**不得为空**——"
+            "对照口径、样本量、参照版本。**不得为空、也不得全是空白**——"
             "「结论：改善」而没说跟什么比、比了多少个样本，"
             "是一条无法被复核、因而也无法被推翻的记录"
         ),
     )
     notes: str | None = Field(default=None, description="评审说明")
-    actor_id: str = Field(default="reviewer", min_length=1)
+    actor_id: str = Field(default="reviewer", min_length=1, max_length=_ACTOR_ID_MAX)
+
+    @field_validator("evidence")
+    @classmethod
+    def _evidence_items_must_say_something(cls, value: list[str]) -> list[str]:
+        """🔴 逐条校验，而不只看列表长度。
+
+        `min_length=1` 只保证"有一项"，保证不了"那一项说了什么"——
+        `evidence=["   "]` 会带着一句空白被永久写进事件负载，
+        而它正是这个字段要防的那类"无法被复核的记录"。
+        """
+        blank = [index for index, item in enumerate(value) if not item.strip()]
+        if blank:
+            msg = f"evidence 的第 {blank} 项是空白——没有对照口径的结论无法被复核"
+            raise ValueError(msg)
+        return value
 
 
 class ProposalTransitionResponse(BaseModel):
@@ -571,19 +606,22 @@ class ProposalTransitionResponse(BaseModel):
 class ApproveProposalRequest(BaseModel):
     """批准进行人工试验。"""
 
-    model_config = _STRICT
+    model_config = _STRICT_TRIMMED
 
-    approved_by: str = Field(min_length=1, description="批准人标识")
+    approved_by: str = Field(min_length=1, max_length=_ACTOR_ID_MAX, description="批准人标识")
     note: str | None = Field(default=None, description="批准说明")
 
 
 class RejectProposalRequest(BaseModel):
     """驳回提案。"""
 
-    model_config = _STRICT
+    model_config = _STRICT_TRIMMED
 
-    rejected_by: str = Field(min_length=1, description="驳回人标识")
+    rejected_by: str = Field(min_length=1, max_length=_ACTOR_ID_MAX, description="驳回人标识")
     reason: str = Field(
         min_length=1,
-        description="驳回理由。**必填**：「不想做」与「做不了」对后来者是完全不同的信息",
+        description=(
+            "驳回理由。**必填**：「不想做」与「做不了」对后来者是完全不同的信息。"
+            "⚠️ 首尾空白会被去掉，因此「   」是一个 422"
+        ),
     )

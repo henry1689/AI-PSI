@@ -27,6 +27,7 @@ from ai_psi.domain.enums import (
 from ai_psi.domain.events import Event
 from ai_psi.domain.exceptions import (
     ConflictError,
+    ConstitutionViolationError,
     NotFoundError,
     OptimisticLockError,
 )
@@ -393,6 +394,18 @@ def _proposal(**overrides: object) -> ImprovementProposal:
     return ImprovementProposal(**payload)  # type: ignore[arg-type]
 
 
+def _forged_proposal_payload(status: str) -> dict[str, object]:
+    """构造一份给 ``model_construct`` 用的完整负载。
+
+    ``model_construct`` 不填默认值，因此每个字段都得给。
+    ``status`` 刻意传**裸字符串**——这正是它要模拟的绕过方式。
+    """
+    base = _proposal()
+    payload = base.model_dump()
+    payload["status"] = status
+    return payload
+
+
 #: 契约测试里显式指定的时间戳基准。
 #:
 #: 🔴 **不能依赖"创建时自然产生的 created_at"。**
@@ -443,12 +456,84 @@ class ProposalRepositoryContract:
         两条并发的状态流转（"批准"与"驳回"同时到达）如果后者覆盖了前者，
         结果是一条提案**同时**被批准和驳回，而事件流里两条理由都在。
         乐观锁在这里不是性能优化，是正确性要求。
+
+        ⚠️ **"过期"必须是真实存在过的那个版本，不能是凭空造的数。**
+
+        初版用的是 ``expected_version=proposal.version + 5``（1 → 6），
+        那是一个**从未存在过**的版本号。把 ``save`` 改成
+        ``if expected_version > current.version: raise`` 之后，
+        真实的过期写入（``expected=1`` 而库里已是 2）会被静默接受、
+        覆盖掉先提交的那次流转——而这条用例照绿。
+
+        这里走真实路径：先读（v1）→ 别人写成功（v2）→ 拿 v1 去写。
         """
         proposal = _proposal()
         await proposal_repository.add(proposal)
-        approved = proposal.bumped(status=ProposalStatus.APPROVED_FOR_MANUAL_TRIAL)
+
+        stale = proposal  # 第一个写入者读到的版本（v1）
+        await proposal_repository.save(
+            proposal.bumped(status=ProposalStatus.PENDING_EVALUATION),
+            expected_version=proposal.version,
+        )
+
         with pytest.raises(OptimisticLockError):
-            await proposal_repository.save(approved, expected_version=proposal.version + 5)
+            await proposal_repository.save(
+                stale.bumped(status=ProposalStatus.REJECTED),
+                expected_version=stale.version,
+            )
+
+    async def test_a_stale_write_does_not_change_the_stored_status(
+        self, proposal_repository
+    ) -> None:
+        """过期的写入失败之后，库里必须仍是**先到**的那个状态。"""
+        proposal = _proposal()
+        await proposal_repository.add(proposal)
+        stale = proposal
+        await proposal_repository.save(
+            proposal.bumped(status=ProposalStatus.PENDING_EVALUATION),
+            expected_version=proposal.version,
+        )
+
+        with pytest.raises(OptimisticLockError):
+            await proposal_repository.save(
+                stale.bumped(status=ProposalStatus.REJECTED),
+                expected_version=stale.version,
+            )
+
+        stored = await proposal_repository.get(proposal.id)
+        assert stored is not None
+        assert stored.status is ProposalStatus.PENDING_EVALUATION
+
+    async def test_a_status_that_is_not_an_enum_member_is_refused(
+        self, proposal_repository
+    ) -> None:
+        """🔴 ``model_construct`` 绕得过 pydantic，绕不过仓储。
+
+        ``ImprovementProposal.model_construct(status="active")`` 造出的对象
+        的 ``status`` 是一个**裸字符串**——类型注解拦不住它
+        （`model_construct` 跳过全部校验）。内存实现此前会把它原样存下
+        并读回；SQL 实现会以 ``AttributeError: 'str' object has no attribute
+        'value'`` 崩溃。**两种都不是"有意拦截"。**
+        """
+        forged = ImprovementProposal.model_construct(**_forged_proposal_payload("active"))  # type: ignore[arg-type]
+        with pytest.raises(ConstitutionViolationError):
+            await proposal_repository.add(forged)
+
+    async def test_a_forged_status_cannot_be_saved_over_an_existing_one(
+        self, proposal_repository
+    ) -> None:
+        proposal = _proposal()
+        await proposal_repository.add(proposal)
+        payload = _forged_proposal_payload("active")
+        payload["id"] = proposal.id
+        payload["version"] = proposal.version + 1
+        forged = ImprovementProposal.model_construct(**payload)  # type: ignore[arg-type]
+
+        with pytest.raises(ConstitutionViolationError):
+            await proposal_repository.save(forged, expected_version=proposal.version)
+        stored = await proposal_repository.get(proposal.id)
+        assert stored is not None
+        assert stored.status is ProposalStatus.DRAFT
 
     async def test_save_unknown_proposal_raises_not_found(self, proposal_repository) -> None:
         with pytest.raises(NotFoundError):

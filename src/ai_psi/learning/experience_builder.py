@@ -23,7 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from uuid import UUID
 
-from ai_psi.domain.enums import SensitivityLevel, VerificationStatus
+from ai_psi.domain.enums import VerificationStatus
 from ai_psi.domain.experiences import Experience
 from ai_psi.learning.error_classifier import ErrorAttribution, ErrorClassifier, ErrorSignals
 
@@ -66,9 +66,13 @@ class RoundRecord:
     缺少条件限制的经验极易被过度推广；反例则是阻止它被过度推广的
     主要手段。两者都由调用方提供——本模块不替调用方决定
     "这条经验在什么范围内成立"。
-    """
 
-    sensitivity: SensitivityLevel = SensitivityLevel.INTERNAL
+    ⚠️ **这两栏放的是短的结构化标签，不是自由文本。**
+    它们会原样进入 ``Experience``、被模式发现汇总、并最终列进提案的
+    ``applicability`` 持久化。放一段用户原话进去，它就跟着进了
+    只追加的事件表。本模块没有机制拦住这件事——它靠的是调用方
+    不往这里填原文（见 ADR-0018 §1 的"残余风险"）。
+    """
 
 
 class ExperienceBuilder:
@@ -127,6 +131,11 @@ class ExperienceBuilder:
             strategy_used=list(record.strategy_used),
             applicable_conditions=list(record.applicable_conditions),
             counterexamples=list(record.counterexamples),
+            # 🔴 **反馈以类型进入经验。** 初版漏了这一行，于是
+            # ``actual_feedback`` 永远是空列表、``summarise_feedback``
+            # 在生产里没有任何调用者——"反馈以类型参与学习"就只剩
+            # 归因那一条路，经验本身记不住"这一条是从哪种反馈来的"。
+            actual_feedback=list(self.summarise_feedback(signals)),
             verification_status=VerificationStatus.UNVERIFIED,
         )
         return experience, attribution
@@ -136,11 +145,13 @@ class ExperienceBuilder:
 
         🔴 **摘要里只有类型，没有原文。**
 
-        ``Experience.actual_feedback`` 是一个会被跨回合聚合的字段
-        （模式发现要按它分组）。把用户原文放进去有两个后果：
-        一是学习链路里从此带着用户隐私，二是分组结果会随措辞变化——
-        "你理解错了"和"我没这个意思"会被当成两种不同的反馈，
-        而它们说的是同一件事。
+        把用户原文放进去有两个后果：一是学习链路里从此带着用户隐私，
+        二是同一件事会因为措辞不同而被当成两件事——
+        「你理解错了」和「我没这个意思」说的是同一个意思。
+
+        ⚠️ 模式发现当前**不按这个字段分组**（它按
+        ``(错误类别, 情境签名)``）。``actual_feedback`` 的价值在于
+        记录"这条经验是从哪种反馈来的"，供人工复盘与后续版本使用。
 
         Args:
             signals: 归因输入。

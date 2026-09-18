@@ -19,6 +19,14 @@
 
 ---
 
+> ⚠️ **本 ADR 有三处表述已被 [ADR-0019](0019-stage-6-independent-review.md) §3 修正**：
+> §1 的"没有任何一栏能装下用户消息/模型输出/反馈正文"、
+> §5 的"服务层抛 `ValueError`、API 上是 422"、
+> §8 的"数据库 CHECK 由枚举生成、自动保持同步"。
+> 原文保留（ADR 不修改内容），阅读时以 0019 为准。
+
+---
+
 ## 1. 学习链路不接收自由文本
 
 `RoundRecord` 与 `ErrorSignals`（`learning/error_classifier.py`、

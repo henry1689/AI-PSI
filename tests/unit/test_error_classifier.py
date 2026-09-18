@@ -63,7 +63,11 @@ class TestNoAttribution:
     def test_every_attribution_carries_reasons(self, classifier: ErrorClassifier) -> None:
         """带类别的归因不允许空理由——不可解释的归因日后无法被推翻。"""
         samples = [
-            _signals(failure_category=ErrorType.FACTUAL_ERROR, failure_stage="analyze"),
+            _signals(
+                round_state=RoundState.FAILED,
+                failure_category=ErrorType.FACTUAL_ERROR,
+                failure_stage="analyze",
+            ),
             _signals(budget_exhausted=True),
             _signals(memory_write_rejected=True),
             _signals(scope_drift_detected=True),
@@ -97,13 +101,19 @@ class TestFailureRule:
 
     def test_reason_names_the_stage(self, classifier: ErrorClassifier) -> None:
         attribution = classifier.classify(
-            _signals(failure_category=ErrorType.SCOPE_ERROR, failure_stage="frame")
+            _signals(
+                round_state=RoundState.FAILED,
+                failure_category=ErrorType.SCOPE_ERROR,
+                failure_stage="frame",
+            )
         )
         assert any("frame" in reason for reason in attribution.reasons)
 
     def test_missing_stage_still_classifies(self, classifier: ErrorClassifier) -> None:
         """阶段名缺失不该让归因失败——类别是已知的，阶段只是补充信息。"""
-        attribution = classifier.classify(_signals(failure_category=ErrorType.EVIDENCE_ERROR))
+        attribution = classifier.classify(
+            _signals(round_state=RoundState.FAILED, failure_category=ErrorType.EVIDENCE_ERROR)
+        )
         assert attribution.error_type is ErrorType.EVIDENCE_ERROR
 
     def test_failure_rule_outranks_structural_signals(self, classifier: ErrorClassifier) -> None:
@@ -117,6 +127,25 @@ class TestFailureRule:
             )
         )
         assert attribution.error_type is ErrorType.EVIDENCE_ERROR
+
+    def test_a_completed_round_is_not_a_failure(self, classifier: ErrorClassifier) -> None:
+        """🔴 **失败类别只在回合真的失败时才算数。**
+
+        ``CognitiveRound`` 只要求 ``FAILED`` 时必填
+        ``failure_stage`` / ``error_category``，**没有禁止**其他状态携带它们。
+        只看"类别非空"的话，一个终态是 ``COMPLETED`` 却带着失败类别的回合
+        会被归成失败——理由栏还会写下「回合在「respond」阶段失败
+        （终态 completed）」这种自相矛盾的句子，而它会作为一次真实错误
+        进入模式发现。
+        """
+        attribution = classifier.classify(
+            _signals(
+                round_state=RoundState.COMPLETED,
+                failure_category=ErrorType.EXPRESSION_ERROR,
+                failure_stage="respond",
+            )
+        )
+        assert attribution.error_type is None
 
 
 class TestStructuralSignals:

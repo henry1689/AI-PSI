@@ -163,8 +163,21 @@ class ErrorClassifier:
     # ------------------------------------------------------------------
 
     def _from_failure(self, signals: ErrorSignals) -> ErrorAttribution | None:
-        """回合失败且已有明确的错误类别。"""
+        """回合失败且已有明确的错误类别。
+
+        🔴 **要求终态确实是 ``FAILED``。**
+
+        只看 ``failure_category is not None`` 的话，一个终态是
+        ``COMPLETED`` 却带着失败类别的回合会被归成"失败"，
+        理由栏还会写下"回合在「respond」阶段失败（终态 completed）"
+        这种自相矛盾的句子——而它会作为一次真实错误进入模式发现。
+
+        ``CognitiveRound`` 只要求 FAILED 时必填这两个字段，
+        **没有禁止**其他状态携带它们；因此这道判断必须在这里做。
+        """
         if signals.failure_category is None:
+            return None
+        if signals.round_state is not RoundState.FAILED:
             return None
         stage = signals.failure_stage or "未知阶段"
         return ErrorAttribution(
@@ -317,11 +330,17 @@ class ErrorClassifier:
 
 #: 阶段名到错误类别的映射。
 #:
-#: ⚠️ 与 :data:`ai_psi.application.cognitive_runtime._STAGE_ERROR_CATEGORY`
-#: 是**同一套语义**。这里保留一份是为了让学习层不依赖运行时模块；
-#: 但两份映射一旦漂移，"同一个失败在两个地方得到不同类别"就会发生，
-#: 且没有任何地方会报错。`tests/unit/test_error_classifier.py`
-#: 有一条用例断言两者逐项一致。
+#: 🔴 **这是这张映射表的唯一一份。**
+#:
+#: 阶段 3 时它住在 `ai_psi.application.cognitive_runtime` 里，
+#: 阶段 6 的归因也需要同一张表，于是搬到了学习层——
+#: 运行时改为从这里 import（`_category_for`），副本已删除。
+#:
+#: 两份各自维护的映射一旦漂移，"同一个失败在两个地方得到不同类别"
+#: 就会发生，且没有任何地方会报错：失败回合照常有类别、
+#: 经验记录也照常有类别，只是它们对不上。
+#: `tests/unit/test_error_classifier.py` 从**运行时的源码**里读出
+#: 它实际会赋的阶段名，断言与本表逐项一致。
 STAGE_ERROR_CATEGORY: Final[dict[str, ErrorType]] = {
     "triage": ErrorType.CONCEPTUAL_ERROR,
     "frame": ErrorType.SCOPE_ERROR,
