@@ -19,7 +19,7 @@ from ai_psi.application.feedback_service import (
     FeedbackService,
     MemoryEffect,
 )
-from ai_psi.application.memory_service import MemoryService
+from ai_psi.application.memory_service import MemoryService, MemoryWriteOutcome
 from ai_psi.application.ports import UnitOfWorkFactory
 from ai_psi.domain.cognitive_rounds import CognitiveBudget, CognitiveRound
 from ai_psi.domain.enums import (
@@ -49,7 +49,7 @@ CORRECTION_TEXT = "我说的适应是改变方法，不是放弃原则"
 class _DenyAllPolicy(WritePolicy):
     """一律拒绝的写入策略——用来证明反馈确实经过了策略这一关。"""
 
-    def decide(self, proposal: MemoryWriteProposal) -> WritePolicyDecision:  # type: ignore[override]
+    def decide(self, proposal: MemoryWriteProposal) -> WritePolicyDecision:
         del proposal
         return WritePolicyDecision(
             decision=WriteDecision.REJECTED,
@@ -507,7 +507,14 @@ class TestTheFeedbackRecordSurvivesAMemoryFailure:
         round_id = await _make_round(uow_factory, user_id=user_id)
 
         class _Exploding(MemoryService):
-            async def propose(self, **kwargs: object):  # type: ignore[override]
+            async def propose(
+                self,
+                *,
+                proposal: MemoryWriteProposal,
+                actor_id: str = "memory_service",
+                correlation_id: UUID | None = None,
+            ) -> MemoryWriteOutcome:
+                del proposal, actor_id, correlation_id
                 msg = "模拟记忆写入过程中崩溃"
                 raise RuntimeError(msg)
 

@@ -155,6 +155,12 @@ class TestEvaluate:
         proposal_id = await _seed(client)
         assert (await _evaluate(client, proposal_id, verdict="还行")).status_code == 422
 
+    async def test_missing_evidence_is_rejected(self, client: httpx.AsyncClient) -> None:
+        """🔴 没有对照口径的评估结论无法被复核，因此也无法被推翻。"""
+        proposal_id = await _seed(client)
+        response = await _evaluate(client, proposal_id, evidence=[])
+        assert response.status_code == 422
+
     async def test_unknown_proposal_is_404(self, client: httpx.AsyncClient) -> None:
         assert (await _evaluate(client, uuid4())).status_code == 404
 

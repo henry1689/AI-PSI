@@ -337,14 +337,40 @@ WritePolicy（阶段 3 已交付）、冲突/过期/取代、用户纠正、删�
 ⚠️ **V0.1 没有认证层**（risks.md R40）：作用域过滤防的是"代码写错导致的
 串号"，不是"恶意调用者"。这条边界写在路由的模块文档里。
 
-### 阶段 6：反馈、经验与改进提案
+### 阶段 6：反馈、经验与改进提案 ✅
 
 **交付**：Feedback API、Experience Builder、Error Classifier、
 Pattern Detector、ImprovementProposal、Proposal 评估接口、自动生效硬禁令。
 **本阶段创建**：`learning/`、`reliability/` 的剩余部分。
 
 **验收**：单次普通经验不能推广；三次同类错误可生成 Proposal；
-Proposal 始终需要外部审批。
+Proposal 始终需要外部审批。**三条均已通过测试钉死。**
+
+**实际交付**（✅ 2026-09-18，ADR-0018）：
+
+| 层 | 内容 |
+|---|---|
+| `learning/` | 确定性错误归因、经验构建（**不收自由文本**）、模式发现（`(错误类别, 情境签名)` 分组）、门槛裁决（**未评估 ≠ 不成立**）、模板提案生成、离线评估（未交付指标**列成清单**） |
+| `reliability/` | 不变量的**运行期自检**（试着构造 "active"）、认知健康度各维度并接入 `/health/cognitive` |
+| `application/` | `FeedbackService`（§12.2）、`ProposalService`（§12.4 状态机 + 乐观锁） |
+| 存储 | `improvement_proposals` 表 + 两侧仓储 + 契约测试；经验**不建表**（留在事件流） |
+| 事件 | 新增 `improvement_proposal.approved_for_manual_trial` / `.rejected`（§5.2 缺失） |
+| 迁移 | `19c6e2485c2d` |
+
+**本阶段明确不做的事**（均登记于 ADR-0018 §10）：
+
+* 自动生成提案（`learning/` 全是纯函数，没有定时器或钩子）；
+* 提案的影响面分析（`possible_regressions` 是模板文字，不是计算结果）；
+* 自动执行被批准的提案（`APPROVED_FOR_MANUAL_TRIAL` 之后由人决定）；
+* `proposal_false_promotion_rate`（要跨版本跟踪，属于长期运行指标）。
+
+⚠️ **本阶段留下的两条最可能在阶段 7 被重新讨论的边界**：
+
+1. `PENDING_EVALUATION` 在 V0.1 是一次原子穿越（没有后台评测器）。接上
+   Eval Runner 时要回答：谁把提案推进这个状态，卡住多久算超时（ADR-0018 §5）；
+2. 自动归因只认确定性判据，**判不了的比例会很高**（`UNKNOWN_ERROR` 只在
+   用户明确否定时出现，其余情况直接不归因）。这让系统偏向**漏报**而不是误报——
+   阶段 7 有评测数据后应统计"有多少真实错误根本没进模式发现"。
 
 ### 阶段 7：评测与回放
 

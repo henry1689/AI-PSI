@@ -47,6 +47,12 @@ V0.1 要验证的不是"回答看起来多深刻"，而是下面五件事在代�
    V0.1 中提案只能处于 `DRAFT` / `PENDING_EVALUATION` / `EVALUATED` /
    `REJECTED` / `APPROVED_FOR_MANUAL_TRIAL`。**没有 `ACTIVE` 路径。**
 
+   这条不是靠约定，而是四层同时成立：类型里不存在那个值；
+   服务上没有 `activate`/`promote`/`publish`/`deploy`/`apply` 任何方法；
+   数据库的 `status` CHECK 由该枚举生成（实测 `'active'` 被拒绝）；
+   `/health/cognitive` 在运行期检查这个结构性保证还在不在。
+   批准与驳回**也必须在评估之后**——未经评估的批准等于凭印象拍板。
+
 3. **认知宪法不能被学习模块修改。**
    宪法以代码常量形式落在 `src/ai_psi/cognition/constitution.py`，
    配套不变量测试。想改宪法 = 改代码 = 走代码评审，不是"模型自己决定"。
@@ -73,28 +79,36 @@ V0.1 要验证的不是"回答看起来多深刻"，而是下面五件事在代�
 | 阶段 3 | Mock LLM 与认知流水线（场景 A–J） | ✅ 已完成 |
 | 阶段 4 | 真实 LLM Provider（DeepSeek） | ✅ 已完成 |
 | 阶段 5 | 长期记忆（PostgreSQL + pgvector） | ✅ 已完成 |
-| 阶段 6 | 反馈、经验与改进提案 | ⬜ 未开始 |
+| 阶段 6 | 反馈、经验与改进提案 | ✅ 已完成 |
 | 阶段 7 | 评测与回放 | ⬜ 未开始 |
 | 阶段 8 | 完整验收与交付 | ⬜ 未开始 |
 
 > 大型自主编码任务最常见的失败，不是写得慢，而是接口尚未稳定就盖到第八层。
 > 因此本项目**严格按阶段推进，每个阶段结束时仓库都处于可运行状态**。
 
-### 当前质量指标（阶段 5 实测）
+### 当前质量指标（阶段 6 实测）
 
 | 检查 | 结果 |
 |---|---|
 | `make lint`（ruff） | 0 error |
-| `make typecheck`（mypy strict，176 个文件） | 0 error |
-| `make test` | **1156 passed, 5 skipped**（单元 + 属性 + 契约 + 场景 + API + 集成） |
+| `make typecheck`（mypy strict，**203 个文件**） | 0 error |
+| `make test` | **1542 passed, 9 skipped**（单元 + 属性 + 契约 + 场景 + API + 集成） |
 | 测试覆盖率 | 总体 **96%**；`domain/` 与 `cognition/` **98%**（门槛 85% / 75%） |
-| 契约测试 | 事件存储 / 回合仓储 / 幂等键 / **长期记忆**：同一组断言跑**内存与 PostgreSQL 两个实现** |
+| `learning/` 覆盖率 | **100%**（六个模块）——阶段 6 之前是**零测试** |
+| 契约测试 | 事件存储 / 回合仓储 / 幂等键 / 长期记忆 / **改进提案**：同一组断言跑**内存与 PostgreSQL 两个实现** |
 | 场景 A–J | **全部通过**（任务书 §15.4） |
 | **真实模型端到端** | ✅ `make test-live`：**5 passed**（真实 DeepSeek；D0/D2/D4 三类回合全部跑通） |
 | **向量检索** | ✅ 512 维 + HNSW 余弦索引，在**真实 PostgreSQL** 上验证维度、索引、删除传播、空值语义 |
+| **不变量自检** | ✅ I01 / I10 / I11 在**运行期**被检查（试着构造 `"active"` 会失败），并接入 `/health/cognitive`；测试逐条把它们按坏，要求自检指出来 |
+| **不变量 11 的 DB 级强制** | ✅ 实测 `INSERT ... status='active'` 被 PostgreSQL 拒绝（`ck_improvement_proposals_status_valid`） |
 | 预算 | **无超预算回合**：调用前扣减 + 可选模块跳过 + 强制尾部保留 |
-| 数据库迁移 | `alembic upgrade head` 通过；22 条 CHECK 约束（含不变量 19/20 与记忆自我引用的 DB 级强制） |
+| 数据库迁移 | `alembic upgrade head` 通过；**32 条 CHECK 约束**（`cognitive_rounds` 10 / `memories` 10 / `improvement_proposals` 6 / `events` 4 / 索引与幂等 2） |
 | 开发数据库 | PostgreSQL 16.15 + pgvector 0.8.6 |
+
+> **阶段 6 的三条验收条件都是"否定式"的**——它们说的是"什么不会自动发生"。
+> 因此对应的测试也写成否定式：单次经验不能推广（门槛 < 2 直接拒绝）、
+> 未经评估不能批准或驳回（409）、
+> 整个 API 里没有任何一条路径能让提案生效（不变量 11）。
 
 > **零依赖与真实模型两条路都通。**
 > 默认配置（`AI_PSI_LLM_PROVIDER=mock` + `AI_PSI_STORAGE_BACKEND=memory`）
@@ -175,7 +189,31 @@ curl -s -X POST localhost:8000/api/v1/conversations/<id>/messages \
      -d '{"content":"水在标准大气压下通常多少摄氏度沸腾？"}' | jq
 curl -s localhost:8000/api/v1/cognitive-rounds/<round_id>/summary | jq
 curl -s -X POST localhost:8000/api/v1/replay/cognitive-rounds/<round_id> | jq
+
+# 给这个回合一条反馈（🔴 user_id 就是提交消息时传的那个）
+curl -s -X POST localhost:8000/api/v1/cognitive-rounds/<round_id>/feedback \
+     -H 'Content-Type: application/json' \
+     -d '{"feedback_type":"correction",
+          "content":"你误解了我的意思，我说的适应是改变方法，不是放弃原则",
+          "allow_memory_update":true}' | jq
+
+# 改进提案：登记 → 评估 → 批准（每一步都留下审计事件）
+curl -s localhost:8000/api/v1/improvement-proposals | jq
+curl -s -X POST localhost:8000/api/v1/improvement-proposals/<proposal_id>/evaluate \
+     -H 'Content-Type: application/json' \
+     -d '{"verdict":"improved","evidence":["历史回放 200 回合"],"actor_id":"评审"}' | jq
+curl -s -X POST localhost:8000/api/v1/improvement-proposals/<proposal_id>/approve-for-manual-trial \
+     -H 'Content-Type: application/json' -d '{"approved_by":"评审"}' | jq
 ```
+
+> 🔴 **反馈里的 `allow_memory_update` 不是"允许写记忆"，而是"允许提给写入流程"。**
+> 真正写入仍要过记忆写入策略（ADR-0004）——命中内容红线的反馈一样被挡住，
+> 响应里的 `memory_effect` 会说明发生了什么（`written` / `not_eligible` /
+> `rejected_by_policy`）。没有它，调用方只能靠猜。
+>
+> 🔴 **`approve-for-manual-trial` 之后没有任何自动动作。**
+> 批准的是"做一次人工试验"，不是上线（不变量 11）。
+> 而且在评估之前调它会得到 409。
 
 ⚠️ **向量（embedding）默认走本地确定性实现，它不是语义向量。**
 
@@ -237,8 +275,9 @@ ai-psi/
 │   ├── cognition/           状态机、宪法、投影、深度路由、编排表、15 个认知模块
 │   ├── prompts/             契约、版本、Schema、模板、结构化输入的编解码
 │   ├── providers/           协议、Mock、网关、解析修复、HTTP 错误映射、熔断装饰器、OpenAI 兼容实现
-│   ├── reliability/         预算记账、反刍信号、置信度上限、熔断状态机
+│   ├── reliability/         预算记账、反刍信号、置信度上限、熔断状态机、**不变量自检**、认知健康度
 │   ├── memory/              写入策略 / 检索 / 排序 / 冲突检测 / 生命周期 / 脱敏
+│   ├── learning/            **错误归因 / 经验构建 / 模式发现 / 门槛裁决 / 提案生成 / 离线评估**
 │   ├── application/         应用服务（唯一允许发起写入的层）+ 全部 Port
 │   ├── infrastructure/      PostgreSQL、内存适配器、事件存储、日志
 │   └── api/                 FastAPI 路由、Schema、错误处理、依赖注入
@@ -254,9 +293,10 @@ ai-psi/
 └── evals/                   评测数据集与运行器（阶段 7）
 ```
 
-> **只创建有实际内容的包。** `learning/`、`reliability/` 的其余部分、
-> 每个包只在本阶段有实体内容时才创建，不预留空壳（ADR-0012）
-> （`docs/adr/0012-v0-1-scope-boundaries.md`）。
+> **只创建有实际内容的包。** 每个包只在本阶段有实体内容时才创建，
+> 不预留空壳（`docs/adr/0012-v0-1-scope-boundaries.md`）。
+> 阶段 6 因此才建出 `learning/`——它在阶段 1 的目录规划里就存在，
+> 但直到有了真正的学习链路才被创建。
 
 ### 分层与依赖方向
 

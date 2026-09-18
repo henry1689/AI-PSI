@@ -82,7 +82,7 @@ class TestConditionOneRepeatedErrors:
 
 
 class TestConditionTwoSevereErrorWithFix:
-    @pytest.mark.parametrize("error_type", sorted(SEVERE_ERROR_TYPES, key=lambda item: item.value))
+    @pytest.mark.parametrize("error_type", sorted(SEVERE_ERROR_TYPES, key=str))
     def test_severe_error_with_direction_triggers(self, policy, error_type: ErrorType) -> None:
         decision = policy.decide(
             PromotionEvidence(
@@ -255,7 +255,7 @@ class TestDecisionShape:
     def test_decision_is_frozen(self, policy) -> None:
         decision = policy.decide(PromotionEvidence())
         with pytest.raises(dataclasses.FrozenInstanceError):
-            decision.allowed = True  # type: ignore[misc]
+            decision.allowed = True
 
 
 class TestTriggerVocabulary:

@@ -10,16 +10,22 @@
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Callable
+from typing import Any
 
 import pytest
 
 from ai_psi.domain.enums import ConfidenceBand, ErrorType
+from ai_psi.domain.experiences import Experience
 from ai_psi.learning.pattern_detector import ErrorPattern, PatternDetector
 
 pytestmark = pytest.mark.unit
 
+#: ``tests/conftest.py`` 的 ``make_experience`` 夹具形状。
+Factory = Callable[..., Any]
 
-def _experience(make_experience, **overrides):
+
+def _experience(make_experience: Factory, **overrides: object) -> Experience:
     """构造一条**可归因**的经验。默认置信度必须够高，否则会被过滤掉。"""
     payload: dict[str, object] = {
         "error_type": ErrorType.REASONING_ERROR,
@@ -27,10 +33,11 @@ def _experience(make_experience, **overrides):
         "situation_signature": "d1|with_evidence|h2",
     }
     payload.update(overrides)
-    return make_experience(**payload)
+    experience: Experience = make_experience(**payload)
+    return experience
 
 
-def _repeated(make_experience, count: int, **overrides):
+def _repeated(make_experience: Factory, count: int, **overrides: object) -> list[Experience]:
     return [_experience(make_experience, **overrides) for _ in range(count)]
 
 

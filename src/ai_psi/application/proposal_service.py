@@ -205,7 +205,9 @@ class ProposalService:
 
         Args:
             proposal_id: 目标提案。
-            evaluation: 评估结论。
+            evaluation: 评估结论。**``evidence`` 不得为空**——
+                没有口径的评估结论无法被复核，也因此无法在日后被推翻，
+                而不可推翻的结论会永久影响策略。
             actor_id: 评估者标识。
             correlation_id: 关联链标识。
 
@@ -215,7 +217,16 @@ class ProposalService:
         Raises:
             NotFoundError: 提案不存在。
             IllegalStateTransitionError: 提案已处于终态。
+            ValueError: ``evidence`` 为空。
         """
+        if not evaluation.evidence:
+            msg = (
+                "评估必须给出对照口径（evidence 不得为空）："
+                "「结论：改善」而没有说跟什么比、比了多少个样本，"
+                "是一条无法被复核、因而也无法被推翻的记录"
+            )
+            raise ValueError(msg)
+
         async with self._uow_factory() as uow:
             proposal = await self._require(uow, proposal_id)
             self._assert_can_enter(proposal, _EVALUATABLE_FROM, to_state=ProposalStatus.EVALUATED)

@@ -541,8 +541,12 @@ class EvaluateProposalRequest(BaseModel):
         description="评估结论。⚠️ inconclusive 是「看不出」而不是「没差」，它是必须存在的选项"
     )
     evidence: list[str] = Field(
-        default_factory=list,
-        description="对照口径、样本量、参照版本。**没有口径的结论无法被复核**",
+        min_length=1,
+        description=(
+            "对照口径、样本量、参照版本。**不得为空**——"
+            "「结论：改善」而没说跟什么比、比了多少个样本，"
+            "是一条无法被复核、因而也无法被推翻的记录"
+        ),
     )
     notes: str | None = Field(default=None, description="评审说明")
     actor_id: str = Field(default="reviewer", min_length=1)

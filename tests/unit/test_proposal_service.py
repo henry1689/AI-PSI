@@ -61,6 +61,11 @@ async def _events(uow_factory: UnitOfWorkFactory, event_type: EventType):
         return await uow.events.read_by_event_type(event_type=event_type)
 
 
+def _evaluation(verdict: EvaluationVerdict) -> ProposalEvaluation:
+    """构造一条**带口径**的评估——没有口径的评估会被服务拒绝。"""
+    return ProposalEvaluation(verdict=verdict, evidence=("历史回放 200 回合",))
+
+
 async def _drafted(service: ProposalService) -> ImprovementProposal:
     return await service.create(_proposal())
 
@@ -70,10 +75,7 @@ async def _evaluated(service: ProposalService) -> ImprovementProposal:
     return (
         await service.evaluate(
             proposal.id,
-            evaluation=ProposalEvaluation(
-                verdict=EvaluationVerdict.IMPROVED,
-                evidence=("历史回放 200 回合",),
-            ),
+            evaluation=_evaluation(EvaluationVerdict.IMPROVED),
         )
     ).proposal
 
@@ -150,7 +152,7 @@ class TestEvaluation:
         proposal = await _drafted(service)
         transition = await service.evaluate(
             proposal.id,
-            evaluation=ProposalEvaluation(verdict=EvaluationVerdict.NO_CHANGE),
+            evaluation=_evaluation(EvaluationVerdict.NO_CHANGE),
         )
         assert transition.proposal.status is ProposalStatus.EVALUATED
         assert transition.proposal.version == proposal.version + 1
@@ -166,7 +168,7 @@ class TestEvaluation:
             await uow.commit()
 
         transition = await service.evaluate(
-            proposal.id, evaluation=ProposalEvaluation(verdict=EvaluationVerdict.IMPROVED)
+            proposal.id, evaluation=_evaluation(EvaluationVerdict.IMPROVED)
         )
         assert transition.proposal.status is ProposalStatus.EVALUATED
 
@@ -195,7 +197,7 @@ class TestEvaluation:
         proposal = await _drafted(service)
         transition = await service.evaluate(
             proposal.id,
-            evaluation=ProposalEvaluation(verdict=EvaluationVerdict.INCONCLUSIVE),
+            evaluation=_evaluation(EvaluationVerdict.INCONCLUSIVE),
         )
         assert transition.proposal.status is ProposalStatus.EVALUATED
 
@@ -204,15 +206,41 @@ class TestEvaluation:
         await service.reject(proposal.id, rejected_by="reviewer", reason="不值得做")
 
         with pytest.raises(IllegalStateTransitionError, match="终态"):
-            await service.evaluate(
-                proposal.id, evaluation=ProposalEvaluation(verdict=EvaluationVerdict.IMPROVED)
-            )
+            await service.evaluate(proposal.id, evaluation=_evaluation(EvaluationVerdict.IMPROVED))
 
     async def test_unknown_proposal_is_not_found(self, service: ProposalService) -> None:
         with pytest.raises(NotFoundError):
             await service.evaluate(
-                uuid4(), evaluation=ProposalEvaluation(verdict=EvaluationVerdict.IMPROVED)
+                uuid4(),
+                evaluation=ProposalEvaluation(
+                    verdict=EvaluationVerdict.IMPROVED, evidence=("历史回放 200 回合",)
+                ),
             )
+
+    async def test_evidence_is_required(self, service: ProposalService) -> None:
+        """🔴 「结论：改善」而没说跟什么比、比了多少样本，不是一条可复核的记录。
+
+        没有口径的结论无法被复核，因此也无法在日后被推翻——
+        而不可推翻的结论会永久影响策略。
+        """
+        proposal = await _drafted(service)
+        with pytest.raises(ValueError, match="对照口径"):
+            await service.evaluate(
+                proposal.id,
+                evaluation=ProposalEvaluation(verdict=EvaluationVerdict.IMPROVED),
+            )
+
+    async def test_a_refused_evaluation_leaves_nothing_behind(
+        self, service: ProposalService, uow_factory: UnitOfWorkFactory
+    ) -> None:
+        proposal = await _drafted(service)
+        with pytest.raises(ValueError):
+            await service.evaluate(
+                proposal.id,
+                evaluation=ProposalEvaluation(verdict=EvaluationVerdict.IMPROVED),
+            )
+        assert (await service.get(proposal.id)).status is ProposalStatus.DRAFT
+        assert await _events(uow_factory, EventType.IMPROVEMENT_PROPOSAL_EVALUATED) == []
 
 
 class TestApprovalRequiresEvaluation:
@@ -399,7 +427,7 @@ class TestTransitionShape:
         """提案来自**跨回合的模式**，挂到某一个回合上会误导读者。"""
         proposal = await _drafted(service)
         transition = await service.evaluate(
-            proposal.id, evaluation=ProposalEvaluation(verdict=EvaluationVerdict.IMPROVED)
+            proposal.id, evaluation=_evaluation(EvaluationVerdict.IMPROVED)
         )
         assert transition.event.cognitive_round_id is None
 

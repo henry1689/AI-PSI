@@ -95,7 +95,7 @@ class TestTheCheckCanActuallyFail:
         monkeypatch.setattr(
             selfcheck,
             "ImprovementProposal",
-            lambda **_: _Permissive(),  # type: ignore[arg-type]
+            lambda **_: _Permissive(),
         )
         result = selfcheck._check_i10()
         assert result.ok is False
@@ -121,7 +121,7 @@ class TestTheCheckCanActuallyFail:
         monkeypatch.setattr(
             selfcheck,
             "ImprovementProposal",
-            lambda **_: _Promotable(),  # type: ignore[arg-type]
+            lambda **_: _Promotable(),
         )
         result = selfcheck._check_i11()
         assert result.ok is False
