@@ -17,7 +17,6 @@ from ai_psi.infrastructure.logging import (
     NEVER_LOGGED_KEYS,
     SENSITIVE_KEYS,
     make_redact_processor,
-    redact_processor,
 )
 
 pytestmark = pytest.mark.unit
@@ -30,12 +29,21 @@ def _redact(event_dict: dict[str, Any], *, include_user_content: bool = False) -
 
 
 class TestDefaultRedaction:
-    def test_default_processor_masks_api_key(self) -> None:
-        result = redact_processor(None, "info", {"api_key": "sk-secret"})
+    """🔴 "默认"指的是 ``configure_logging`` **真的装上去的那个**。
+
+    ⚠️ 这两条此前调的是一个模块级的 ``redact_processor``，而它的文档
+    自称"这是默认配置使用的处理器"——假的，``configure_logging``
+    装的一直是 ``make_redact_processor(...)``。那个死函数已删除
+    （阶段 6.5 §八 评审 A），用例改为直接测**真正被装配的**那一个：
+    测一个没人装的东西，等于没测默认配置。
+    """
+
+    def test_the_processor_configure_logging_wires_masks_api_key(self) -> None:
+        result = _redact({"api_key": "sk-secret"})
         assert result["api_key"] == "***"
 
     def test_non_sensitive_fields_pass_through(self) -> None:
-        result = redact_processor(None, "info", {"event": "round.started", "count": 3})
+        result = _redact({"event": "round.started", "count": 3})
         assert result["event"] == "round.started"
         assert result["count"] == 3
 

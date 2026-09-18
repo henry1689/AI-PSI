@@ -40,8 +40,6 @@ from ai_psi.infrastructure.db.models import (
 
 __all__ = [
     "apply_event",
-    "apply_memory",
-    "apply_round",
     "memory_to_row",
     "memory_to_values",
     "proposal_to_row",
@@ -195,16 +193,13 @@ def round_to_row(round_: CognitiveRound) -> CognitiveRoundRow:
     return CognitiveRoundRow(**values)
 
 
-def apply_round(row: CognitiveRoundRow, round_: CognitiveRound) -> None:
-    """把领域回合的全部字段写入已存在的 ORM 行。
-
-    Args:
-        row: 目标 ORM 行。
-        round_: 源领域对象。
-    """
-    row.id = round_.id
-    for column, value in round_to_values(round_).items():
-        setattr(row, column, value)
+# ⚠️ 这里曾经有一个 ``apply_round``（"把领域回合的全部字段写入
+# 已存在的 ORM 行"）。它**全仓零引用**——仓储重建行用的是
+# ``round_to_row``，而"更新已存在的行"这条路径根本不存在。
+#
+# 阶段 6.5 §八 评审 A 找出它之后按 §四 的三选一删掉了。
+# 留着它的代价不是几行代码，是**改动时的第二个落点**：
+# 字段一改，改的人会以为这里也要跟着改，而它其实谁都不影响。
 
 
 def row_to_round(row: CognitiveRoundRow) -> CognitiveRound:
@@ -299,16 +294,8 @@ def memory_to_row(memory: Memory) -> MemoryRow:
     return MemoryRow(**values)
 
 
-def apply_memory(row: MemoryRow, memory: Memory) -> None:
-    """把领域记忆的全部字段写入已存在的 ORM 行。
-
-    Args:
-        row: 目标 ORM 行。
-        memory: 源领域对象。
-    """
-    row.id = memory.id
-    for column, value in memory_to_values(memory).items():
-        setattr(row, column, value)
+# ⚠️ 这里曾经有一个 ``apply_memory``，与 ``apply_round`` 同源同病：
+# 零引用、且与 ``memory_to_row`` 构成"两个落点"。已按 §四 删除。
 
 
 def row_to_memory(row: MemoryRow) -> Memory:

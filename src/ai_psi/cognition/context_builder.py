@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final
 from uuid import UUID
@@ -370,11 +369,11 @@ def _conflicting_claim_ids(evidence: tuple[Evidence, ...]) -> frozenset[UUID]:
     )
 
 
-@dataclass(frozen=True, slots=True)
-class ContextSelectionStats:
-    """上下文选择的统计，用于观测指标。"""
-
-    considered: int
-    selected: int
-    dropped: int
-    estimated_tokens: int
+# ⚠️ 这里曾经有一个 ``ContextSelectionStats``（"上下文选择的统计，
+# 用于观测指标"）。它**全仓零引用**——没有生产者、没有消费者、
+# 也不在任何 ``__all__`` 里，连测试都没碰过它。
+#
+# 阶段 6.5 §八 评审 A 把它找出来之后，按 §四 自己定的三选一
+# （接入 / 删除 / 登记待办）选了**删除**：一个没人算、没人读的
+# "观测指标"不是待办，是一段会让人以为"已经有这个指标了"的代码。
+# 真正需要它的时候，它会跟着**第一个消费者**一起出现。

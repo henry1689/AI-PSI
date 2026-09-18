@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from uuid import UUID
 
 from ai_psi.cognition.base import ModuleOutcome, invocation_context
@@ -215,9 +215,10 @@ def _status_for(*, supporting: list[UUID], opposing: list[UUID]) -> HypothesisSt
     return HypothesisStatus.UNRESOLVED
 
 
-@dataclass(frozen=True, slots=True)
-class HypothesisBundle:
-    """假设及其评估的组合，供下游合成器使用。"""
-
-    hypotheses: tuple[Hypothesis, ...] = field(default=())
-    evaluation: HypothesisEvaluation | None = None
+# ⚠️ 这里曾经有一个 ``HypothesisBundle``（"假设及其评估的组合，
+# 供下游合成器使用"）。它**全仓零引用**——没有任何"下游合成器"
+# 接收它，它也不在任何 ``__all__`` 里。
+#
+# 阶段 6.5 §八 评审 A 找出来之后按 §四 的三选一删掉了：
+# 它的文档描述了一个**并不存在**的调用方，而那种"看起来已经接好了"
+# 的描述比没有代码更容易误导人。

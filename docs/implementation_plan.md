@@ -450,3 +450,52 @@ Markdown/JSON 报告、Baseline 对照接口。
 | 记忆写入与事件写入不在同一事务 | ✅ 阶段 5 已闭合 | 记忆仓储纳入 `UnitOfWork`，四步同事务；`TestAtomicity` 为直接证据（ADR-0017 §3） |
 | 反刍检测是**词面**相似度 | ⚠️ 阶段 3 已知局限 | 只捕捉逐字重复；改写过的同一论点不触发。语义级检测待阶段 5 的向量检索（`risks.md` R32） |
 | 任务书 20 项内部冲突 | ✅ 已处理 | 4 项实质矛盾见 ADR-0006/0009/0010/0012，16 项缺口默认值见 ADR-0008/0012 |
+
+### 6.1 死代码与"仅测试可达"的符号（阶段 6.5 §八 评审 A 建立）
+
+🔴 **§四 定的规则是"接入 / 删除 / 登记待办"三选一。**
+阶段 6.5 当时只对 §一 点名的两个对象（`OfflineEvaluator` / `ReplayService`）
+执行了这条规则，**剩下的没有扫描、也没有登记**——评审 A 因此判定
+"死代码清零"这个说法不成立。这一节就是补上的登记。
+
+**统计口径**（不写清楚的话，下面每个数字都可以被质疑）：
+
+* 生产 = `src/` + `migrations/` + `scripts/`。⚠️ `migrations/` **算**——
+  第一版扫描把它漏了，于是 `make_selector_loop` 被误判成死代码，
+  而它其实被 `migrations/env.py` 用着（关键字实参，形如
+  `loop_factory=make_selector_loop`，正则 `名字(` 抓不到）。
+* "零引用"= 全仓（含 tests）连一次提及都没有；
+  "仅测试可达"= 只有 `tests/` 在调它。
+
+#### ✅ 本轮已删除（全仓零引用，含测试）
+
+| 符号 | 位置 | 为什么删而不是留 |
+|---|---|---|
+| `ContextSelectionStats` | `cognition/context_builder.py` | 文档说"用于观测指标"，而既没有生产者也没有消费者 |
+| `HypothesisBundle` | `cognition/hypothesis_generator.py` | 文档说"供下游合成器使用"——**那个合成器不存在** |
+| `apply_round` | `infrastructure/db/mappers.py` | 与 `round_to_row` 构成"改动时的第二个落点" |
+| `apply_memory` | `infrastructure/db/mappers.py` | 同上 |
+| `create_engine` | `infrastructure/db/session.py` | 🔴 最有害的一个：签名里摆着 `pool_size` / `max_overflow`，**读代码的人会以为连接池是按它们配的**，而真正生效的是组合根里 `create_async_engine` 的默认值 |
+| `redact_processor` | `infrastructure/logging.py` | 🔴 文档自称"这是默认配置使用的处理器"——**假的**，`configure_logging` 装的一直是 `make_redact_processor(...)` |
+
+#### 📋 已登记待办（仅测试可达，**本轮不删**）
+
+这些是**公开 API 面**（都在各自的 `__all__` 里），删它们等于删一条
+可能被外部依赖的接口；而它们又各自只被测试调用。按 §四 登记为待办，
+由第一个真实消费者决定去留。
+
+| 符号 | 位置 | 说明 |
+|---|---|---|
+| `invariant` | `cognition/constitution.py` | 宪法断言的装饰器形式 |
+| `state_for_step` / `nominal_model_calls` | `cognition/orchestrator.py` | 编排器的查询口 |
+| `allowed_transitions` / `is_valid_decision_target` / `timeout_for` | `cognition/state_machine.py` | 状态机的查询口；`is_valid_decision_target` 有 13 处测试调用 |
+| `reset_settings_cache` | `config.py` | 测试夹具用它，生产不用 |
+| `triggered_by` | `learning/proposal_generator.py` | |
+| `extract_json_object` | `providers/parsing.py` | 有 14 处测试调用——覆盖很足，只是没有生产者 |
+| `signature_for` | `reliability/repetition_detector.py` | |
+| `is_expired` / `plan_expiry` / `due_for_expiry` | `memory/lifecycle.py` | **整个到期规划子系统没有调用者**：`plan_expiry` 只被 `due_for_expiry` 调，而后者无人调 |
+| `assert_hypothesis_not_fact` / `assert_user_model_not_confirmed` | `cognition/constitution.py` | 见 R52：守卫的 `raise` 分支不可达，它们是**写在代码里的文档** |
+
+**下一步（阶段 7 的显式待办）**：为每一项做一次三选一，并把决定写回本表。
+在此之前，**不要**声称"死代码已清零"——准确的说法是
+"阶段 6.5 §一 点名的两项已接入，其余已登记"。

@@ -9,61 +9,23 @@
 
 from __future__ import annotations
 
-from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
-from sqlalchemy.pool import NullPool
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from ai_psi.config import Settings
+__all__ = ["create_session_factory"]
 
-__all__ = ["create_engine", "create_session_factory"]
-
-
-def create_engine(
-    settings: Settings,
-    *,
-    echo: bool = False,
-    pool_size: int = 5,
-    max_overflow: int = 10,
-    use_null_pool: bool = False,
-) -> AsyncEngine:
-    """按配置创建异步引擎。
-
-    Args:
-        settings: 运行配置。
-        echo: 是否回显 SQL（调试用，**生产必须关闭**——SQL 日志会含参数值）。
-        pool_size: 连接池常驻连接数。
-        max_overflow: 峰值时允许超出池的连接数。
-        use_null_pool: 使用 ``NullPool``——每条语句新建连接、用完即关。
-            **集成测试必须开启**：测试为每个用例创建独立事件循环，
-            而池中的连接绑定在创建它的循环上；跨循环复用连接会抛
-            ``attached to a different loop``。NullPool 从根上避开这个陷阱。
-
-    Returns:
-        异步引擎。
-
-    Note:
-        ``pool_pre_ping=True`` 会在取连接时先探活。数据库重启或网络闪断后，
-        池里的死连接会导致难以诊断的偶发失败——预检把它们变成一次透明重连。
-    """
-    if use_null_pool:
-        return create_async_engine(
-            settings.database_url,
-            echo=echo,
-            poolclass=NullPool,
-        )
-
-    return create_async_engine(
-        settings.database_url,
-        echo=echo,
-        pool_size=pool_size,
-        max_overflow=max_overflow,
-        pool_pre_ping=True,
-        pool_recycle=1800,
-    )
+# ⚠️ 这里曾经有一个 ``create_engine(settings, *, pool_size=5, ...)``。
+# 它**全仓零引用**：真正建引擎的是组合根
+# （``container.py``：``create_async_engine(url, pool_pre_ping=True)``）
+# 与集成夹具（``tests/integration/conftest.py``：``poolclass=NullPool``）。
+#
+# 🔴 **它不只是"几行没人用的代码"，而是一个会骗人的配置面**：
+# 它把 ``pool_size`` / ``max_overflow`` 摆在签名里，读代码的人会以为
+# 连接池是按这两个数配置的——而实际生效的是 ``create_async_engine``
+# 的默认值。改池大小的人会改到这里，然后发现没有任何变化。
+#
+# 阶段 6.5 §八 评审 A 找出它之后，按 §四 的三选一删掉了。
+# 关于 NullPool 的那段知识没有丢——它本来就在
+# ``tests/integration/conftest.py`` 里，而且写在**真正用它的地方**。
 
 
 def create_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:

@@ -22,7 +22,6 @@ __all__ = [
     "configure_logging",
     "get_logger",
     "make_redact_processor",
-    "redact_processor",
 ]
 
 
@@ -134,25 +133,19 @@ def _redact_entry(key: str, value: Any, *, include_user_content: bool, depth: in
     return value
 
 
-def redact_processor(
-    _logger: Any,
-    _method_name: str,
-    event_dict: MutableMapping[str, Any],
-) -> MutableMapping[str, Any]:
-    """structlog 处理器：脱敏敏感字段（用户正文一并丢弃）。
-
-    这是默认配置使用的处理器。需要放行用户正文时，
-    请使用 :func:`make_redact_processor` 构造的版本。
-
-    Args:
-        _logger: structlog 传入的 logger（未使用）。
-        _method_name: 日志方法名（未使用）。
-        event_dict: 事件字典。
-
-    Returns:
-        脱敏后的事件字典。
-    """
-    return _redact(event_dict, include_user_content=False)
+# ⚠️ 这里曾经有一个模块级的 ``redact_processor``，它的文档写着
+# **"这是默认配置使用的处理器"**——而那是**假的**：
+# ``configure_logging`` 装的是 ``make_redact_processor(...)``，
+# 全仓没有任何地方用它。
+#
+# 阶段 6.5 §八 评审 A 的评语值得原样留着：**一个死函数，其文档却
+# 声称自己站在脱敏路径上。** 这类谎报比"少一个函数"危险得多——
+# 读代码的人会以为"用户正文默认被丢弃"这条保证落在这里，
+# 于是既不会去 `configure_logging` 核对，也不会去测它。
+#
+# 处置按 §四 的三选一：删除（它的行为等价于
+# ``make_redact_processor(include_user_content=False)``，
+# 而后者才是真正被装配的那个）。原有测试已改为直接测后者。
 
 
 def make_redact_processor(*, include_user_content: bool) -> Any:
