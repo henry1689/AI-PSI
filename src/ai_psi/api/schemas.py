@@ -15,13 +15,13 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Self
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ai_psi.application.feedback_service import MemoryEffect
-from ai_psi.domain.common import is_blank
+from ai_psi.domain.common import is_blank, unstorable_in
 from ai_psi.domain.enums import (
     ApprovalLevel,
     CognitiveDepth,
@@ -40,6 +40,7 @@ from ai_psi.domain.enums import (
 )
 
 __all__ = [
+    "IDEMPOTENCY_KEY_MAX",
     "ApproveProposalRequest",
     "ConversationCreatedResponse",
     "CorrectMemoryRequest",
@@ -87,6 +88,71 @@ _STRICT_TRIMMED = ConfigDict(extra="forbid", str_strip_whitespace=True)
 #: 在 PostgreSQL 后端因为 `value too long for type character varying(128)`
 #: 炸成 500——**两个后端对同一个 HTTP 契约给出不同结果**。
 _ACTOR_ID_MAX = 128
+
+#: `Idempotency-Key` **请求头**的长度上限。
+#:
+#: 🔴 它是同一类缺陷的第二个实例，而 ADR-0021 §3 当时**漏掉了它**。
+#:
+#: 那一段把阶段 6 的 `actor_id` 事故写成了教训——"请求 schema 接受的
+#: 长度必须 ≤ 数据库列宽"——然后只对**请求体字段**做了对齐。
+#: 而幂等键走的是**请求头**：它不经任何 pydantic 模型，
+#: 直接落进 `idempotency_keys.key` 与 `cognitive_rounds.idempotency_key`
+#: 两个 `varchar(128)` 列。
+#:
+#: 阶段 6.5 §八 评审 C 实测（129 个字符）：
+#: `memory` → **201**（整个回合跑完并落库），
+#: `postgres` → **500**（`StringDataRightTruncation`）。
+#: 边界确认：128 两边都 201，129 即分叉。
+IDEMPOTENCY_KEY_MAX = 128
+
+
+class _BoundaryRequestModel(BaseModel):
+    """全部**请求体**模型的基类：边界上的文本纪律。
+
+    🔴 **为什么是一个基类，而不是给每个字段各挂一个校验器。**
+
+    本阶段先后发现了两个"两个后端两个结果"的实例
+    （`actor_id` 超长、自由文本里的 `U+0000`），而它们都不是
+    "某个字段忘了加约束"，是**同一类输入的每一个承载字段都漏了**。
+    逐字段补校验器的做法在第一个新字段出现时就会重新漏掉——
+    而漏掉的表现是"内存里跑得好好的，换 PostgreSQL 就 500"。
+
+    基类把这条规则挂在**模型**上：新加一个 `str` 字段**自动**被覆盖，
+    不需要任何人记得去挂校验器。
+
+    ⚠️ 子类可以覆盖 `model_config`（本类只提供一个默认值），
+    但**不能**取消这条校验——它是基类的 `model_validator`，
+    继承即生效。
+    """
+
+    model_config = _STRICT_TRIMMED
+
+    @model_validator(mode="after")
+    def _reject_unstorable_text(self) -> Self:
+        """把**存不进数据库**的字符挡在边界上（见 :func:`unstorable_in`）。
+
+        拦的是 `U+0000`：PostgreSQL 对 text/varchar/jsonb 参数一律拒收，
+        而 Python、JSON 与内存后端都接受。同一个请求因此会在两个后端上
+        得到 201 与 500 两个不同结果。
+
+        ⚠️ 逐字段遍历而不是只查"已知的那几个"：字段会被重命名、
+        会有新的进来，而**漏掉一个就少挡一处 500**。遍历的代价是
+        一次线性扫描，输入有长度上限兜着。
+        """
+        offenders = [
+            f"{name}（{''.join(found)}）"
+            for name in type(self).model_fields
+            if (found := unstorable_in(getattr(self, name, None)))
+        ]
+        if offenders:
+            msg = (
+                f"以下字段含有存不进数据库的字符（U+0000）：{'、'.join(offenders)}。"
+                "🔴 它在内存后端能跑通、在 PostgreSQL 上是 500——"
+                "两个后端对同一个请求给出不同结果"
+            )
+            raise ValueError(msg)
+        return self
+
 
 #: 会话类自由文本的上限：用户消息、反馈正文、记忆内容。
 #:
@@ -163,7 +229,7 @@ class ConversationCreatedResponse(BaseModel):
     )
 
 
-class SubmitMessageRequest(BaseModel):
+class SubmitMessageRequest(_BoundaryRequestModel):
     """提交用户消息并启动认知回合。"""
 
     model_config = _STRICT_TRIMMED
@@ -445,7 +511,7 @@ class MemoryListResponse(BaseModel):
     memories: list[MemoryView] = Field(default_factory=list)
 
 
-class CorrectMemoryRequest(BaseModel):
+class CorrectMemoryRequest(_BoundaryRequestModel):
     """用户纠正一条记忆。"""
 
     model_config = _STRICT_TRIMMED
@@ -521,7 +587,7 @@ class UserDataDeletionResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class FeedbackRequest(BaseModel):
+class FeedbackRequest(_BoundaryRequestModel):
     """对某个认知回合的反馈。"""
 
     model_config = _STRICT_TRIMMED
@@ -636,7 +702,7 @@ class ProposalListResponse(BaseModel):
     proposals: list[ProposalView] = Field(default_factory=list)
 
 
-class EvaluateProposalRequest(BaseModel):
+class EvaluateProposalRequest(_BoundaryRequestModel):
     """记录一次离线评估。"""
 
     model_config = _STRICT_TRIMMED
@@ -692,7 +758,7 @@ class ProposalTransitionResponse(BaseModel):
     can_become_active: bool = Field(description="🔴 恒为 false（不变量 11）")
 
 
-class ApproveProposalRequest(BaseModel):
+class ApproveProposalRequest(_BoundaryRequestModel):
     """批准进行人工试验。"""
 
     model_config = _STRICT_TRIMMED
@@ -701,7 +767,7 @@ class ApproveProposalRequest(BaseModel):
     note: str | None = Field(default=None, max_length=_NOTE_MAX, description="批准说明")
 
 
-class RejectProposalRequest(BaseModel):
+class RejectProposalRequest(_BoundaryRequestModel):
     """驳回提案。"""
 
     model_config = _STRICT_TRIMMED
@@ -709,6 +775,7 @@ class RejectProposalRequest(BaseModel):
     rejected_by: str = Field(min_length=1, max_length=_ACTOR_ID_MAX, description="驳回人标识")
     reason: str = Field(
         min_length=1,
+        max_length=_NOTE_MAX,
         description=(
             "驳回理由。**必填**：「不想做」与「做不了」对后来者是完全不同的信息。"
             "⚠️ 首尾空白与不可见格式字符会被去掉，因此「   」是一个 422"
@@ -727,7 +794,7 @@ class RejectProposalRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class LearningRunRequest(BaseModel):
+class LearningRunRequest(_BoundaryRequestModel):
     """跑一次学习链路的输入。
 
     🔴 **全部字段可选，且没有任何一个是"批准"。**

@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Annotated, Any, Final, Self
 from uuid import UUID, uuid4
@@ -20,10 +21,12 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validat
 __all__ = [
     "INVISIBLE_CHARACTERS",
     "SCHEMA_VERSION_V1",
+    "UNSTORABLE_CHARACTERS",
     "EntityMetadata",
     "UtcDatetime",
     "UtcDatetimeOptional",
     "is_blank",
+    "unstorable_in",
     "utc_now",
 ]
 
@@ -80,6 +83,59 @@ def is_blank(text: str) -> bool:
         去掉 Unicode 空白与 :data:`INVISIBLE_CHARACTERS` 之后为空时返回 ``True``。
     """
     return not text.strip("".join(INVISIBLE_CHARACTERS)).strip()
+
+
+#: 能进 Python 字符串、但**存不进数据库**的字符。
+#:
+#: 🔴 只有一个：``U+0000``（NUL）。
+#:
+#: PostgreSQL 对 ``text`` / ``varchar`` / ``jsonb`` 的**参数**一律拒收它
+#: （```psycopg.errors.UntranslatableCharacter`` ``invalid byte sequence``），
+#: 而 Python 字符串、JSON 编码、以及内存后端都欣然接受。
+#:
+#: 这就是"两个后端两个结果"的经典形态，而且**方向最坏**：
+#: 同一个请求在内存后端是一个跑完并落库的回合，
+#: 在真实 PostgreSQL 上是一个 500——而 `tests/api/` 全部跑在内存后端上。
+#:
+#: ⚠️ 它**不是**"更严格的输入校验"，而是"一个后端根本收不下"。
+#: 因此判据是**数据库能不能收**，与"这个字符好不好看"无关。
+UNSTORABLE_CHARACTERS: Final[frozenset[str]] = frozenset({chr(0x0000)})
+
+
+def unstorable_in(value: Any) -> tuple[str, ...]:
+    """``value`` 里**存不进数据库**的字符（去重、按首次出现顺序）。
+
+    ⚠️ 与 :func:`is_blank` **刻意分开**：两者拦的是不同的事。
+    前者拦"一定会让一个后端报 500 的输入"，后者拦"看起来是空的输入"。
+    合成一个函数，改其中一条时会被另一条的语义带跑——
+    而"空白判据"与"可存储判据"将来完全可能各自演化。
+
+    ⚠️ 只认 ``str``、``str`` 序列与 ``None``。其他类型一律当作"没有"：
+    本函数的用途是在**边界**上做一次粗筛，而不是做一个通用的
+    "递归扫描任意 JSON"的工具——后者会把"检查什么"这件事
+    藏进一个没人读得完的遍历里。
+
+    Args:
+        value: 任意值。
+
+    Returns:
+        出现过的字符（去重、有序）；没有则返回空元组。
+    """
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        texts: Sequence[str] = (value,)
+    elif isinstance(value, Sequence):
+        texts = tuple(item for item in value if isinstance(item, str))
+    else:
+        return ()
+
+    seen: list[str] = []
+    for text in texts:
+        for character in text:
+            if character in UNSTORABLE_CHARACTERS and character not in seen:
+                seen.append(character)
+    return tuple(seen)
 
 
 def utc_now() -> datetime:

@@ -200,6 +200,118 @@ class TestOverLongInputsAreRejectedOnBothBackends:
         )
         _assert_client_error(response, expected_status=422)
 
+    async def test_over_long_idempotency_key(self, client: httpx.AsyncClient) -> None:
+        """🔴 **同一类缺陷的第二个实例，而 ADR-0021 §3 当时漏掉了它。**
+
+        上一条用的是请求体字段；幂等键走的是**请求头**，
+        不经任何 pydantic 模型，直接落进 `idempotency_keys.key`
+        与 `cognitive_rounds.idempotency_key` 两个 ``varchar(128)`` 列。
+
+        阶段 6.5 §八 评审 C 实测：129 个字符的键在 `memory` 上是 **201**
+        （回合跑完并落库），在 `postgres` 上是 **500**
+        （``StringDataRightTruncation``）。128 两边都 201，129 即分叉。
+        """
+        created = await client.post(f"{API_PREFIX}/conversations")
+        conversation_id = created.json()["conversation_id"]
+        response = await client.post(
+            f"{API_PREFIX}/conversations/{conversation_id}/messages",
+            json={"content": "水在标准大气压下通常多少摄氏度沸腾？"},
+            headers={"Idempotency-Key": "k" * 129},
+        )
+        _assert_client_error(response, expected_status=422)
+
+    async def test_the_key_at_the_limit_is_still_accepted(self, client: httpx.AsyncClient) -> None:
+        """反向对照：长度上限是 128，**不是**"看到这个头就拒"。
+
+        少了这一条，上一条对"一律拒绝"的实现也成立——
+        而那会让所有带幂等键的客户端全部失效。
+        """
+        created = await client.post(f"{API_PREFIX}/conversations")
+        conversation_id = created.json()["conversation_id"]
+        response = await client.post(
+            f"{API_PREFIX}/conversations/{conversation_id}/messages",
+            json={"content": "水在标准大气压下通常多少摄氏度沸腾？"},
+            headers={"Idempotency-Key": "k" * 128},
+        )
+        assert response.status_code == 201, response.text
+
+
+class TestUnstorableCharactersAreRejectedOnBothBackends:
+    """🔴 `U+0000`（NUL）：内存后端照单全收，PostgreSQL 一律拒收。
+
+    它是**两后端分叉的第二类根因**——与"字段超长"并列，但形态不同：
+    这一条不是"某个字段忘了加上限"，而是"某个**字符**根本存不进去"。
+    PostgreSQL 对 text / varchar / jsonb 的**参数**一律拒绝 NUL
+    （``psycopg.errors.UntranslatableCharacter``），而 Python 字符串、
+    JSON 编码、以及内存后端都欣然接受。
+
+    评审 C 实测的四个入口里，前三个都真的分叉了（201 vs 500）。
+    """
+
+    #: 含一个 NUL 的正文。
+    #:
+    #: ⚠️ 用 ``chr(0x0000)`` 而不是字面量——把 NUL 直接写进源码，
+    #: 会让这个文件本身在多数编辑器里显示成一串问号。
+    NUL = chr(0x0000)
+
+    async def test_nul_in_message_content(self, client: httpx.AsyncClient) -> None:
+        created = await client.post(f"{API_PREFIX}/conversations")
+        conversation_id = created.json()["conversation_id"]
+        response = await client.post(
+            f"{API_PREFIX}/conversations/{conversation_id}/messages",
+            json={"content": f"水什么时候沸腾{self.NUL}？"},
+        )
+        _assert_client_error(response, expected_status=422)
+
+    async def test_nul_in_feedback_content(self, client: httpx.AsyncClient) -> None:
+        round_id = await _new_round(client)
+        response = await client.post(
+            f"{API_PREFIX}/cognitive-rounds/{round_id}/feedback",
+            json={"feedback_type": "correction", "content": f"你错了{self.NUL}"},
+        )
+        _assert_client_error(response, expected_status=422)
+
+    async def test_nul_in_a_short_optional_field(self, client: httpx.AsyncClient) -> None:
+        """🔴 这一条拦的是**逐字段补校验器**的做法。
+
+        `related_claim` 既没有 `min_length` 也没有自定义校验器，
+        如果只给"显眼的"字段挂校验，这个字段会一直漏到 database 层。
+        基类的模型级遍历就是为了不给"哪个字段显眼"留下判断空间。
+        """
+        round_id = await _new_round(client)
+        response = await client.post(
+            f"{API_PREFIX}/cognitive-rounds/{round_id}/feedback",
+            json={
+                "feedback_type": "correction",
+                "content": "你这里判断错了",
+                "related_claim": f"单一观察{self.NUL}推出意图",
+            },
+        )
+        _assert_client_error(response, expected_status=422)
+
+    async def test_nul_in_the_reason_of_a_rejection(self, client: httpx.AsyncClient) -> None:
+        response = await client.post(
+            f"{API_PREFIX}/improvement-proposals/00000000-0000-0000-0000-000000000001/reject",
+            json={"rejected_by": "reviewer", "reason": f"不符合验收条件{self.NUL}"},
+        )
+        _assert_client_error(response, expected_status=422)
+
+    async def test_other_control_characters_still_pass(self, client: httpx.AsyncClient) -> None:
+        """反向对照：被拒的只有 NUL，**不是**"所有控制字符"。
+
+        少了这一条，一条"把正文里的控制字符全砍掉"的实现也成立——
+        而那会改变**有内容**的输入，并且会把一个**契约问题**
+        扩大成一个**数据丢失问题**。PostgreSQL 收得下退格与制表符，
+        所以它们不该被拦。
+        """
+        created = await client.post(f"{API_PREFIX}/conversations")
+        conversation_id = created.json()["conversation_id"]
+        response = await client.post(
+            f"{API_PREFIX}/conversations/{conversation_id}/messages",
+            json={"content": "水什么时候沸腾？（这是退格，不是 NUL）"},
+        )
+        assert response.status_code == 201, response.text
+
 
 class TestMalformedInputsAreRejectedOnBothBackends:
     """非法枚举、非法 UUID、缺字段——一律 422 且带机器可读的 code。"""

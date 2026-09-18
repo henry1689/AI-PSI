@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from typing import Annotated
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Header
 
 from ai_psi.api.dependencies import ContainerDep
 from ai_psi.api.schemas import (
+    IDEMPOTENCY_KEY_MAX,
     ConversationCreatedResponse,
     SubmitMessageRequest,
     SubmitMessageResponse,
@@ -41,12 +43,21 @@ async def submit_message(
     conversation_id: UUID,
     body: SubmitMessageRequest,
     container: ContainerDep,
-    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    idempotency_key: Annotated[
+        str | None, Header(alias="Idempotency-Key", max_length=IDEMPOTENCY_KEY_MAX)
+    ] = None,
 ) -> SubmitMessageResponse:
     """提交用户消息并启动一次认知回合。
 
     🔴 ``Idempotency-Key`` 存在时，重复提交同一请求**不会**创建第二个回合
     （任务书 §13.4）。同一 key 搭配不同请求体会得到 409，而不是静默返回旧结果。
+
+    🔴 **``max_length`` 不是可选的礼貌，是后端一致性要求。**
+    幂等键不经任何 pydantic 请求模型（它走请求头），直接落进
+    `idempotency_keys.key` 与 `cognitive_rounds.idempotency_key`
+    两个 ``varchar(128)`` 列。少了长度上限，129 个字符的键
+    在内存后端是 201、在 PostgreSQL 上是 500——阶段 6.5 §八
+    评审 C 实测过这个分叉。
 
     Args:
         conversation_id: 所属会话。
