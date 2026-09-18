@@ -130,6 +130,25 @@ class LearningRun:
     那不是"没有退化"，是"没有对照"。两者的区别必须能从返回值里读出来。
     """
 
+    offline_regression: bool | None = None
+    """离线对照是否判为**稳定退化**（§11.3 条件三的结论）。
+
+    🔴 **三态，不是两态。**
+
+    * ``None``：没有对照可做（单侧数据）——条件三记为**未评估**；
+    * ``False``：对照过，**没有**退化；
+    * ``True``：对照过，**有**退化。
+
+    合并前两者会把"没评估"说成"没退化"，那正是
+    ``PromotionEvidence`` 用 ``None`` 而不是 ``False`` 的理由。
+
+    ⚠️ **它必须与门禁用的是同一个值，且必须能被读出来。**
+    阶段 6.5 §八 评审 A 指出：这个结论此前只在
+    ``for pattern in scan.patterns`` 内部被计算，且**没有任何 HTTP 出口**——
+    于是"稳定退化会被检出"这条能力在跑起来的系统里**读不到**，
+    黑盒层也就断言不了它。现在它算一次、两处共用，并回传。
+    """
+
     patterns: tuple[ErrorPattern, ...] = ()
     candidates: tuple[ErrorPattern, ...] = ()
     """达到模式门槛、并**被门禁复核过**的观察。"""
@@ -239,6 +258,16 @@ class LearningService:
         covered = await self._covered_keys()
         corrections = await self._negative_feedback_by_signature(load)
         evaluation = await self._evaluate_offline(evaluation_window)
+        # 🔴 **退化判定只算一次，门禁与运行结果共用它。**
+        # 两处各算一次的话，某天 `regressed` 的判据一变，
+        # 响应里报的那个结论与门禁实际用的是**两个不同的数**——
+        # 而两者都不会报错，只是永远对不上。
+        #
+        # ⚠️ 单侧数据返回 `None` 而不是 `False`：把"没评估"说成
+        # "没退化"是这一整条链路上最容易犯、也最难发现的错。
+        evaluation_regressed: bool | None = (
+            self._evaluator.regressed(evaluation) if evaluation.comparison_available else None
+        )
 
         candidates: list[ErrorPattern] = []
         created: list[CreatedProposal] = []
@@ -255,11 +284,7 @@ class LearningService:
                     # 单侧数据返回 False 会把"没评估"说成"没退化"——
                     # 那正是 `PromotionEvidence` 用 None 而不是 False
                     # 表示未评估的理由（"未评估 ≠ 不成立"）。
-                    offline_regression=(
-                        self._evaluator.regressed(evaluation)
-                        if evaluation.comparison_available
-                        else None
-                    ),
+                    offline_regression=evaluation_regressed,
                     # 🔴 这里给的是**观测到的计数**（含 0），不是 ``None``。
                     #
                     # ``None`` 表示"没有接入计数的调用方"——而这里**有**
@@ -321,6 +346,7 @@ class LearningService:
             unreadable_experiences=load.unreadable_experiences,
             unreadable_evaluations=load.unreadable_evaluations,
             offline_evaluation=evaluation,
+            offline_regression=evaluation_regressed,
             patterns=scan.patterns,
             candidates=tuple(candidates),
             created=tuple(created),

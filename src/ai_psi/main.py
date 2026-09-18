@@ -16,12 +16,17 @@ psycopg 的异步驱动不支持 Windows 默认的 ``ProactorEventLoop``
 ## 为什么学习链路需要一个 CLI 入口（阶段 6.5 §四/§七）
 
 `PatternDetector` / `PromotionPolicy` / `ProposalGenerator` /
-`OfflineEvaluator` 在阶段 6 收尾时在 `src/` 里**零调用者**——
+`OfflineEvaluator` 在阶段 6 收尾时**从跑起来的系统里到不了**——
 "三次同类错误可生成 Proposal"这条验收条件只在测试里成立、
-在跑起来的系统里**不可操作**。能力证据矩阵把它记为 E1（仅测试）。
+在生产上**不可操作**。能力证据矩阵把它记为 E1（仅测试）。
 
-CLI 与 HTTP 路由（``POST /api/v1/learning/runs``）是它的两个入口，
-**走的是同一个 `LearningService` 实例**。两条路径都存在是因为
+⚠️ **准确的说法是"那个调用者自己不可达"，不是"零调用者"。**
+`LearningService` 从阶段 6 起就在 `src/` 里调用它们；问题在于
+`LearningService` 本身没有任何入口。两者都不报错，只是永远不跑。
+
+CLI 与 HTTP 路由（``POST /api/v1/learning/runs``）是它的两个入口。
+⚠️ **它们共享的是「组合根」（`build_container`），不是同一个实例**——
+CLI 与服务是两个进程，各自建各自的容器。两条路径都存在是因为
 它们服务两种不同的用法：运维想"直接跑一次看结果"，
 而黑盒验收要"走真实 HTTP + 真实 PostgreSQL"。
 
@@ -55,7 +60,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "learn",
         help=(
             "跑一次学习链路：读经验 → 模式发现 → 门禁复核 → 生成 DRAFT 草案。"
-            "🔴 它不能批准任何东西（不变量 11）"
+            "注意：它不能批准任何东西（不变量 11）"
         ),
     )
     learn.add_argument(
@@ -96,13 +101,61 @@ def main(argv: list[str] | None = None) -> int:
         退出码。``learn`` 在没有任何提案生成时仍然返回 0——
         **"这次没有可生成的"是一个正常结果，不是失败**。
     """
+    # 🔴 **先把标准流的编码错误策略改成"替换"。**
+    #
+    # 阶段 6.5 §八 评审 A 实测：`python -m ai_psi.main --help` 在
+    # GBK 控制台下**确定性崩溃**——`UnicodeEncodeError: 'gbk' codec
+    # can't encode character '\U0001f534'`，退出码 1。字符串是
+    # `learn` 子命令 help 里的那个红点，而**只有**父解析器打印子命令
+    # 列表时才会输出它。
+    #
+    # ⚠️ 只改 `errors`，**不改 `encoding`**：控制台真是 GBK 的话，
+    # 强制输出 UTF-8 会让中文全变乱码——那是拿一个崩溃换一个更难查的
+    # 显示问题。`errors="replace"` 让不可编码的字符退化成 `?`，
+    # 中文照常。
+    #
+    # 如果你的终端是 UTF-8 的（Windows Terminal、VSCode 终端），
+    # 中文反而会乱码——那是 Python 按 OEM 代码页选了 GBK。
+    # 那种情况下用 `PYTHONUTF8=1` 启动（与变异测试子进程的处理一致），
+    # 而不是在这里替所有人做决定。
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:  # pragma: no cover - 真实终端才有
+            reconfigure(errors="replace")
+
     arguments = _build_parser().parse_args(argv)
     # 🔴 两条路径都要先装策略：CLI 同样会连 PostgreSQL。
     install_selector_loop_policy()
 
     if arguments.command == "learn":
-        return asyncio.run(_learn(arguments))
+        return _run_learn(arguments)
     return _serve()
+
+
+def _run_learn(arguments: argparse.Namespace) -> int:
+    """跑学习链路，并把**可动作的**失败信息放在第一行。
+
+    🔴 阶段 6.5 §八 评审 A 实测：数据库连不上时，``asyncio.run``
+    直接把 SQLAlchemy 的异常抛出去，屏幕上是一条约 30 层深的
+    traceback（末行 ``ConnectionTimeout``，耗时约两分钟），
+    而**没有任何一个字**告诉读它的人"去改哪个环境变量"。
+
+    运维读 CLI 输出时看的是头几行。这里把结论提到最前面，
+    traceback 仍然照打——**不为了好看把调试信息丢掉**。
+    """
+    from sqlalchemy.exc import SQLAlchemyError
+
+    try:
+        return asyncio.run(_learn(arguments))
+    except SQLAlchemyError as error:
+        print(
+            f"数据库操作失败：{type(error).__name__}: {error}\n"
+            "  请先确认：① AI_PSI_DATABASE_URL 指向的实例在跑；"
+            "② 迁移已到 head（make migrate）。\n"
+            "  下面是完整的 traceback。",
+            file=sys.stderr,
+        )
+        raise
 
 
 def _serve() -> int:

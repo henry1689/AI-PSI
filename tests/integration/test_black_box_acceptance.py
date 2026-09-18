@@ -77,13 +77,26 @@ async def client(
     await container.aclose()
 
 
-async def _run_round(client: httpx.AsyncClient) -> str:
+#: 会走到 D4、并让元认知**反复反刍**的价值判断问题。
+#:
+#: 🔴 它与上面那句的差别是**离线评测能不能造出退化**的全部秘密。
+#: 默认 Mock 的深度路由按问题的结构选档：常识事实题走 D0、
+#: 不产生元认知循环；价值判断题走 D4、`metacognitive_loops` 不为 0。
+#: 于是"反刍率"这个 lower-is-better 指标会从 0.0 升到 1.0。
+#:
+#: 这是阶段 6.5 §八 评审 A 用**默认 Mock、真实 HTTP、零脚本**跑出来的，
+#: 它推翻了此前"Mock Provider 不产生可控信号"的说法——见
+#: `test_lower_is_better_regression_is_detected`。
+_RUMINATING_QUESTION = "我应该原谅他吗？这是不是道德上正确的选择？"
+
+
+async def _run_round(client: httpx.AsyncClient, *, question: str = _QUESTION) -> str:
     """跑一个真实回合，返回它的 id。"""
     created = await client.post(f"{API_PREFIX}/conversations")
     conversation_id = created.json()["conversation_id"]
     response = await client.post(
         f"{API_PREFIX}/conversations/{conversation_id}/messages",
-        json={"content": _QUESTION},
+        json={"content": question},
     )
     assert response.status_code == 201, response.text
     return str(response.json()["cognitive_round_id"])
@@ -240,28 +253,110 @@ class TestOfflineEvaluationIsReachableAndHonest:
     async def test_lower_is_better_regression_is_detected(self, client: httpx.AsyncClient) -> None:
         """🔴 **§七.15**：lower-is-better 指标从 0 上升到 1 必须判为退化。
 
-        ⚠️ **本文件无法在 Mock Provider 下构造出这个退化**——
-        它需要"基线回合都没有反刍、候选回合全都有"两组真实数据，
-        而 Mock 的行为由脚本控制，脚本化又超出了本文件的黑盒边界。
+        ⚠️ **本用例在阶段 6.5 §八 被推翻并重写过，两处都改了。**
 
-        因此 §七.15 的**黑盒部分**在这里只做到"对照可达"，
-        方向判定本身由单元层的
-        `tests/unit/test_offline_evaluator.py::test_lower_is_better_metric_rising_is_a_regression`
-        钉住。这个缺口写在 `docs/assurance/capability_evidence_matrix.md`
-        与阶段完成报告的残余风险里——**不假装它被覆盖了**。
+        它此前写着"本文件无法在 Mock Provider 下构造出这个退化……
+        Mock 的行为由脚本控制，脚本化又超出了本文件的黑盒边界"，
+        然后只断言 `comparison_available is True`。评审 A 指出这个理由
+        **是错的**：用**默认 Mock、真实 HTTP、零脚本**，只把问句换成
+        一个会走到 D4 的问题，反刍率就从 0.0 升到 1.0 了。
+
+        真正的阻断点在别处，而且两条都已修：
+
+        * `OfflineEvaluator.regressed()` 只在 `for pattern in scan.patterns`
+          内部被调用——**没有模式就一次都不调**；
+        * `LearningRunResponse` 里**没有这个结论的出口**，
+          就算算出来了黑盒也断言不到。
+
+        因此这一条现在是**真的黑盒验收**：正式端点、真实 PostgreSQL、
+        默认 Mock，断言的是**方向判定本身**，而不是"对照可达"。
+        """
+        baseline = [await _run_round(client, question=_QUESTION)]
+        candidate = [await _run_round(client, question=_RUMINATING_QUESTION)]
+
+        body = await _learn(client, baseline_round_ids=baseline, candidate_round_ids=candidate)
+
+        assert body["comparison_available"] is True, body
+        # 🔴 **方向判定**：反刍率是 lower-is-better，它上升就是退化。
+        assert body["offline_regression"] is True, body
+
+    async def test_a_clean_comparison_is_not_a_regression(self, client: httpx.AsyncClient) -> None:
+        """反向对照：**没有退化时必须报 ``False``，而不是 ``True``**。
+
+        少了这一条，一条"只要做了对照就说退化"的实现也能让上一条全绿——
+        而那条实现的后果是每一次对照都触发条件三，提案门槛形同不存在。
+
+        顺带钉住**三态**里的另外两态：一侧数据时 `null`（未评估）、
+        这里两侧同质时 `false`（评估过、没退化）。把它们合并成两态
+        就是把"没评估"说成"没退化"。
         """
         baseline = [await _run_round(client)]
         candidate = [await _run_round(client)]
 
         body = await _learn(client, baseline_round_ids=baseline, candidate_round_ids=candidate)
 
-        # 能算出对照，且原因可读——至于方向判定，见上面的说明
-        assert body["comparison_available"] is True
+        assert body["comparison_available"] is True, body
+        assert body["offline_regression"] is False, body
 
 
 # ---------------------------------------------------------------------------
 # §七.10–11：非法状态进不去
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# 回放：出口真的被读到了吗
+# ---------------------------------------------------------------------------
+
+
+class TestReplayIsReachableThroughTheApi:
+    """🔴 回放此前**没有任何黑盒覆盖**（阶段 6.5 §八 评审 A 的发现）。
+
+    §四 把回放接通成了正式路径，但它的出口——
+    ``differs_from_projection``——**连一条 HTTP 用例都没有**：
+    只有两处**直接调 `ReplayService`** 的集成用例断言过它。
+
+    而 `ReplayResponse` 给这个字段设了默认值 `False`，
+    于是"把路由里那一行删掉"的症状恰好是"响应里恒为 False"——
+    也就是说，看起来一切正常。**一个没人钉住的告警等于没有告警。**
+    （默认值已随之去掉：这个字段现在是必填的。）
+    """
+
+    async def test_a_healthy_round_reports_no_divergence(self, client: httpx.AsyncClient) -> None:
+        round_id = await _run_round(client)
+
+        response = await client.post(f"{API_PREFIX}/replay/cognitive-rounds/{round_id}")
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        # 🔴 先确认字段**真的在响应里**：少了它，上面那条断言会变成
+        # KeyError——那也是红的，但红在"键不存在"而不是"值不对"，
+        # 而两者的修法完全不同。
+        assert "differs_from_projection" in body, body
+        assert body["differs_from_projection"] is False, body
+
+    async def test_the_replayed_state_matches_the_live_projection(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """🔴 这条才是那个告警**要说的事**。
+
+        上面那条只证明"字段在、且是 False"。它证明不了"重建出的状态
+        与当前状态投影一致"——一条恒返回 False 的实现在它下面完全成立。
+
+        这里把回放重建出的状态与 `GET /cognitive-rounds/{id}` 报的
+        实时状态**对起来**：两者不一致时，告警字段必须为 True，
+        而它若仍报 False，这条用例就会红。
+        """
+        round_id = await _run_round(client)
+
+        replayed = await client.post(f"{API_PREFIX}/replay/cognitive-rounds/{round_id}")
+        live = await client.get(f"{API_PREFIX}/cognitive-rounds/{round_id}")
+
+        assert replayed.status_code == 200, replayed.text
+        assert live.status_code == 200, live.text
+        body = replayed.json()
+        assert body["state"] == live.json()["state"], (body["state"], live.json()["state"])
+        assert body["differs_from_projection"] is False, body
 
 
 class TestIllegalStatesCannotBeWritten:
@@ -341,16 +436,24 @@ class TestAtomicityAndConcurrency:
 
         assert await _count_events(engine) == before
 
-    async def test_concurrent_feedback_only_one_succeeds(self, client: httpx.AsyncClient) -> None:
-        """§七.14：两个并发请求**只允许一个成功**，失败方零副作用。
+    async def test_concurrent_feedback_both_succeed(self, client: httpx.AsyncClient) -> None:
+        """🔴 **两条并发反馈都会成功——本用例证明的就是这件事。**
 
-        ⚠️ 这条在内存后端上**测不出来**（工作单元的方法没有 await 点，
-        两个"并发"实际是顺序执行的，见 R48）。真实 PostgreSQL 上
-        才会出现真正的交错。
+        ⚠️ **它的名字与 docstring 在阶段 6.5 §八 被改过，因为原来那个
+        名字在说反话。** 原名是
+        `test_concurrent_feedback_only_one_succeeds`，首句写着
+        "两个并发请求**只允许一个成功**，失败方零副作用"——
+        而正文断言的恰恰是**两条都 201**。评审 C 把它列为
+        "最像用一条走了别的路的用例冒充验收"的地方：读名字的人会以为
+        §七.14「并发只有一个成功」已被覆盖，实际上没有。
 
-        这里并发的是**同一回合的两条反馈**——它们都会成功，因为
-        反馈不是幂等的单次写入。真正被唯一约束仲裁的是
-        **幂等键**，那一条在下面。
+        正确的事实是：**反馈不是幂等的单次写入**，同一回合上的两条
+        反馈是**两件事**，都该成功。真正被唯一约束仲裁的是**幂等键**，
+        那一条在下面（`test_the_same_idempotency_key_only_creates_one_round`）。
+
+        ⚠️ 因此 **§七.14 的「并发只有一个成功」在 V0.1 没有等价物**——
+        系统里唯一"只允许一个成功"的并发写入是幂等键占位，
+        而它已经单独覆盖。这个缺口如实记在能力矩阵里，不靠改名抹掉。
         """
         round_id = await _run_round(client)
 

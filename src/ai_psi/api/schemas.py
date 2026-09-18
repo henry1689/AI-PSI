@@ -426,12 +426,11 @@ class ReplayResponse(BaseModel):
     failure_stage: str | None = None
     error_category: str | None = None
     differs_from_projection: bool = Field(
-        default=False,
         description=(
             "🔴 **数据一致性告警**：事件流重建出的状态与当前状态表不一致。"
-            "为 True 通常意味着有写入绕过了应用服务。正常情况下恒为 False；"
+            "为 True 通常意味着有写入绕过了应用服务，正常情况下恒为 False。"
             "阶段 6.5 之前这个信号在代码里算出来了却没有任何出口"
-        ),
+        )
     )
     projected_at: datetime
 
@@ -884,6 +883,16 @@ class LearningRunResponse(BaseModel):
             "它表示没有候选数据，条件三因此记为「未评估」而不是「不成立」"
         )
     )
+    offline_regression: bool | None = Field(
+        description=(
+            "离线对照是否判为**稳定退化**（§11.3 条件三的结论）。"
+            "🔴 **三态**：`null` = 没有对照可做（未评估）、"
+            "`false` = 对照过且没退化、`true` = 对照过且有退化。"
+            "⚠️ 没有默认值——它是**必填**的，因为"
+            "「忘了把它接上」的症状恰好是「值恒为 false」，"
+            "而那个症状看起来与「没有退化」一模一样（评审 A 的发现）"
+        )
+    )
     evaluation_reasons: list[str] = Field(default_factory=list)
     summary: str
 
@@ -907,6 +916,7 @@ class LearningRunResponse(BaseModel):
                 for pattern, reasons in run.suppressed
             ],
             comparison_available=(False if comparison is None else comparison.comparison_available),
+            offline_regression=run.offline_regression,
             evaluation_reasons=[] if comparison is None else list(comparison.reasons),
             summary=run.summary(),
         )
