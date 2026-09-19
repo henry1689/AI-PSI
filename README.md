@@ -99,27 +99,53 @@ V0.1 要验证的不是"回答看起来多深刻"，而是下面五件事在代�
 
 ### 当前质量指标
 
-> 🔴 **基线：`6113b1a`**（阶段 7‑专项 / R72 完成时）。下表的每个数字都是
-> 在该 SHA 上实测的；换基线就要重新测，**不要**沿用。
+> 🔴 **基线：`d9421a09380b8641d9b866398fba6902b566149a`**（简称 `d9421a0`，
+> **该仓库首次 CI 全绿**的那一次提交）。下表的每个数字都是在该 SHA 上实测的；
+> 换基线就要重新测，**不要**沿用。
+>
+> 前一个基线 `6113b1a` 的数字与本次**逐项相同**，但那时 CI 从未绿过——
+> 两次运行都因 `tests/unit/test_config.py` 的三个默认值用例确定性失败
+> （CI 的 job 级 `AI_PSI_ENV=testing` 渗进 pytest），该问题自 CI 第一次运行起就存在，
+> 与业务代码无关，已在 `d9421a0` 修复。
 
-| 检查 | 结果（`6113b1a`） |
+| 检查 | 结果（`d9421a0`） |
 |---|---|
 | `make lint`（ruff lint + format） | 0 error |
 | `make typecheck`（mypy strict，**226 个文件**） | 0 error |
-| `make test`（`pytest -m "not live"`） | **2099 passed, 9 deselected**（单元 + 属性 + 契约 + 场景 + API + 集成 + 黑盒 + 并发 + 迁移） |
-| 测试覆盖率 | 总体 **96%**；`domain/` 与 `cognition/` **98%**（门槛 75% / 85%，**由 `make policy` 执行、CI 会跑**） |
+| `make test`（`uv run pytest` + 覆盖率采集，**与 CI 同一条命令**） | **2099 passed, 9 skipped**（单元 + 属性 + 契约 + 场景 + API + 集成 + 黑盒 + 并发 + 迁移）——`live` 用例无密钥时 skip；加 `-m "not live"` 过滤时等价地报 9 deselected |
+| 测试覆盖率 | 总体 **96%**（门槛 **75%**）；`domain/` 与 `cognition/` **98%**（门槛 **85%**）——门槛**由 `make policy` 执行、CI 会跑** |
+| **CI：`Lint & Type Check`** | ✅ **success**（ruff lint + format、mypy strict） |
+| **CI：`Test (Python 3.12)`** | ✅ **success**（`2099 passed, 9 skipped`） |
+| **CI：`Test (Python 3.13)`** | ✅ **success**（`2099 passed, 9 skipped`） |
+| **CI：覆盖率两级门槛（`make policy`）** | ✅ **success**（96% / 98%）——⚠️ 这一步在首次全绿之前**一直是被跳过的**：前一步 pytest 失败即短路，门槛从未真正执行过 |
+| **CI Run** | <https://github.com/henry1689/AI-PSI/actions/runs/35454252126> |
 | `learning/` 覆盖率 | 整体 **99%**（7 个模块）——其中 6 个 100%；`error_classifier.py` 98%，未覆盖的 2 行是 `_category_for_correction` 末尾那条**不可达的 fail-closed 守卫**（`CorrectionTarget` 已在构造时用 `CORRECTABLE_KINDS` 拦住） |
 | **学习链路端到端** | ✅ **只用真实回合产出的事件**证明"三次同类错误 → DRAFT 提案"（`tests/scenarios/test_learning_chain.py`）；反方向也钉住：两次不够、判不了的经验跑多少次都凑不出模式 |
 | **独立评审** | ✅ 阶段 6 交付后补做三视角独立评审（互不通气、只读），抓到 **11 处确认缺陷**并全部修正——**最重要的一条是验收条件此前在跑起来的系统里不成立**（ADR-0019） |
 | 契约测试 | 事件存储 / 回合仓储 / 幂等键 / 长期记忆 / **改进提案**：同一组断言跑**内存与 PostgreSQL 两个实现** |
 | 场景 A–J | **全部通过**（任务书 §15.4） |
-| **真实模型端到端** | ✅ `make test-live`：**5 passed**（真实 DeepSeek；D0/D2/D4 三类回合全部跑通）——⚠️ **上次实测于阶段 6，未在 `6113b1a` 复测**（需要网络与真实计费）。它不是上表那四个数字的一部分 |
+| **真实模型端到端** | ✅ `make test-live`：**5 passed**（真实 DeepSeek；D0/D2/D4 三类回合全部跑通）——⚠️ **上次实测于阶段 6，未在 `d9421a0` 复测**（需要网络与真实计费；`make test` 里这批用例是 **skip** 的）。它不是上表那组质量数字的一部分 |
 | **向量检索** | ✅ 512 维 + HNSW 余弦索引，在**真实 PostgreSQL** 上验证维度、索引、删除传播、空值语义 |
 | **不变量自检** | ✅ I01 / I10 / I11 在**运行期**被检查（试着构造 `"active"` 会失败），并接入 `/health/cognitive`；测试逐条把它们按坏，要求自检指出来 |
 | **不变量 11 的 DB 级强制** | ✅ 实测 `INSERT ... status='active'` 被 PostgreSQL 拒绝（`ck_improvement_proposals_status_valid`） |
 | 预算 | **无超预算回合**：调用前扣减 + 可选模块跳过 + 强制尾部保留 |
 | 数据库迁移 | `alembic upgrade head` 通过；**32 条 CHECK 约束**（`cognitive_rounds` 10 / `memories` 10 / `improvement_proposals` 6 / `events` 4 / 幂等与向量 2）+ **24 个索引**（含 R72 的活跃模式唯一索引） |
 | 开发数据库 | PostgreSQL 16.15 + pgvector 0.8.6 |
+
+> 🔴 **`d9421a0` 是"当前已实施范围"的绿色技术基线，不是"V0.1 已完成"。**
+>
+> 它说明的只有一件事：**已实施的阶段 0–6.6 与阶段 7‑专项（R72）**
+> 在本地与 CI 上全绿。它**不**说明：
+>
+> * **正式阶段 7 的评测体系**——50 个 Golden Cases、Eval Runner、指标、
+>   Markdown/JSON 报告、Prompt 版本比较——**尚未完成，一项都还没开始**
+>   （见上方"当前进度"与 [`docs/implementation_plan.md`](docs/implementation_plan.md) §2）；
+> * **阶段 8 的完整验收与交付**同样未开始；
+> * 上面那份"已知限制"清单里的多条（R46 漏报率、R38 成本、R32 反刍阈值、
+>   R78 归因分支）**正是要等阶段 7 的评测数据**才能定的。
+>
+> 因此**不得**把这次绿读成"完整 V0.1 已交付"。它是一条**技术基线**，
+> 不是一次**发布**。
 
 > **阶段 6 的三条验收条件都是"否定式"的**——它们说的是"什么不会自动发生"。
 > 因此对应的测试也写成否定式：单次经验不能推广（门槛 < 2 直接拒绝）、
