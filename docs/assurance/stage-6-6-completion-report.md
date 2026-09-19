@@ -114,7 +114,50 @@
 
 ---
 
-## 七、明确不做（范围纪律）
+## 七、证据
+
+| 证据 | 结果 |
+|---|---|
+| `uv run ruff check .` / `ruff format --check` | 全绿 |
+| `uv run mypy src tests scripts mutation` | 223 个文件，**0 错误**（`--strict`） |
+| `uv run pytest -m "not live"` | **2036 passed**，9 deselected，0 failed |
+| 黑盒场景 A–H + 审计（真实 HTTP × 真实 PostgreSQL × 默认 Mock） | **14/14** |
+| 变异：`domain/experiences.py` | **169/169 = 100.0%**，0 存活，0 incompetent |
+| 变异：`learning/pattern_detector.py` | **104/104 = 100.0%**，0 存活，0 incompetent |
+| 变异合计 | **273/273 = 100.0%** |
+| 等价登记漂移（`_stale_equivalents`） | **0** |
+
+复现：
+
+```bash
+uv run pytest -m "not live"                                        # 全量
+uv run pytest tests/integration/test_black_box_acceptance.py -q    # A–H
+uv run python mutation/run.py experiences pattern_detector         # 变异
+```
+
+### 本阶段被变异测试抓到的**真缺口**（4 处，全在本阶段新写的代码里）
+
+变异跑是**先红后绿**才可信的，因此如实记下它先变红的那一轮：
+
+| 缺口 | 为什么它是真缺口 |
+|---|---|
+| `PatternScan.conflicting_attributions` 的默认值 | 阶段 6.5 那条"默认值是契约"的用例**存在但没覆盖新字段**——正是它会漏掉的形态 |
+| `attribution_basis` 的筛选条件（`is` → `is not`） | 冲突经验必须**没有**依据；没有用例钉住"空"这一侧 |
+| 冲突时依据必须为空 | 同上，只测了"有依据"那一侧 |
+| `ExperienceAttributionRecord` 的身份字段边界（`experience_canonical_key` / `classifier_version` 的 `min_length`） | 新加的身份字段没人试过把它构造成空的 |
+
+另有一处 `attribution_conflict` 的**默认值**（改成 `True` 后全绿）在本轮补齐——
+它不是不起眼的默认：默认为真等于让**每一条**没显式带标志的评估凭空退出计数。
+补的用例是 `test_the_attribution_defaults_are_the_quiet_ones`，
+**反向验证过**（把默认值翻成 `True`，该用例当场变红）。
+
+> ⚠️ 与"18 条行号漂移"的区别：漂移是 `EQUIVALENTS` 的**登记位置**过期，
+> 不是测试缺口——`_stale_equivalents` 的全部作用就是把这类过期**报出来**
+> 而不是静默放行。
+
+---
+
+## 八、明确不做（范围纪律）
 
 不进入阶段 7；不改门槛、权重、评价档位与状态机；不重构无关模块；
 不引入新依赖；不做全仓库保证工程（变异只重跑受影响的模块）。

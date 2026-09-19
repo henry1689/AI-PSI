@@ -516,6 +516,74 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
         mutation="rank != ExperienceEvaluation.SUSPECTED.rank",
         reason="同上：rank 的四个取值互异且都在小整数缓存内，`!=` 与 `>` 同答案",
     ),
+    Equivalent(
+        module="experiences",
+        operator="core/ReplaceComparisonOperator_Is_Eq",
+        line=706,
+        mutation="item.error_type == effective_type",
+        reason=(
+            "《枚举比较》。这一行还多一层：`effective_type` **可以是 `None`**"
+            "（冲突或无法归因时），而 `item.error_type` 永远是成员。"
+            "`成员 == None` 与 `成员 is None` 同样为假——StrEnum 的 "
+            "`__eq__` 继承自 `str`，对 `None` 返回 `NotImplemented`，"
+            "于是回落到同一性比较。两条分支（有类别 / 无类别）答案都相同。"
+            "守行为的是 `test_the_basis_comes_from_the_records_that_agree` "
+            "与 `test_a_conflict_has_no_basis_at_all`"
+        ),
+    ),
+    Equivalent(
+        module="experiences",
+        operator="core/ReplaceComparisonOperator_Gt_NotEq",
+        line=744,
+        mutation="if len(kinds) != 1:",
+        reason=(
+            "紧挨着的上一问是 `if not kinds: return`——**走到这一行时 "
+            "`kinds` 必非空**。非空集合上 `len(kinds) > 1` 与 "
+            "`len(kinds) != 1` 是同一条判据。"
+            "⚠️ 这条依赖那个空集提前返回**紧邻在上**；"
+            "把它挪走或删掉，这里立刻变成真变异（空集会被误判成冲突）"
+        ),
+    ),
+    Equivalent(
+        module="experiences",
+        operator="core/ReplaceComparisonOperator_Is_Eq",
+        line=748,
+        mutation="if experience.error_type == only:",
+        reason="《枚举比较》：同段说明",
+    ),
+    Equivalent(
+        module="experiences",
+        operator="core/ReplaceComparisonOperator_Is_Eq",
+        line=750,
+        mutation="item.error_type == only",
+        reason="《枚举比较》：同段说明。与下面的 `<=` 共用同一段前提",
+    ),
+    Equivalent(
+        module="experiences",
+        operator="core/ReplaceComparisonOperator_Is_LtE",
+        line=750,
+        mutation="item.error_type <= only",
+        reason=(
+            "与上面那条 `Is_GtE` 同一段前提：走到这一行时 `kinds` 只有一个"
+            "元素，因此**每一条记录**的 `error_type` 都就是 `only`，"
+            "`only <= only` 恒为真。⚠️ 这里 `<=` 与 `is` 同答案**不靠字面量**"
+            "——自己与自己比较，任何 StrEnum 都成立，比 `Is_GtE` 那条更稳"
+        ),
+    ),
+    Equivalent(
+        module="experiences",
+        operator="core/ReplaceFalseWithTrue",
+        line=752,
+        mutation="return only, experience.attribution_confidence, True",
+        reason=(
+            "这一行在 `if not matching:  # pragma: no cover` 里面，"
+            "而那个分支**不可达**：`only` 来自 `kinds`，若它不来自经验自己"
+            "（那就是上面 748 那一问已返回的情形），就必来自某条记录，"
+            "于是 `matching` 非空。于是这里改成 `True`（报冲突）也不可观察。"
+            "⚠️ 它与上面那条 `> 1` → `!= 1` 是**同一件事的两面**："
+            "都靠 `kinds` 的构成论证，删掉任一前提两者会一起失配"
+        ),
+    ),
     # ------------------------------------------------------------------
     # 《slots 族》：`@dataclass(frozen=True, slots=True)` → `slots=False`。
     #

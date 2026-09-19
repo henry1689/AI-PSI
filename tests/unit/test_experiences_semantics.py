@@ -538,6 +538,29 @@ class TestTheAssessmentIsAnImmutableValue:
         assert assessment.evaluator_types == ()
         assert assessment.evidence_refs == ()
 
+    def test_the_attribution_defaults_are_the_quiet_ones(self, make_experience) -> None:
+        """🔴 变异测试发现：``attribution_conflict`` 的默认值改成 ``True``
+        之后全绿。
+
+        它不是个不起眼的默认值——``attribution_conflict`` 为真意味着
+        "这套归因自相矛盾，**在裁决之前不计入任何门槛**"。默认成真，
+        等于让**每一条**没显式带这个标志的评估凭空退出计数。
+
+        :func:`assess_experiences` 今天每条都显式传它，所以这个默认值
+        只在**别处手工构造**时才露面——而手工构造正是本文件的常态。
+        默认值是一份契约（同 ``PatternScan.conflicting_attributions``）：
+        没有矛盾的评估，就该是"不冲突"。
+        """
+        assessment = ExperienceAssessment(
+            experience=make_experience(),
+            evaluation=ExperienceEvaluation.SUSPECTED,
+        )
+        assert assessment.attribution_conflict is False
+        assert assessment.effective_error_type is None
+        assert assessment.effective_attribution_confidence is ConfidenceBand.VERY_LOW
+        assert assessment.attribution_basis == ()
+        assert assessment.attributions == ()
+
 
 class TestTheSingleEnforcementPointHasEveryBranch:
     """🔴 §二.4 的**唯一执行点**（:func:`assert_evaluator_may_produce`）。
