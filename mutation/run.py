@@ -362,7 +362,7 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
     Equivalent(
         module="experiences",
         operator="core/NumberReplacer",
-        line=287,
+        line=297,
         mutation="min_length= 0",
         reason=(
             "`canonical_key` 由 `_check_canonical_identity` 钉死为**派生值**"
@@ -376,7 +376,7 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
     Equivalent(
         module="experiences",
         operator="core/NumberReplacer",
-        line=287,
+        line=297,
         mutation="min_length= 2",
         reason=(
             "同上，方向反过来：把下界抬到 2 也不会拒掉任何东西——"
@@ -386,8 +386,32 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
     ),
     Equivalent(
         module="experiences",
+        operator="core/NumberReplacer",
+        line=289,
+        mutation="min_length= 0",
+        reason=(
+            "`independence_group` **曾经**是自由字符串，那时这条是真变异；"
+            "阶段 6.5 §八 给 `Experience` 加了 `_check_independence_group` "
+            "（逐字核对它 == `independence_group_for(幂等键, 回合)`）之后，"
+            "它成了派生值，最短也有 5 个字符（`round:` + UUID = 42，"
+            "`idem:` 至少 5）。下界降到 0 没有任何输入能走到。"
+            "⚠️ **这条等价的成立条件是那条校验器存在**——"
+            "它由 `test_a_hand_written_independence_group_is_refused` 与"
+            "`test_the_group_follows_the_round` 钉住；删掉校验器，"
+            "那两条会先红，而不是让这里悄悄放行真变异"
+        ),
+    ),
+    Equivalent(
+        module="experiences",
+        operator="core/NumberReplacer",
+        line=289,
+        mutation="min_length= 2",
+        reason="同上，方向反过来：派生值最短也有 5 个字符，抬到 2 拒不掉任何东西",
+    ),
+    Equivalent(
+        module="experiences",
         operator="core/ReplaceTrueWithFalse",
-        line=470,
+        line=522,
         mutation="slots=False",
         reason=(
             "`ExperienceAssessment` 的 `frozen=True` **本身**就拒绝一切属性"
@@ -400,7 +424,7 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
     Equivalent(
         module="experiences",
         operator="core/ReplaceComparisonOperator_Gt_GtE",
-        line=539,
+        line=591,
         mutation="rank >= evaluation.rank",
         reason=(
             "`ExperienceEvaluation` 四档的 `rank` **互异**（0/1/2/3，"
@@ -412,7 +436,7 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
     Equivalent(
         module="experiences",
         operator="core/ReplaceComparisonOperator_IsNot_Lt",
-        line=580,
+        line=632,
         mutation="evaluation < ExperienceEvaluation.UNASSESSED",
         reason=(
             "StrEnum 的 `<` 比**字符串**。实测：suspected / supported / "
@@ -424,14 +448,14 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
     Equivalent(
         module="experiences",
         operator="core/ReplaceComparisonOperator_IsNot_NotEq",
-        line=580,
+        line=632,
         mutation="evaluation != ExperienceEvaluation.UNASSESSED",
         reason="《枚举比较》：同段说明。`!=` 与 `is not` 对成员输入同答案",
     ),
     Equivalent(
         module="experiences",
         operator="core/ReplaceComparisonOperator_Is_GtE",
-        line=588,
+        line=640,
         mutation="evaluation >= ExperienceEvaluation.UNASSESSED",
         reason=(
             "《StrEnum 的字典序》的另一半：除 unassessed 之外的三个值都"
@@ -442,14 +466,14 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
     Equivalent(
         module="experiences",
         operator="core/ReplaceComparisonOperator_Is_Eq",
-        line=588,
+        line=640,
         mutation="evaluation == ExperienceEvaluation.UNASSESSED",
         reason="《枚举比较》：同段说明",
     ),
     Equivalent(
         module="experiences",
         operator="core/ReplaceComparisonOperator_Is_Eq",
-        line=596,
+        line=648,
         mutation="evaluator == ExperienceEvaluator.INTERNAL_METACOGNITION",
         reason=(
             "《枚举比较》：同段说明。⚠️ 这一条尤其要记住它的边界——"
@@ -460,7 +484,7 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
     Equivalent(
         module="experiences",
         operator="core/ReplaceComparisonOperator_Gt_IsNot",
-        line=597,
+        line=649,
         mutation="rank is not ExperienceEvaluation.SUSPECTED.rank",
         reason=(
             "`_EXPERIENCE_EVALUATION_RANK` 的取值是 0/1/2/3，全部落在 CPython "
@@ -473,7 +497,7 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
     Equivalent(
         module="experiences",
         operator="core/ReplaceComparisonOperator_Gt_NotEq",
-        line=597,
+        line=649,
         mutation="rank != ExperienceEvaluation.SUSPECTED.rank",
         reason="同上：rank 的四个取值互异且都在小整数缓存内，`!=` 与 `>` 同答案",
     ),

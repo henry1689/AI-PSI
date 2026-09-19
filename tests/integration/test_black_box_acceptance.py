@@ -21,7 +21,13 @@
 **交集为空**——而阶段 6 真出过一次由此产生的缺陷（`actor_id`
 超长时内存返回 201、PostgreSQL 返回 500）。
 
-本文件是那个交集的第一个大块：**真实 HTTP × 真实 PostgreSQL**。
+本文件与 `tests/integration/test_input_contract.py` 一同构成那个交集：
+**真实 HTTP × 真实 PostgreSQL**。
+
+⚠️ **"第一个大块"这个说法在阶段 6.5 §八 被评审 A 更正过。**
+基线 `93727b4` 时 `test_input_contract.py` **还不存在**（它是 §三 建的），
+所以 §一 记的"交集为空"当时是准确的；现在它是"被填上了一部分"，
+而不是"由本文件独占"。
 """
 
 from __future__ import annotations
@@ -59,7 +65,24 @@ async def client(
     test_settings: Settings,
     clean_tables: None,
 ) -> AsyncIterator[httpx.AsyncClient]:
-    """真实 PostgreSQL 上的 HTTP 客户端。"""
+    """真实 PostgreSQL 上的 HTTP 客户端。
+
+    🔴 **``raise_app_exceptions=False`` 是刻意的，不是随手加的开关。**
+
+    Starlette 的 ``ServerErrorMiddleware`` 在**生成 500 响应之后会
+    重新抛出异常**，而 ``httpx.ASGITransport`` 默认把服务器异常
+    原样往上抛。两者叠在一起，症状是：一个真实客户端会看到
+    **500** 的请求，在测试里变成一道 Python traceback——
+    于是"失败时是什么样的"这件事在测试里与在线上**不一样**。
+
+    而这个文件的前提是"**只能通过正式 API**"（见模块文档）：
+    真实的客户端看不到 traceback，它看到 500。
+    因此这里把传输层调成与真实 HTTP 一致。
+
+    ⚠️ 代价要说清楚：应用抛异常时**不再自动让用例变红**。
+    补偿是每一条用例都断言了具体的状态码（`assert ... == 201, response.text`），
+    多出来的 500 会在那一步被抓住，并连同响应体一起打印出来。
+    """
     del clean_tables
     settings = test_settings.model_copy(
         update={
@@ -71,7 +94,7 @@ async def client(
     app = create_app(settings)
     container = build_container(settings)
     app.state.container = container
-    transport = httpx.ASGITransport(app=app)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as test_client:
         yield test_client
     await container.aclose()
@@ -423,7 +446,10 @@ class TestAtomicityAndConcurrency:
     ) -> None:
         """§七.13：失败**不留事件、不留状态变化**。
 
-        用一个不存在的回合触发失败，然后直接查库确认事件表没多东西。
+        ⚠️ **本用例只覆盖了"事务开始之前失败"**（不存在的回合 → 404，
+        事务压根没开）。阶段 6.5 §八 评审 C 指出了这一点，
+        真正的"事务**中途**失败"由下面的
+        `test_a_midway_failure_rolls_back_what_was_already_written` 覆盖。
         """
         del clean_tables
         before = await _count_events(engine)
@@ -435,6 +461,102 @@ class TestAtomicityAndConcurrency:
         assert response.status_code == 404
 
         assert await _count_events(engine) == before
+
+    async def test_a_midway_failure_rolls_back_what_was_already_written(
+        self, client: httpx.AsyncClient, engine: AsyncEngine, clean_tables: None
+    ) -> None:
+        """🔴 §七.13 的**真正那一半**：事务中途失败，前面的写入必须一起回滚。
+
+        阶段 6.5 §八 评审 C 的探针（这里把它固化成用例）：
+
+        * 在 ``memories`` 上装一个 ``BEFORE INSERT`` 触发器**抛异常**——
+          此时反馈事件与经验评价事件**都已经成功 INSERT**，
+          失败发生在第三步；
+        * 发一条反馈 → HTTP 500；
+        * 断言 **events / feedback / evaluated / memories 四个计数
+          全部没变**——前一写必须跟着回滚。
+
+        🔴 **为什么必须用数据库自己的故障，而不是 monkeypatch。**
+        monkeypatch 注入的异常走的是应用层的异常路径，
+        而这里要证明的是**事务边界本身**成立。
+        用触发器，故障发生在数据库进程里，应用层没有任何机会
+        "顺手清理一下"——那才是这条断言的对手。
+
+        ⚠️ 触发器在 ``finally`` 里删掉：它是共享测试库上的对象，
+        留着会让后续用例莫名其妙地 500。
+        """
+        del clean_tables
+
+        # 🔴 **必须先让"正常情况会写记忆"这条路成立**，否则触发器根本
+        # 不会被触发（没有 INSERT 就没有 BEFORE INSERT），
+        # 而症状是"HTTP 201 + 什么都没发生"——看起来像用例通过了。
+        # 因此正文用与用户隔离用例**同一句**（它已被证明能过写入策略），
+        # 并且 `allow_memory_update=True`。
+        user_id = uuid4()
+        conversation = await client.post(f"{API_PREFIX}/conversations")
+        sent = await client.post(
+            f"{API_PREFIX}/conversations/{conversation.json()['conversation_id']}/messages",
+            json={"content": _QUESTION, "user_id": str(user_id)},
+        )
+        assert sent.status_code == 201, sent.text
+        round_id = str(sent.json()["cognitive_round_id"])
+
+        async def _feedback_events() -> int:
+            async with engine.begin() as conn:
+                result = await conn.execute(
+                    text(
+                        "SELECT count(*) FROM events "
+                        "WHERE event_type IN ('user_feedback_received', 'experience.evaluated')"
+                    )
+                )
+                return int(result.scalar_one())
+
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    """
+                    CREATE OR REPLACE FUNCTION black_box_fail_memory_insert()
+                    RETURNS trigger AS $$
+                    BEGIN
+                        RAISE EXCEPTION 'black-box injected failure';
+                    END;
+                    $$ LANGUAGE plpgsql;
+                    """
+                )
+            )
+            await conn.execute(
+                text(
+                    """
+                    CREATE TRIGGER black_box_fail_memory_insert
+                    BEFORE INSERT ON memories
+                    FOR EACH ROW EXECUTE FUNCTION black_box_fail_memory_insert();
+                    """
+                )
+            )
+
+        try:
+            before_events = await _count_events(engine)
+            before_feedback = await _feedback_events()
+
+            response = await client.post(
+                f"{API_PREFIX}/cognitive-rounds/{round_id}/feedback",
+                json={
+                    "feedback_type": "correction",
+                    "content": "我喜欢简洁的回答，别啰嗦",
+                    "allow_memory_update": True,
+                },
+            )
+
+            assert response.status_code == 500, response.text
+            # 🔴 失败必须**什么都不留**：不是"少留一点"，是一点都不留。
+            assert await _count_events(engine) == before_events
+            assert await _feedback_events() == before_feedback
+        finally:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("DROP TRIGGER IF EXISTS black_box_fail_memory_insert ON memories")
+                )
+                await conn.execute(text("DROP FUNCTION IF EXISTS black_box_fail_memory_insert()"))
 
     async def test_concurrent_feedback_both_succeed(self, client: httpx.AsyncClient) -> None:
         """🔴 **两条并发反馈都会成功——本用例证明的就是这件事。**

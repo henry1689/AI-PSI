@@ -194,22 +194,38 @@ class TestTheValidatorsActuallyRefuseThings:
         它是门槛的计量单位——"这件事发生过几次"就是数它有几个不同取值。
         允许随手填，等于让**调用方**决定门槛有没有被跨过，
         而下游（门禁、提案、审计数字）看不出任何异常。
+
+        ⚠️ **两个方向都要试**，理由与前面对 `canonical_key` 的那条完全相同：
+        判据是"相等"，不是"谁大谁小"。只试一个方向的话，
+        把 `!=` 改成 `<` 的变异体**能不能被杀死取决于字符串的字典序**——
+        那是随机。**变异测试实测到了这一点**：第一版只用了
+        `"idem:我自己编的"`（它恰好 `< "round:<uuid>"`），
+        于是 `!=` → `<` 活了下来。
+
+        🔴 `"aaa-…"` 与 `"zzz-…"` 是**确定**更小 / 更大的两个字符串。
         """
-        with pytest.raises(ValidationError, match="independence_group"):
-            make_experience(independence_group="idem:我自己编的")
+        for forged in ("aaa-比真分组小", "zzz-比真分组大"):
+            with pytest.raises(ValidationError, match="independence_group"):
+                make_experience(independence_group=forged)
 
     def test_the_group_follows_the_round(self, make_experience) -> None:
         """事实改了、分组没跟着改，同样要拒绝——与 ``canonical_key`` 对称。
 
         上一条只证明"乱填会被拒"，这一条证明的是**精确一致**：
         拿着**另一个回合**算出来的分组来构造，也必须炸。
+
+        ⚠️ 两个回合 id 都用**确定的**排位（`int=1` 最小、
+        `int=2**128-1` 最大）并**双向**跑一遍。用随机 uuid 的话，
+        哪边大取决于运气——于是判据是 `<` 还是 `!=` 就测不出来。
         """
-        experience = make_experience()
-        with pytest.raises(ValidationError, match="independence_group"):
-            make_experience(
-                cognitive_round_id=uuid4(),
-                independence_group=experience.independence_group,
-            )
+        low = UUID(int=1)
+        high = UUID(int=2**128 - 1)
+        for donor, target in ((low, high), (high, low)):
+            with pytest.raises(ValidationError, match="independence_group"):
+                make_experience(
+                    cognitive_round_id=target,
+                    independence_group=f"round:{donor}",
+                )
 
     def test_the_idempotency_key_is_what_moves_the_group(self, make_experience) -> None:
         """正向对照：没有它，上面两条对"一律拒绝"的实现也成立。
