@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Final
 
@@ -55,6 +56,13 @@ from ai_psi.evaluation.isolation import (
     plan_isolation,
 )
 from ai_psi.evaluation.loader import DatasetError, GoldenDataset, load_dataset
+from ai_psi.evaluation.manifest import (
+    ReproducibilityError,
+    ReproducibilityManifest,
+    build_manifest,
+    collect_code_identity,
+    storage_identity,
+)
 from ai_psi.evaluation.postgres import (
     create_engine_for,
     drop_database,
@@ -68,15 +76,19 @@ from ai_psi.evaluation.runner import (
     RunResult,
     StorageIsolation,
     build_mock_runtime,
+    deterministic_settings,
 )
-from ai_psi.evaluation.serialization import write_reports
+from ai_psi.evaluation.serialization import dumps, write_reports
 from ai_psi.evaluation.snapshot import take_reference_snapshot
 from ai_psi.infrastructure.asyncio_compat import make_selector_loop
+from ai_psi.prompts.versions import build_default_registry
 
 __all__ = [
     "EXIT_DATASET_ERROR",
     "EXIT_ISOLATION_ERROR",
+    "EXIT_NOT_REPRODUCIBLE",
     "EXIT_OK",
+    "EXIT_OUTPUT_ERROR",
     "EXIT_TESTS_FAILED",
     "build_parser",
     "main",
@@ -86,6 +98,12 @@ EXIT_OK: Final[int] = 0
 EXIT_TESTS_FAILED: Final[int] = 1
 EXIT_DATASET_ERROR: Final[int] = 2
 EXIT_ISOLATION_ERROR: Final[int] = 3
+#: ``--require-reproducible`` 要求而身份不可用（阶段 7 · S3）。
+#: 🔴 与 ``EXIT_TESTS_FAILED`` 分开：那说明**案例没过**，这说**这次跑的
+#: 环境不满足可复现条件**——两者的处置完全不同。
+EXIT_NOT_REPRODUCIBLE: Final[int] = 4
+#: 报告 / 清单写盘失败。
+EXIT_OUTPUT_ERROR: Final[int] = 5
 
 _DEFAULT_DATASET: Final[str] = "evals/datasets"
 _DEFAULT_OUTPUT: Final[str] = "evals/reports/s1a-results.json"
@@ -149,6 +167,25 @@ def build_parser() -> argparse.ArgumentParser:
             "⚠️ 这不是安全开关——它不放松任何守卫，只是不执行清理"
         ),
     )
+    # ---- 可复现性（阶段 7 · S3）----
+    parser.add_argument(
+        "--manifest-output",
+        default=None,
+        help=(
+            "把可复现性清单单独写到这个路径（UTF-8、键排序、结尾恰好一个换行）。"
+            "⚠️ 清单**总是**写进原始报告；这个参数只是额外给一份独立文件"
+        ),
+    )
+    parser.add_argument(
+        "--require-reproducible",
+        action="store_true",
+        help=(
+            "要求这次运行具备正式可复现身份：Git 提交可用、工作树干净、"
+            "Prompt 注册表完整、PostgreSQL 模式 migrating 到 head。"
+            "任一不满足则在**执行案例之前**以退出码 4 失败。"
+            "⚠️ 不提供任何绕过它的开关"
+        ),
+    )
     return parser
 
 
@@ -160,6 +197,62 @@ def _load_dataset_or_exit(dataset_root: Path) -> GoldenDataset | int:
         print(f"数据集加载失败：{exc.detail}", file=sys.stderr)
         print(f"  出问题的路径：{exc.path}", file=sys.stderr)
         return EXIT_DATASET_ERROR
+
+
+def _provider_parameters(settings: Settings) -> dict[str, object]:
+    """Provider 配置摘要用的**白名单**参数。
+
+    🔴 只列会影响生成行为、且**不含秘密**的项。刻意不遍历 ``Settings``
+    的所有字段——那样一个新增的密钥字段会在无人察觉时进入摘要，
+    而摘要会被写进报告、粘进讨论区。
+
+    ⚠️ 本切片只跑 Mock。而 ``MockProvider.generate_structured`` **忽略**
+    ``ModelConfig``，因此采样参数（temperature 等）不影响结果；
+    真正影响结果的是 Mock 的实现本身，那由 ``commit_sha`` 覆盖。
+    这里记的是**配置层**会影响真实 Provider 行为的那些项。
+    """
+    return {
+        "json_mode": settings.llm_json_mode,
+        "max_retries": settings.llm_max_retries,
+        "reasoning_headroom_tokens": settings.llm_reasoning_headroom_tokens,
+    }
+
+
+def _require_reproducible_identity() -> None:
+    """``--require-reproducible`` 的**执行前**检查。
+
+    Raises:
+        ReproducibilityError: 任一条件不满足。**一条案例都不会跑**，
+            一个 HTTP 请求都不会发。
+    """
+    code = collect_code_identity()
+    if code.commit_sha is None:
+        msg = (
+            "拿不到 Git 提交（没有 .git，或 git 不可用），"
+            "因此这次运行无法被定位到某个代码版本。"
+            "⚠️ 本工具**不会**编造一个提交号来填满清单"
+        )
+        raise ReproducibilityError(msg)
+    if not code.working_tree_clean:
+        msg = (
+            "工作树不干净：这份结果来自一个**无法从提交号重建**的代码状态。"
+            "请先提交或 stash 改动。⚠️ 本工具不会替你清理工作树"
+        )
+        raise ReproducibilityError(msg)
+
+    if not build_default_registry().task_names():
+        msg = "Prompt 注册表为空，无法建立 Prompt 身份"
+        raise ReproducibilityError(msg)
+
+
+def _write_manifest(path: Path, manifest: ReproducibilityManifest) -> None:
+    """把清单单独写一份。
+
+    用与报告相同的 :func:`~ai_psi.evaluation.serialization.dumps`：
+    UTF-8、键排序、缩进固定、结尾恰好一个换行。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(dumps(manifest.model_dump(mode="json")), encoding="utf-8", newline="\n")
 
 
 def _report(result: RunResult, dataset: GoldenDataset, raw: Path, canonical: Path) -> None:
@@ -188,8 +281,29 @@ def _report(result: RunResult, dataset: GoldenDataset, raw: Path, canonical: Pat
 
 def _run_in_memory(arguments: argparse.Namespace, dataset: GoldenDataset) -> RunResult:
     """S1a 路径：内存后端 + Mock，直接调运行时。"""
-    runner = GoldenRunner(build_mock_runtime())
-    return asyncio.run(runner.run_dataset(dataset.cases, execution_mode=ExecutionMode.IN_MEMORY))
+    del arguments  # S1a 路径不看任何参数；清单里的仓库根用默认值
+    settings = deterministic_settings()
+    runtime = build_mock_runtime()
+    runner = GoldenRunner(runtime)
+
+    def _manifest(prompt_versions: Mapping[str, str]) -> ReproducibilityManifest:
+        return build_manifest(
+            cases=dataset.cases,
+            execution_mode=ExecutionMode.IN_MEMORY.value,
+            prompt_versions=prompt_versions,
+            provider_name=runtime.provider_name,
+            model_id=settings.llm_model or "",
+            provider_parameters=_provider_parameters(settings),
+            storage=storage_identity(backend="memory", alembic_revision=None),
+        )
+
+    return asyncio.run(
+        runner.run_dataset(
+            dataset.cases,
+            execution_mode=ExecutionMode.IN_MEMORY,
+            manifest_factory=_manifest,
+        )
+    )
 
 
 def _postgres_settings(identity: DatabaseIdentity) -> Settings:
@@ -277,15 +391,30 @@ async def _run_postgres_http(
 
     try:
         # ---- 迁移版本必须在案例执行**之前**核对 ----
-        await require_at_head(evaluation_engine, role="评测库")
+        head = await require_at_head(evaluation_engine, role="评测库")
         await require_at_head(reference_engine, role="参考库")
 
         before = await take_reference_snapshot(reference_engine)
 
         async with open_http_evaluation_executor(settings) as executor:
             runner = GoldenRunner(executor)
+
+            def _manifest(prompt_versions: Mapping[str, str]) -> ReproducibilityManifest:
+                return build_manifest(
+                    cases=dataset.cases,
+                    execution_mode=ExecutionMode.POSTGRES_HTTP.value,
+                    prompt_versions=prompt_versions,
+                    provider_name=executor.provider_name,
+                    model_id=settings.llm_model or "",
+                    provider_parameters=_provider_parameters(settings),
+                    # 🔴 只记 revision，不记库名——评测库的名字每次运行都不同。
+                    storage=storage_identity(backend="postgresql", alembic_revision=head),
+                )
+
             result = await runner.run_dataset(
-                dataset.cases, execution_mode=ExecutionMode.POSTGRES_HTTP
+                dataset.cases,
+                execution_mode=ExecutionMode.POSTGRES_HTTP,
+                manifest_factory=_manifest,
             )
 
         after = await take_reference_snapshot(reference_engine)
@@ -335,6 +464,15 @@ def main(argv: list[str] | None = None) -> int:
         return loaded
     dataset = loaded
 
+    # 🔴 可复现身份的检查排在**执行任何案例之前**：一条案例都不跑，
+    # 一个 HTTP 请求都不发。这也是它不提供任何绕过开关的原因。
+    if arguments.require_reproducible:
+        try:
+            _require_reproducible_identity()
+        except ReproducibilityError as exc:
+            print(f"不可复现：{exc}", file=sys.stderr)
+            return EXIT_NOT_REPRODUCIBLE
+
     if arguments.mode == _MODE_POSTGRES_HTTP:
         # 🔴 Windows 默认的 ``ProactorEventLoop`` 不被 psycopg 异步驱动支持
         # （ADR-0014 §1）。这里是**我们自建循环**，因此按那份 ADR 的优先级
@@ -348,9 +486,35 @@ def main(argv: list[str] | None = None) -> int:
     else:
         result = _run_in_memory(arguments, dataset)
 
+    # 🔴 "实际用到了哪些 Prompt"只有跑完才知道。一个版本都没记到，说明这次
+    # 运行拿不出可证明的 Prompt 身份——而 ``--require-reproducible`` 的承诺
+    # 正是"身份完整"，所以必须失败，而不是写出一份空身份的清单。
+    manifest = result.manifest
+    if arguments.require_reproducible and (manifest is None or not manifest.prompts.versions):
+        print(
+            "不可复现：本次运行没有记录到任何实际使用的 Prompt 版本，"
+            "无法证明它是在哪套提示词契约下跑出来的",
+            file=sys.stderr,
+        )
+        return EXIT_NOT_REPRODUCIBLE
+
     raw_path = Path(arguments.output)
     canonical_path = Path(arguments.canonical_output)
-    write_reports(result, raw_path=raw_path, canonical_path=canonical_path)
+    try:
+        write_reports(result, raw_path=raw_path, canonical_path=canonical_path)
+        if arguments.manifest_output:
+            if manifest is None:
+                msg = "本次运行没有采集到可复现性清单"
+                raise ReproducibilityError(msg)
+            _write_manifest(Path(arguments.manifest_output), manifest)
+    except OSError as exc:
+        # 写盘失败必须非零：一次"看起来跑完了却没产物"的运行是最坏的结果。
+        print(f"报告写盘失败：{type(exc).__name__}", file=sys.stderr)
+        return EXIT_OUTPUT_ERROR
+    except ReproducibilityError as exc:
+        print(f"清单不可用：{exc}", file=sys.stderr)
+        return EXIT_NOT_REPRODUCIBLE
+
     _report(result, dataset, raw_path, canonical_path)
     return EXIT_OK if result.passed_overall else EXIT_TESTS_FAILED
 

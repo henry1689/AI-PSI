@@ -29,6 +29,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final, Protocol
@@ -47,6 +49,7 @@ __all__ = [
     "JudgeOutcome",
     "assertion_names",
     "evaluate",
+    "registry_digest",
     "spec_for",
 ]
 
@@ -161,6 +164,16 @@ class AssertionSpec:
     single_valued: bool = True
     #: 不可观测时怎么办。S1a 全体统一为"判为不通过"，逐条写明。
     unobservable_behavior: str = "观测值取不到时判为**不通过**（绝不自动通过）"
+    #: 🔴 **判定语义的版本**（阶段 7 · S3）。
+    #:
+    #: :func:`registry_digest` 要回答的是"这份结果是在什么断言契约下得出的"。
+    #: 而判定逻辑是 Python 函数——``inspect.getsource`` 不能作为跨环境稳定的
+    #: 契约（换 Python 版本、换 AST 就变），也不能靠"函数对象"（含内存地址）。
+    #: 因此给每条断言一个人工维护的语义版本。
+    #:
+    #: **改动比较逻辑（阈值方向、边界包含与否、不可观测时的处置）就必须递增它。**
+    #: 只改措辞、注释、``detail`` 文案则不必——那些不影响判定结果。
+    semantics_version: str = "1"
 
 
 class _Judge(Protocol):
@@ -667,3 +680,55 @@ def evaluate(
         passed=passed,
         detail=detail,
     )
+
+
+def registry_digest() -> str:
+    """断言注册表的**语义摘要**（阶段 7 · S3）。
+
+    🔴 它回答的是"这份结果是在什么断言契约下得出的"。因此摘要必须覆盖
+    **判定语义**，而不只是名字：
+
+    ==========================  ===================================
+    纳入字段                    为什么它在语义里
+    ==========================  ===================================
+    ``name``                    断言的身份
+    ``applies_to``              它能不能用在这类案例上
+    ``expected_kind``           期望值的类型（``"4"`` 与 ``4`` 不是一回事）
+    ``allowed_values``          闭集取值；放宽它等于放宽契约
+    ``observed_from``           观测口径；换来源就是换语义
+    ``allows_required`` /       两种模式各自的可用性
+    ``allows_forbidden``
+    ``single_valued``           是否允许多次出现（矛盾检查的依据）
+    ``semantics_version``       比较逻辑本身的人工版本
+    ==========================  ===================================
+
+    ⚠️ **不纳入** ``detail``：它是给人看的措辞，改文案不该让全部历史结果
+    变成"在另一个契约下跑出来的"。
+
+    🔴 **不依赖字典插入顺序**：条目按断言名排序后再拼。
+    🔴 **不含内存地址、不含函数对象**：那两样会随进程变化，
+    拿它们当契约等于说"每次运行的契约都不一样"。
+
+    Returns:
+        形如 ``sha256:<hex>`` 的摘要。
+    """
+    entries: list[dict[str, object]] = []
+    for name in sorted(ASSERTIONS):
+        spec = ASSERTIONS[name]
+        entries.append(
+            {
+                "allowed_values": (
+                    None if spec.allowed_values is None else list(spec.allowed_values)
+                ),
+                "allows_forbidden": spec.allows_forbidden,
+                "allows_required": spec.allows_required,
+                "applies_to": sorted(spec.applies_to),
+                "expected_kind": spec.expected_kind.value,
+                "name": spec.name,
+                "observed_from": spec.observed_from,
+                "semantics_version": spec.semantics_version,
+                "single_valued": spec.single_valued,
+            }
+        )
+    payload = json.dumps(entries, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return f"sha256:{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"

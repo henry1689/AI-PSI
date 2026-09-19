@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final
@@ -50,6 +51,10 @@ from ai_psi.evaluation.assertions import (
     evaluate,
 )
 from ai_psi.evaluation.executors import CaseExecution, CaseExecutor
+from ai_psi.evaluation.manifest import (
+    ReproducibilityManifest,
+    prompt_versions_from_invocations,
+)
 from ai_psi.evaluation.models import GoldenCase
 
 __all__ = [
@@ -157,6 +162,20 @@ class MockRuntime:
         return CaseExecution(
             cognitive_round_id=outcome.cognitive_round_id,
             observation=await self.observe(outcome),
+            prompt_versions=await self.prompt_versions(outcome.cognitive_round_id),
+        )
+
+    async def prompt_versions(self, round_id: UUID) -> Mapping[str, str]:
+        """读本回合**实际调用过**的模型任务及其 Prompt 版本。
+
+        🔴 数据源是事件流里的模型调用记录（不变量 18 要求每次调用都写
+        ``task_name`` 与 ``prompt_version``），因此它证明的是"真的用了什么"，
+        而不是"代码里注册了什么"。
+        """
+        events = await self.read_events(round_id)
+        artifacts = project_artifacts(events)
+        return prompt_versions_from_invocations(
+            item.model_dump(mode="json") for item in artifacts.model_invocations
         )
 
     async def observe(self, outcome: RoundOutcome) -> CaseObservation:
@@ -257,6 +276,11 @@ class RunResult(BaseModel):
     execution_mode: str = ExecutionMode.IN_MEMORY.value
     #: 存储隔离证据；``in_memory`` 模式下为 ``None``（那时没有第二个库）。
     storage_isolation: StorageIsolation | None = None
+    #: 可复现性清单（阶段 7 · S3）。
+    #:
+    #: 🔴 原始报告带**完整**清单；canonical 只带其中的稳定身份子集
+    #: （见 :meth:`~ai_psi.evaluation.manifest.ReproducibilityManifest.canonical_identity`）。
+    manifest: ReproducibilityManifest | None = None
 
 
 def observation_of(
@@ -357,6 +381,18 @@ class GoldenRunner:
             案例结果。执行期异常**不向上抛**：它被记进 ``failure_reason`` /
             ``failure_detail``，其余案例继续跑，由调用方（CLI）返回非零退出码。
         """
+        result, _ = await self._execute_case(case)
+        return result
+
+    async def _execute_case(self, case: GoldenCase) -> tuple[CaseResult, Mapping[str, str]]:
+        """执行一条案例，并带回它**实际用到**的 Prompt 版本。
+
+        ``run_dataset`` 需要后者来组装可复现性清单，而 ``run_case`` 的
+        公开签名不该为了这件事变复杂——所以拆成两层。
+
+        Returns:
+            ``(案例结果, 实际用到的 Prompt 版本)``。执行失败时版本为空。
+        """
         expectations = [("required", expectation) for expectation in case.expectations.required] + [
             ("forbidden", expectation) for expectation in case.expectations.forbidden
         ]
@@ -369,16 +405,19 @@ class GoldenRunner:
             # 但兜住不等于吞掉：异常类型与原文都进结果（原文只进原始输出），
             # 且断言**不评估**（见 ``_unevaluated``）。
             reason = f"回合执行抛出异常：{type(exc).__name__}"
-            return CaseResult(
-                case_id=case.case_id,
-                category=case.category.value,
-                assertions=tuple(
-                    _unevaluated(mode, expectation.assertion, expectation.expected, reason)
-                    for mode, expectation in expectations
+            return (
+                CaseResult(
+                    case_id=case.case_id,
+                    category=case.category.value,
+                    assertions=tuple(
+                        _unevaluated(mode, expectation.assertion, expectation.expected, reason)
+                        for mode, expectation in expectations
+                    ),
+                    passed=False,
+                    failure_reason=reason,
+                    failure_detail=f"{type(exc).__name__}: {exc}",
                 ),
-                passed=False,
-                failure_reason=reason,
-                failure_detail=f"{type(exc).__name__}: {exc}",
+                {},
             )
 
         observation = execution.observation
@@ -386,16 +425,19 @@ class GoldenRunner:
             # 🔴 执行器报告"跑完了，但观测不到"。这条路径同样**不算通过**：
             # 一条没有观测的案例若被记成通过，报告会显示绿，而它什么都没验证。
             reason = "回合执行完成但没有产生可观测结果"
-            return CaseResult(
-                case_id=case.case_id,
-                category=case.category.value,
-                cognitive_round_id=execution.cognitive_round_id,
-                assertions=tuple(
-                    _unevaluated(mode, expectation.assertion, expectation.expected, reason)
-                    for mode, expectation in expectations
+            return (
+                CaseResult(
+                    case_id=case.case_id,
+                    category=case.category.value,
+                    cognitive_round_id=execution.cognitive_round_id,
+                    assertions=tuple(
+                        _unevaluated(mode, expectation.assertion, expectation.expected, reason)
+                        for mode, expectation in expectations
+                    ),
+                    passed=False,
+                    failure_reason=reason,
                 ),
-                passed=False,
-                failure_reason=reason,
+                execution.prompt_versions,
             )
 
         assertions = tuple(
@@ -403,14 +445,17 @@ class GoldenRunner:
             for mode, expectation in expectations
         )
         failed = [result.name for result in assertions if not result.passed]
-        return CaseResult(
-            case_id=case.case_id,
-            category=case.category.value,
-            cognitive_round_id=execution.cognitive_round_id,
-            observation=observation,
-            assertions=assertions,
-            passed=not failed,
-            failure_reason=None if not failed else f"未通过的断言：{'、'.join(failed)}",
+        return (
+            CaseResult(
+                case_id=case.case_id,
+                category=case.category.value,
+                cognitive_round_id=execution.cognitive_round_id,
+                observation=observation,
+                assertions=assertions,
+                passed=not failed,
+                failure_reason=None if not failed else f"未通过的断言：{'、'.join(failed)}",
+            ),
+            execution.prompt_versions,
         )
 
     async def run_dataset(
@@ -419,6 +464,7 @@ class GoldenRunner:
         *,
         execution_mode: ExecutionMode = ExecutionMode.IN_MEMORY,
         storage_isolation: StorageIsolation | None = None,
+        manifest_factory: Callable[[Mapping[str, str]], ReproducibilityManifest] | None = None,
     ) -> RunResult:
         """顺序执行整个数据集，产出汇总结果。
 
@@ -429,11 +475,23 @@ class GoldenRunner:
             cases: 案例（已按 ``case_id`` 排序）。
             execution_mode: 本次运行走的是哪条执行路径。
             storage_isolation: 存储隔离证据；只有 PostgreSQL 路径才有。
+            manifest_factory: 用**实际用到的 Prompt 版本**构造可复现性清单的回调。
+                🔴 清单里还有存储与 Provider 身份，那些只有调用方（CLI）知道，
+                所以这里收一个回调而不是自己去读配置——runner 不该知道
+                "这次连的是哪个库"。``None`` 表示本次不采集清单。
 
         Returns:
             汇总结果。
         """
-        results = tuple([await self.run_case(case) for case in cases])
+        prompt_versions: dict[str, str] = {}
+        results: list[CaseResult] = []
+        for case in cases:
+            result, versions = await self._execute_case(case)
+            # 取**并集**：不同深度的案例会走到不同的 Prompt 组件，
+            # 清单要回答的是"这次运行一共用到了哪些"。
+            prompt_versions.update(versions)
+            results.append(result)
+
         passed = sum(1 for result in results if result.passed)
         return RunResult(
             case_type="cognitive_behavior",
@@ -442,7 +500,8 @@ class GoldenRunner:
             passed=passed,
             failed=len(results) - passed,
             passed_overall=passed == len(results),
-            cases=results,
+            cases=tuple(results),
             execution_mode=execution_mode.value,
             storage_isolation=storage_isolation,
+            manifest=None if manifest_factory is None else manifest_factory(prompt_versions),
         )

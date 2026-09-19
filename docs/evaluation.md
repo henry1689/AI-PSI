@@ -171,3 +171,77 @@ Candidate : 候选策略
 报告必须包含运行版本信息（§6.3）。
 `evals/reports/` 的具体产物**不进 git**（见 `.gitignore`），
 只保留 `.gitkeep`——报告是可再生产物，不应污染提交历史。
+
+---
+
+## 8. 可复现性清单（阶段 7 · S3，**已实现**）
+
+一份评测结果若只有"10 个案例通过"，一周后是没法被理解的：不知道是哪个提交
+跑的、数据集有没有改过、提示词是不是同一版。每次运行现在都会产出一份
+**ReproducibilityManifest**，把这些身份钉在结果里。
+
+### 字段与来源
+
+| 分组 | 字段 | 权威来源 |
+|---|---|---|
+| `code` | `commit_sha` / `working_tree_clean` | `git rev-parse HEAD` / `git status --porcelain` |
+| | `package_version` | `ai_psi.__version__` |
+| `evaluation` | `case_schema_version` | `evaluation/models.py::CASE_SCHEMA_VERSION` |
+| | `dataset_digest` / `dataset_case_count` | 加载并规范化后的案例 |
+| | `assertion_registry_digest` | `evaluation/assertions.py::registry_digest()` |
+| | `execution_mode` | `in_memory` / `postgres_http` |
+| `prompts` | `versions` / `digest` | **实际发生**的模型调用记录（`ModelInvocationInfo`，不变量 18） |
+| `provider` | `provider_name` / `model_id` / `deterministic` | 装配结果 + 配置白名单 |
+| | `network_allowed` | 恒为 `false`（S1a/S2 只跑 Mock） |
+| | `configuration_digest` | 白名单参数 |
+| `runtime` | `python_version` / `ai_psi_version` | `sys.version_info` / 包版本 |
+| `storage` | `backend` / `alembic_revision` | 执行模式 / 库上读到的 revision |
+
+⚠️ **Prompt 版本记的是"这次运行真的走到过哪些"**，不是"仓库里注册了哪些"。
+数据源是不变量 18 要求的模型调用记录，因此可被证明；不经过的组件不会出现。
+
+### digest 的语义
+
+- 算法一律 **SHA-256**，输出形如 `sha256:<hex>`；
+- `dataset_digest` 基于**规范化后的案例语义**，不是 YAML 原始字节——
+  注释、缩进与键的书写顺序都不影响它，语义变化才会；
+- `assertion_registry_digest` 覆盖每条断言的判定语义，含一个人工维护的
+  `semantics_version`（改比较逻辑必须递增它；只改文案不必）；
+- `prompts.digest` 只覆盖实际使用过的组件；
+- `provider.configuration_digest` 只基于**白名单**参数——密钥变化不改变它，
+  行为参数变化才改变。
+
+### 原始结果与 canonical 的区别
+
+- **原始 JSON** 带完整清单；
+- **canonical JSON** 只带稳定身份子集：不含 `python_version`（补丁版本是
+  环境属性，换台机器不该表现为"不可比"）、不含 `working_tree_clean`
+  （那属于"能不能当基线"的判定）、不含数据库名（每次运行的评测库都不同）。
+
+### comparability 只判断身份契约
+
+`compare_manifests()` 回答"两份结果能不能放在一起比"，返回布尔值**加**
+机器可读的原因码：`dataset_differs` / `prompt_versions_differ` /
+`provider_differs` / `model_differs` / `code_revision_differs` /
+`dirty_worktree` / `identity_unavailable` 等。
+
+🔴 **它不判断性能回归。** 哪个更好属于后续切片；本切片也不计算通过率差异、
+回归数量或任何发布结论。
+
+### 秘密永不进入报告
+
+清单只输出白名单字段。API key、Authorization、数据库 URL、用户名、密码、
+完整环境变量集合一律不进——配置摘要本身就基于白名单结构计算。
+
+### dirty worktree 与无 `.git` 环境
+
+| 情形 | 处理 |
+|---|---|
+| 工作树脏 | **如实记录** `working_tree_clean: false`；可比较性给出 `dirty_worktree`。工具**不会**替你清理工作树 |
+| 无 `.git`（wheel 安装等） | `commit_sha` 记为**不可用**（`null`），**不编造**；可比较性给出 `identity_unavailable` |
+| `--require-reproducible` | 上述两种情形在**执行第一个案例之前**以退出码 `4` 失败 |
+
+### 尚未实现（属后续切片）
+
+Baseline/Candidate 对比、指标层、Markdown 报告、发布阈值、真实 Provider 评测。
+本文件 §5 与 §7 描述的是**目标形态**，不是当前实现状态。

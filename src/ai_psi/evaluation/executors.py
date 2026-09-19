@@ -27,9 +27,9 @@ S2 要的是后者：经过 FastAPI 路由、正式请求模型、正式应用�
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, MutableMapping
+from collections.abc import AsyncIterator, Mapping, MutableMapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 from uuid import UUID, uuid4
 
@@ -47,6 +47,7 @@ from ai_psi.config import Settings
 from ai_psi.container import Container
 from ai_psi.evaluation.assertions import CaseObservation
 from ai_psi.evaluation.isolation import require_mock_provider
+from ai_psi.evaluation.manifest import prompt_versions_from_invocations
 from ai_psi.evaluation.models import GoldenCase
 
 __all__ = [
@@ -76,6 +77,11 @@ class CaseExecution:
 
     cognitive_round_id: UUID | None
     observation: CaseObservation | None
+    #: 本回合**实际用到**的 Prompt 版本（任务名 → 语义版本）。
+    #:
+    #: 🔴 它来自不变量 18 要求的模型调用记录，不是"读代码猜的"。
+    #: 一个 D0 的案例不会经过哲学分析，因此这里天然只有它真走过的那几个。
+    prompt_versions: Mapping[str, str] = field(default_factory=dict)
 
 
 class CaseExecutor(Protocol):
@@ -227,6 +233,10 @@ class HttpEvaluationExecutor:
         return CaseExecution(
             cognitive_round_id=round_id,
             observation=_observation_from(accepted, summary, status),
+            # 正式摘要里的模型调用记录就是"实际用到了哪些 Prompt"的证据。
+            prompt_versions=prompt_versions_from_invocations(
+                view.model_dump(mode="json") for view in summary.model_invocations
+            ),
         )
 
     async def _get_json(self, path: str) -> dict[str, Any]:

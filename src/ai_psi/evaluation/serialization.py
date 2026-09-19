@@ -127,6 +127,24 @@ def _isolation_payload(result: RunResult, *, canonical: bool) -> dict[str, Any] 
     }
 
 
+def _manifest_payload(result: RunResult, *, canonical: bool) -> dict[str, Any] | None:
+    """可复现性清单。
+
+    * **原始输出**：完整清单——诊断时需要的正是全部身份；
+    * **canonical**：只有稳定且影响语义比较的**子集**
+      （见 ``ReproducibilityManifest.canonical_identity``）。
+
+    ⚠️ 清单本身**不含**秘密、数据库 URL、绝对路径与 Prompt 正文；
+    子集里更是刻意去掉了 ``python_version`` 与 ``working_tree_clean``。
+    """
+    manifest = result.manifest
+    if manifest is None:
+        return None
+    if canonical:
+        return manifest.canonical_identity()
+    return manifest.model_dump(mode="json")
+
+
 def canonical_payload(result: RunResult) -> dict[str, Any]:
     """构造 canonical（可比较）结果。"""
     return {
@@ -135,6 +153,7 @@ def canonical_payload(result: RunResult) -> dict[str, Any]:
         "provider": result.provider,
         "execution_mode": result.execution_mode,
         "storage_isolation": _isolation_payload(result, canonical=True),
+        "manifest": _manifest_payload(result, canonical=True),
         "summary": {
             "total": result.total,
             "passed": result.passed,
@@ -153,6 +172,7 @@ def raw_payload(result: RunResult) -> dict[str, Any]:
         "provider": result.provider,
         "execution_mode": result.execution_mode,
         "storage_isolation": _isolation_payload(result, canonical=False),
+        "manifest": _manifest_payload(result, canonical=False),
         "summary": {
             "total": result.total,
             "passed": result.passed,

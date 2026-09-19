@@ -752,3 +752,134 @@ class TestTheCliEndToEnd:
         assert prepared_databases.evaluation.password not in raw.read_text(encoding="utf-8")
         # 参考库确实没被动过
         assert await _count(reference_engine, "cognitive_rounds") == 1
+
+
+class TestReproducibilityManifestOnPostgres:
+    """S3：PostgreSQL 模式下的可复现性身份。"""
+
+    @staticmethod
+    def _argv(prepared: IsolationPlan, tmp_path: Path) -> tuple[list[str], Path, Path]:
+        """带回原始报告与清单文件路径的命令行。"""
+        raw = tmp_path / "s3.json"
+        manifest = tmp_path / "s3-manifest.json"
+        return (
+            [
+                "--mode",
+                "postgres-http",
+                "--dataset",
+                str(_DATASET),
+                "--evaluation-database-url",
+                prepared.evaluation.normalized_url,
+                "--reference-database-url",
+                prepared.reference.normalized_url,
+                "--output",
+                str(raw),
+                "--canonical-output",
+                str(tmp_path / "s3-canonical.json"),
+                "--manifest-output",
+                str(manifest),
+                # ⚠️ 两座库由**本模块**的 fixture 共享，不能被这次 CLI 删掉。
+                "--keep-databases",
+            ],
+            raw,
+            manifest,
+        )
+
+    async def test_the_postgres_run_records_the_migration_revision(
+        self,
+        prepared_databases: IsolationPlan,
+        seeded_reference: None,
+        tmp_path: Path,
+    ) -> None:
+        """🔴 存储身份记的是 **revision**，不是库名。"""
+        import json
+
+        from ai_psi.evaluation.postgres import alembic_head
+
+        argv, raw, manifest_path = self._argv(prepared_databases, tmp_path)
+        assert await asyncio.to_thread(main, argv) == EXIT_OK
+
+        payload = json.loads(raw.read_text(encoding="utf-8"))
+        manifest = payload["manifest"]
+        assert manifest["storage"]["backend"] == "postgresql"
+        assert manifest["storage"]["alembic_revision"] == alembic_head()
+        # 清单文件与报告里的那一份是同一个
+        assert json.loads(manifest_path.read_text(encoding="utf-8")) == manifest
+
+    async def test_the_manifest_records_the_prompts_actually_used(
+        self,
+        prepared_databases: IsolationPlan,
+        seeded_reference: None,
+        tmp_path: Path,
+    ) -> None:
+        """🔴 清单说的是"这次运行用了什么"，来源是真实的模型调用记录。"""
+        import json
+
+        argv, raw, _ = self._argv(prepared_databases, tmp_path)
+        assert await asyncio.to_thread(main, argv) == EXIT_OK
+
+        prompts = json.loads(raw.read_text(encoding="utf-8"))["manifest"]["prompts"]
+        assert prompts["versions"], "一次 10 案例的运行不可能一个 Prompt 都没用到"
+        assert prompts["digest"].startswith("sha256:")
+        # 深度不同的案例会走到不同组件，因此这里必然不止一两个
+        assert len(prompts["versions"]) > 1
+
+    async def test_the_manifest_carries_no_database_identity(
+        self,
+        prepared_databases: IsolationPlan,
+        seeded_reference: None,
+        tmp_path: Path,
+    ) -> None:
+        """🔴 随机库名、URL、用户名、密码都不得进入**可复现性清单**。
+
+        这条比"代码里没这么写"强：它检查的是**真的产出的字节**。
+
+        ⚠️ 检查范围是**清单**（报告里的 ``manifest`` 字段 + 独立清单文件），
+        不是整份原始报告：S2 的 ``storage_isolation`` 里刻意保留了库名，
+        那是**隔离证据**，与"版本身份"是两回事。
+        清单里只有 ``backend`` 与 ``alembic_revision``——库名每次运行都不同，
+        进了身份就等于说"两次运行永远不可比"。
+        """
+        import json
+
+        argv, raw, manifest_path = self._argv(prepared_databases, tmp_path)
+        assert await asyncio.to_thread(main, argv) == EXIT_OK
+
+        payload = json.loads(raw.read_text(encoding="utf-8"))
+        produced = manifest_path.read_text(encoding="utf-8") + json.dumps(
+            payload["manifest"], ensure_ascii=False
+        )
+        # ⚠️ 用户名（``ai_psi``）恰好是 ``ai_psi_version`` 的子串，
+        # 断言裸用户名会永远为假——那测的是版本号，不是凭据。
+        # 真正的泄漏形式是 ``user:password@`` 或完整 URL。
+        username = prepared_databases.evaluation.username
+        password = prepared_databases.evaluation.password
+        for forbidden in (
+            prepared_databases.evaluation.database,
+            prepared_databases.reference.database,
+            password,
+            f"{username}:{password}",
+            f"//{username}@",
+            "postgresql+psycopg://",
+        ):
+            assert forbidden not in produced, f"清单里出现了 {forbidden!r}"
+
+    async def test_the_canonical_identity_excludes_the_runtime(
+        self,
+        prepared_databases: IsolationPlan,
+        seeded_reference: None,
+        tmp_path: Path,
+    ) -> None:
+        """canonical 里的身份子集不含 Python 补丁版本——换台机器不该"不可比"。"""
+        import json
+        import platform
+
+        argv, _, _ = self._argv(prepared_databases, tmp_path)
+        canonical = tmp_path / "s3-canonical.json"
+        assert await asyncio.to_thread(main, argv) == EXIT_OK
+
+        identity = json.loads(canonical.read_text(encoding="utf-8"))["manifest"]
+        assert "python_version" not in identity
+        assert "working_tree_clean" not in identity
+        assert identity["storage_backend"] == "postgresql"
+        assert platform.python_version() not in json.dumps(identity)
