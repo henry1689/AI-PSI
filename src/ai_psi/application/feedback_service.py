@@ -293,11 +293,18 @@ def _resolve_correction_target(
 ) -> tuple[CorrectionTarget | None, str]:
     """在**本回合**的事件流里把 id 反查成"哪一类产物"。
 
-    🔴 **绑定是解析方式本身带来的，不是一句注释。**
+    🔴 **跨回合的绑定是解析方式本身带来的，不是一句注释。**
 
-    候选集合只有"这条回合的事件流"，因此：
-    别的回合的产物、别的用户/租户的记忆，**根本不在这张表里**——
+    候选集合只有"这条回合的事件流"，因此**别的回合的产物**
+    （以及根本不在事件流里的**记忆**）**不在候选里**——
     不需要额外的过滤条件，也就不会因为忘写一个 `WHERE user_id` 而漏。
+
+    ⚠️ **"跨主体"这一半没有结构保证，必须如实读**（评审 6.6 §F1 附注）：
+    V0.1 **全仓库没有鉴权**（`api/routes/` 里没有任何认证依赖），
+    因此任何知道 `round_id` 的调用方都能在**别人的回合**上发反馈、
+    写归因。本函数读的是"这条回合的流"，而它**不校验调用方是谁的回合**。
+    这是 V0.1 的全局性质（不是本阶段引入的），已记入 R74——
+    在那之前，"别的用户指不到你的产物"这句话**只对记忆成立**。
 
     ⚠️ 返回的第二种情况（"找到了但不接受纠正"）与第一种（"找不到"）
     是**两件事**，理由必须分开说：前者是调用方指对了但这类东西
@@ -499,6 +506,7 @@ class FeedbackService:
                 related_artifact_id=related_artifact_id,
                 correlation_id=correlation,
                 actor_id=actor_id,
+                user_id=user_id,
                 feedback_event_id=event.id,
             )
 
@@ -864,6 +872,7 @@ class FeedbackService:
         related_artifact_id: UUID | None,
         correlation_id: UUID,
         actor_id: str,
+        user_id: UUID | None,
         feedback_event_id: UUID,
     ) -> tuple[tuple[ExperienceAttributionRecord, ...], tuple[str, ...]]:
         """把这次纠正变成对某条经验的**错误归因**（阶段 6.6，ADR-0023）。
@@ -931,10 +940,15 @@ class FeedbackService:
 
         written: list[ExperienceAttributionRecord] = []
         for experience in experiences:
-            # 🔴 **重复纠正不写第二条**：同一个 feedback 事件重放、
-            # 或用户在同一个回合上点了两次同样的纠正，都落在这一条上。
-            # 少了它，重复反馈会让归因条数涨上去——而门槛数的是
-            # `independence_group`，涨条数本身不抬门槛，却会让审计视图骗人。
+            # 🔴 **再一次的重复纠正不写第二条**：同一个 feedback 事件重放、
+            # 或用户在同一个回合上按**先后**点了两次同样的纠正，都落在这一条上。
+            #
+            # ⚠️ **它是"尽力去重"，不是保证**（评审 6.6 §F2 实测）：上面的
+            # `already` 是一次**读**，下面是一次**写**，两者之间没有锁，
+            # 因此**并发**（同一纠正的两个请求间隔 < ~50ms）会各读到同一份
+            # `already`、各写一条事件。见 R73——包括"为什么它不抬门槛"：
+            # 读取端 `_attributions_for` 按同一个三元组去重，
+            # 所以涨的只有事件条数，不是计数。
             if (experience.id, attribution.error_type, related_artifact_id) in already:
                 continue
             record = ExperienceAttributionRecord(
@@ -959,6 +973,11 @@ class FeedbackService:
                     actor_id=actor_id,
                     correlation_id=correlation_id,
                     cognitive_round_id=round_id,
+                    # 🔴 与同事务的 `experience.evaluated` 一致地带上归属用户。
+                    # 少了它，同一条"用户纠正"链路上三个事件对"这是谁的事"
+                    # 会给出两个答案，将来任何按用户作用域的审计/导出
+                    # 都会**静默漏掉**归因（评审 6.6 §F6）。
+                    user_id=user_id,
                     payload={"attribution": record.model_dump(mode="json")},
                 )
             )

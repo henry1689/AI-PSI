@@ -114,7 +114,11 @@ _RUMINATING_QUESTION = "我应该原谅他吗？这是不是道德上正确的�
 
 
 async def _run_round(
-    client: httpx.AsyncClient, *, question: str = _QUESTION, depth: str | None = None
+    client: httpx.AsyncClient,
+    *,
+    question: str = _QUESTION,
+    depth: str | None = None,
+    user_id: UUID | None = None,
 ) -> str:
     """跑一个真实回合，返回它的 id。
 
@@ -126,12 +130,17 @@ async def _run_round(
             而"用户指得出被纠正的是哪一条产物"需要一个**可指的对象**。
             不显式请求的话，指针恒为 `None`，于是"没有提案"的断言
             会因为**前提不成立**而空过。
+        user_id: 归属用户。``None`` 表示匿名回合——
+            ⚠️ 匿名回合产出的**每一条**事件 ``user_id`` 都是空，
+            因此"归因事件带没带归属用户"这件事**只有带用户的回合才验得了**。
     """
     created = await client.post(f"{API_PREFIX}/conversations")
     conversation_id = created.json()["conversation_id"]
     payload: dict[str, Any] = {"content": question}
     if depth is not None:
         payload["requested_depth"] = depth
+    if user_id is not None:
+        payload["user_id"] = str(user_id)
     response = await client.post(
         f"{API_PREFIX}/conversations/{conversation_id}/messages",
         json=payload,
@@ -521,6 +530,17 @@ class TestTheCorrectionClosesTheAttributionLoop:
         body = response.json()
         assert body["attribution"] is None, body
         assert body["reasons"], "必须说清为什么没有归因"
+        # 🔴 **理由必须落到具体那一支。**（评审 6.6 §F5）
+        #
+        # 少了这两行，`inquiry` 这一格与 `random` 那一格**可观测结果完全相同**
+        # ——把 `_PAYLOAD_KINDS` 里的 `"inquiry"` 删掉，本用例照样全绿，
+        # 于是"找到了、但这类产物不接受纠正"这条规则其实没人钉住。
+        # 两支的理由在源码里是分开写的，这里就把它们分开断言。
+        reasons = " ".join(body["reasons"])
+        if pointer_from == "inquiry":
+            assert "不接受纠正" in reasons, reasons
+        else:
+            assert "解析不到" in reasons, reasons
         assert await _attributed_experiences(engine) == 0
         assert await _proposals(client) == []
 
@@ -533,7 +553,10 @@ class TestTheCorrectionClosesTheAttributionLoop:
         关联回合、关联原判断、纠正内容（反馈事件）、分类结果、
         分类依据、分类器版本。
         """
-        round_id = await _run_round(client, depth="d2")
+        # 🔴 **必须带用户**：匿名回合的每条事件 `user_id` 都是空，
+        # 那样这条断言会因为**前提不成立**而空过（评审 6.6 §F6）。
+        user_id = uuid4()
+        round_id = await _run_round(client, depth="d2", user_id=user_id)
         artifacts = await _artifacts_of(client, round_id)
         await _correct_at(client, round_id, artifact_id=artifacts["hypothesis"])
 
@@ -541,15 +564,23 @@ class TestTheCorrectionClosesTheAttributionLoop:
             result = await conn.execute(
                 text(
                     """
-                    SELECT payload -> 'attribution' AS attribution
+                    SELECT payload -> 'attribution' AS attribution, user_id
                     FROM events WHERE event_type = 'experience.attributed'
                     """
                 )
             )
-            rows = [row[0] for row in result.all()]
+            rows = result.all()
+            evaluated = await conn.execute(
+                text("SELECT user_id FROM events WHERE event_type = 'experience.evaluated'")
+            )
 
         assert len(rows) == 1, rows
-        record = rows[0]
+        # 🔴 **归属用户必须与同事务的其它事件一致**（评审 6.6 §F6）。
+        # 少了它，同一条"用户纠正"链路上几个事件对"这是谁的事"
+        # 会给出两个答案，将来任何按用户作用域的审计/导出都会静默漏掉归因。
+        assert rows[0][1] == user_id, "experience.attributed 缺了归属用户"
+        assert {row[0] for row in evaluated.all()} == {user_id}
+        record = rows[0][0]
         for key in (
             "cognitive_round_id",  # 关联回合
             "judgment_id",  # 关联原判断

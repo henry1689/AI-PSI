@@ -603,21 +603,21 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
     Equivalent(
         module="pattern_detector",
         operator="core/ReplaceTrueWithFalse",
-        line=104,
+        line=110,
         mutation="slots=False",
         reason="《slots 族》。同族的 `frozen=True → False` 由 `TestTheResultsAreImmutable` 杀掉",
     ),
     Equivalent(
         module="pattern_detector",
         operator="core/ReplaceTrueWithFalse",
-        line=152,
+        line=158,
         mutation="slots=False",
         reason="《slots 族》。同上",
     ),
     Equivalent(
         module="pattern_detector",
         operator="core/ReplaceTrueWithFalse",
-        line=172,
+        line=178,
         mutation="slots=False",
         reason="《slots 族》。同上",
     ),
@@ -641,7 +641,7 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
     Equivalent(
         module="pattern_detector",
         operator="core/ReplaceUnaryOperator_USub_Invert",
-        line=282,
+        line=288,
         mutation="(~item.weighted_count,",
         reason=(
             "`~x` 就是 `-x - 1`，是 `-x` 的**单调变换**（相差一个常数 1）。"
@@ -654,14 +654,14 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
     Equivalent(
         module="pattern_detector",
         operator="core/ReplaceUnaryOperator_USub_Invert",
-        line=285,
+        line=291,
         mutation="(~item.weighted_count,",
         reason="同上（`suppressed.sort` 用的是同一个键表达式）",
     ),
     Equivalent(
         module="pattern_detector",
         operator="core/NumberReplacer",
-        line=355,
+        line=361,
         mutation="evaluations[- 0]",
         reason=(
             "这一支**只在全部参与计数的评价权重都为 0 时**才进入"
@@ -675,7 +675,7 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
     Equivalent(
         module="pattern_detector",
         operator="core/ReplaceUnaryOperator_USub_Not",
-        line=355,
+        line=361,
         mutation="evaluations[not 1]",
         reason="同上：`not 1` 是 `False`，即下标 0——同样落在「全部权重为 0」的不可观察区间里",
     ),
@@ -696,7 +696,7 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
     Equivalent(
         module="pattern_detector",
         operator="core/ReplaceBinaryOperator_Mul_Div",
-        line=199,
+        line=205,
         mutation="/,",
         reason="《`*,` → `/,` 族》",
     ),

@@ -141,6 +141,17 @@ learning = await self._run_learning_after_commit(...)
   `LearningService._covered_keys()` 让已存在的 `(error_class, signature)`
   不再生成。触发器**不自己记"跑过了"**——那会是第二份真相来源。
 
+  > ⚠️ **这句话在并发下不成立，必须如实读**（评审 6.6 §F1 实测，
+  > 记为 **R72**）。`_covered_keys()` 是"先读已存在的提案、再生成"，
+  > 读与写之间没有锁，`improvement_proposals` 上也没有
+  > `(error_class, applicability)` 唯一约束——**间隔 < ~50ms 的两个
+  > 纠正请求会各自生成一条内容相同的 DRAFT 提案**。
+  >
+  > 准确的表述是：**顺序**重试不重复创建（黑盒场景 D 钉住了这一半），
+  > **并发**不保证。修它属于提案层（唯一索引 + 迁移 + 在"最后一道关"
+  > 处理冲突），不在本阶段范围内，因此本阶段**只改这句话，不改代码**——
+  > 让一行声称的保证回到它真正成立的范围里。
+
 **接线**：`application/ports.py::LearningTrigger`，由组合根注入
 （`container.py` 里 `feedback_service` 因此移到 `learning_service` **之后**
 构造；`LearningService` 不依赖 `FeedbackService`，不构成环）。

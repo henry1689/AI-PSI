@@ -50,6 +50,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Final
 from uuid import UUID
 
@@ -74,6 +75,11 @@ __all__ = [
 _MIN_ATTRIBUTION_CONFIDENCE: Final[int] = 1  # == ConfidenceBand.LOW.rank
 
 
+def _happened_at(item: ExperienceAssessment) -> tuple[datetime, str]:
+    """**发生时间**的排序键；``id`` 是并列时的确定键（同一微秒创建的两条经验）。"""
+    return (item.experience.created_at, str(item.experience.id))
+
+
 def _distinct_occurrences(
     members: Sequence[ExperienceAssessment],
 ) -> dict[str, ExperienceAssessment]:
@@ -96,7 +102,7 @@ def _distinct_occurrences(
     弱化版，而不是它的反面。
     """
     unique: dict[str, ExperienceAssessment] = {}
-    for item in members:
+    for item in sorted(members, key=_happened_at):
         unique.setdefault(item.experience.independence_group, item)
     return unique
 
@@ -113,9 +119,9 @@ class ErrorPattern:
         weighted_count: 按评价状态加权后的计数。
             🔴 **门槛比的是它**，不是 ``occurrence_count``——
             三次内部怀疑的分组数是 3，加权数是 0。
-        experience_count: 参与计数的经验对象条数。
-            它 ≥ ``occurrence_count``；两者的差就是"重复抽取 /
-            重试 / 重放"造出的冗余。把它报出来是为了让冗余可见。
+        experience_count: 参与计数的经验对象条数。⚠️ **当前恒等于**
+            ``occurrence_count``——两个构造点拿到的都是**去重之后**的集合，
+            因此它**报不出"重复抽取造出多少冗余"**（见 R75）。
         evaluations: 参与计数的经验的有效评价（去重、按次序排列）。
         evaluator_types: 参与计数经验的评估者类型（去重）。
         independence_groups: 去重后的分组键（升序）。
@@ -372,7 +378,4 @@ def _ordered(unique: dict[str, ExperienceAssessment]) -> list[ExperienceAssessme
 
     ``id`` 是并列时的确定排序键（同一微秒内创建的两条经验）。
     """
-    return sorted(
-        unique.values(),
-        key=lambda item: (item.experience.created_at, str(item.experience.id)),
-    )
+    return sorted(unique.values(), key=_happened_at)

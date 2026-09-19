@@ -270,8 +270,11 @@ class TestOccurrenceAccounting:
         assert len({item.cognitive_round_id for item in retried}) == 3
         scan = detector.detect(_assessed(retried))
         assert scan.patterns == ()
-        # 冗余是可见的：三条经验、一次发生
-        assert scan.suppressed[0].experience_count == 1
+        # ⚠️ **这里读不出"冗余"**（评审 6.6 §F4）：`experience_count` 与
+        # `occurrence_count` 拿的是同一份去重后的集合，两者恒等。
+        # 三条经验塌缩成一次发生这件事，只能由**本用例自己**的 `retried` 说明。
+        assert scan.suppressed[0].occurrence_count == 1
+        assert scan.suppressed[0].experience_count == scan.suppressed[0].occurrence_count
 
     def test_same_round_different_judgments_are_one_occurrence(
         self, detector, make_experience
@@ -293,6 +296,63 @@ class TestOccurrenceAccounting:
         ]
         assert len({item.judgment_id for item in within_one_round}) == 3
         assert detector.detect(_assessed(within_one_round)).patterns == ()
+
+    def test_a_groups_representative_does_not_depend_on_input_order(
+        self, detector: PatternDetector, make_experience
+    ) -> None:
+        """🔴 **整组算几，不能取决于调用方按什么顺序把经验递进来。**
+
+        评审 6.6 §F7 实测：``_distinct_occurrences`` 用 ``setdefault`` 取
+        **输入顺序里的第一条**代表整组，于是同一个集合换个顺序就得到不同的
+        加权计数（实测在 0 与 1 之间翻转）。门槛是"计几"的定义，
+        它不可以是调用顺序的函数。
+
+        修法：先按**发生时间**排一遍再取首条——那是本模块其它地方早已在用的
+        次序（``_ordered``），所以这次改的是"确定"，不是"策略"。
+
+        ⚠️ **现实里走不到**：一个回合产出一条经验，分组因此只有一条成员。
+        本条覆盖的是领域模型已经预留（``evaluation_target`` 存在的理由）、
+        当前还构造不出来的那种形状。
+        """
+        round_id = uuid4()
+        early = _experience(
+            make_experience,
+            cognitive_round_id=round_id,
+            judgment_id=uuid4(),
+            created_at=datetime.fromisoformat("2026-09-19T00:00:00+00:00"),
+            evaluation=ExperienceEvaluation.SUSPECTED,
+            evaluator_type=ExperienceEvaluator.INTERNAL_METACOGNITION,
+        )
+        late = _experience(
+            make_experience,
+            cognitive_round_id=round_id,
+            judgment_id=uuid4(),
+            created_at=datetime.fromisoformat("2026-09-19T01:00:00+00:00"),
+        )
+        # 同一个回合 = 同一个分组：整组只算一次发生，由谁代表它决定算几
+        assert early.independence_group == late.independence_group
+        assert early.id != late.id
+        confirmed_late = ExperienceEvaluationRecord(
+            created_by="test",
+            experience_id=late.id,
+            experience_canonical_key=late.canonical_key,
+            evaluation=ExperienceEvaluation.CONFIRMED,
+            evaluator_type=ExperienceEvaluator.USER_CORRECTION,
+            evaluator_version="test/1",
+            evidence_refs=[uuid4()],
+            evaluated_at=datetime.fromisoformat("2026-09-19T02:00:00+00:00"),
+        )
+
+        def weighted(order: Sequence[Experience]) -> int:
+            suppressed = detector.detect(assess_experiences(order, [confirmed_late])).suppressed
+            assert len(suppressed) == 1, suppressed
+            return suppressed[0].weighted_count
+
+        forward = weighted([early, late])
+        assert weighted([late, early]) == forward
+        # 代表整组的是**发生时间最早**的那条，因此算的是它的权重
+        # （SUSPECTED 默认权重为 0）——顺序换了也一样。
+        assert forward == 0
 
     def test_three_rebuilds_do_not_reach_the_threshold(self, detector, make_experience) -> None:
         """上面的组合版：两次真实发生 + 一次重建 = **两次**，不够门槛。"""
