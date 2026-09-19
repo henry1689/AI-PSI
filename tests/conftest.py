@@ -393,3 +393,34 @@ def _isolate_provider_credentials(
         monkeypatch.delenv(name, raising=False)
     # 注意：改的是**类属性上的 config 字典**，monkeypatch 会在用例结束后还原。
     monkeypatch.setitem(Settings.model_config, "env_file", None)
+
+
+#: 会被**运行环境**真实设置的应用环境变量。
+#:
+#: 它不是密钥，因此不属于 :func:`_isolate_provider_credentials` 的职责：
+#: 那条夹具管的是"别让开发机上的**凭据**渗进测试"，这条管的是
+#: "别让**运行环境**改变'默认值是什么'这类断言的答案"。
+_AMBIENT_ENVIRONMENT_VAR = "AI_PSI_ENV"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_application_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """把 ``AI_PSI_ENV`` 从测试进程的环境里摘掉。
+
+    🔴 **CI 在 job 级设了 ``AI_PSI_ENV: testing``**（``.github/workflows/ci.yml``），
+    它会一路渗进 pytest 进程。而 ``tests/unit/test_config.py`` 里有三个用例
+    断言的正是"**默认**环境是 ``development``"——于是它们在 CI 上
+    **确定性失败**、在开发机上通过（那里没有谁设这个变量）。
+    这与 :func:`_isolate_provider_credentials` 挡的是**同一类**东西：
+    断言依赖了"跑测试的那台机器上恰好是什么环境"。
+    它从 CI 第一次运行（``6113b1a``）起就存在，与业务代码无关。
+
+    ⚠️ ``tests/unit/test_config.py`` 里的 ``settings()`` 只关掉了 ``.env``
+    那一条通道（``_env_file=None``），**进程环境变量**这条一直开着——
+    本夹具补的正是它。
+
+    ⚠️ 本夹具**不**妨碍覆盖测试：用例在自己的函数体里
+    ``monkeypatch.setenv("AI_PSI_ENV", ...)`` 依然生效
+    （这条夹具先跑，用例的设置在其之后）。
+    """
+    monkeypatch.delenv(_AMBIENT_ENVIRONMENT_VAR, raising=False)
