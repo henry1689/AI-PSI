@@ -80,31 +80,45 @@ V0.1 要验证的不是"回答看起来多深刻"，而是下面五件事在代�
 | 阶段 4 | 真实 LLM Provider（DeepSeek） | ✅ 已完成 |
 | 阶段 5 | 长期记忆（PostgreSQL + pgvector） | ✅ 已完成 |
 | 阶段 6 | 反馈、经验与改进提案 | ✅ 已完成 |
-| 阶段 7 | 评测与回放 | ⬜ 未开始 |
+| 阶段 6.5 | 阶段 6 的完成定义修订（经验身份/评价/独立性分组、输入契约、门禁权威边界、变异测试） | ✅ 已完成 |
+| 阶段 6.6 | 真实错误归因闭环 | ✅ 已完成 |
+| 阶段 7‑专项 | **R72 并发唯一性加固**（进入阶段 7 后完成的专项） | ✅ 已完成 |
+| 阶段 7 | **评测与回放（任务书正式路线图）** | ⬜ **未开始** |
 | 阶段 8 | 完整验收与交付 | ⬜ 未开始 |
+
+> 🔴 **"阶段 7‑专项"与"阶段 7"是两件事。**
+> R72 是进入阶段 7 后完成的**专项加固**（修并发下会写出重复 DRAFT 提案的缺陷），
+> 它**不是**任务书 §18 定义的阶段 7 交付物。
+> **正式阶段 7 路线图一项都还没开始**——50 个 Golden Cases、Eval Runner、
+> 指标、Markdown/JSON 报告、版本比较全部为未开始。
+> 不要把"7‑专项 ✅"读成"阶段 7 已完成"。
+> 完整状态见 [`docs/implementation_plan.md`](docs/implementation_plan.md) §2。
 
 > 大型自主编码任务最常见的失败，不是写得慢，而是接口尚未稳定就盖到第八层。
 > 因此本项目**严格按阶段推进，每个阶段结束时仓库都处于可运行状态**。
 
-### 当前质量指标（阶段 6 实测）
+### 当前质量指标
 
-| 检查 | 结果 |
+> 🔴 **基线：`6113b1a`**（阶段 7‑专项 / R72 完成时）。下表的每个数字都是
+> 在该 SHA 上实测的；换基线就要重新测，**不要**沿用。
+
+| 检查 | 结果（`6113b1a`） |
 |---|---|
-| `make lint`（ruff） | 0 error |
-| `make typecheck`（mypy strict，**205 个文件**） | 0 error |
-| `make test` | **1600 passed, 9 skipped**（单元 + 属性 + 契约 + 场景 + API + 集成） |
-| 测试覆盖率 | 总体 **96%**；`domain/` 与 `cognition/` **98%**（门槛 85% / 75%） |
-| `learning/` 覆盖率 | **100%**（六个模块）——阶段 6 之前是**零测试** |
+| `make lint`（ruff lint + format） | 0 error |
+| `make typecheck`（mypy strict，**226 个文件**） | 0 error |
+| `make test`（`pytest -m "not live"`） | **2099 passed, 9 deselected**（单元 + 属性 + 契约 + 场景 + API + 集成 + 黑盒 + 并发 + 迁移） |
+| 测试覆盖率 | 总体 **96%**；`domain/` 与 `cognition/` **98%**（门槛 75% / 85%，**由 `make policy` 执行、CI 会跑**） |
+| `learning/` 覆盖率 | 整体 **99%**（7 个模块）——其中 6 个 100%；`error_classifier.py` 98%，未覆盖的 2 行是 `_category_for_correction` 末尾那条**不可达的 fail-closed 守卫**（`CorrectionTarget` 已在构造时用 `CORRECTABLE_KINDS` 拦住） |
 | **学习链路端到端** | ✅ **只用真实回合产出的事件**证明"三次同类错误 → DRAFT 提案"（`tests/scenarios/test_learning_chain.py`）；反方向也钉住：两次不够、判不了的经验跑多少次都凑不出模式 |
 | **独立评审** | ✅ 阶段 6 交付后补做三视角独立评审（互不通气、只读），抓到 **11 处确认缺陷**并全部修正——**最重要的一条是验收条件此前在跑起来的系统里不成立**（ADR-0019） |
 | 契约测试 | 事件存储 / 回合仓储 / 幂等键 / 长期记忆 / **改进提案**：同一组断言跑**内存与 PostgreSQL 两个实现** |
 | 场景 A–J | **全部通过**（任务书 §15.4） |
-| **真实模型端到端** | ✅ `make test-live`：**5 passed**（真实 DeepSeek；D0/D2/D4 三类回合全部跑通） |
+| **真实模型端到端** | ✅ `make test-live`：**5 passed**（真实 DeepSeek；D0/D2/D4 三类回合全部跑通）——⚠️ **上次实测于阶段 6，未在 `6113b1a` 复测**（需要网络与真实计费）。它不是上表那四个数字的一部分 |
 | **向量检索** | ✅ 512 维 + HNSW 余弦索引，在**真实 PostgreSQL** 上验证维度、索引、删除传播、空值语义 |
 | **不变量自检** | ✅ I01 / I10 / I11 在**运行期**被检查（试着构造 `"active"` 会失败），并接入 `/health/cognitive`；测试逐条把它们按坏，要求自检指出来 |
 | **不变量 11 的 DB 级强制** | ✅ 实测 `INSERT ... status='active'` 被 PostgreSQL 拒绝（`ck_improvement_proposals_status_valid`） |
 | 预算 | **无超预算回合**：调用前扣减 + 可选模块跳过 + 强制尾部保留 |
-| 数据库迁移 | `alembic upgrade head` 通过；**32 条 CHECK 约束**（`cognitive_rounds` 10 / `memories` 10 / `improvement_proposals` 6 / `events` 4 / 索引与幂等 2） |
+| 数据库迁移 | `alembic upgrade head` 通过；**32 条 CHECK 约束**（`cognitive_rounds` 10 / `memories` 10 / `improvement_proposals` 6 / `events` 4 / 幂等与向量 2）+ **24 个索引**（含 R72 的活跃模式唯一索引） |
 | 开发数据库 | PostgreSQL 16.15 + pgvector 0.8.6 |
 
 > **阶段 6 的三条验收条件都是"否定式"的**——它们说的是"什么不会自动发生"。
@@ -116,6 +130,34 @@ V0.1 要验证的不是"回答看起来多深刻"，而是下面五件事在代�
 > 默认配置（`AI_PSI_LLM_PROVIDER=mock` + `AI_PSI_STORAGE_BACKEND=memory`）
 > 下整套认知闭环零外部依赖；把 `AI_PSI_LLM_PROVIDER` 改成 `deepseek`
 > 并在环境里配好密钥，同一套代码就跑在真实推理模型上。
+
+---
+
+## 已知限制（Known limitations）
+
+🔴 **本节是已知限制的权威入口。** 每项只写**事实与后果**；
+完整分析与处置计划在 [`docs/risks.md`](docs/risks.md) 的对应条目里，不在此重复。
+
+| # | 事实 | 后果 | 详见 |
+|---|---|---|---|
+| **R40** | **没有认证层。** `user_id` 由调用方**声明**，不是从凭据推导出来的 | 作用域过滤防的是"代码写错导致的串号"，**不防恶意调用者**；故意传别人的 `user_id` 就能读到别人的记忆。认证不在 V0.1 范围内 | `risks.md` R40 |
+| **R74** | **"跨主体"不是结构保证。** `_resolve_correction_target` 只保证**跨回合**绑定（别的回合的产物不在候选集里），不保证跨主体 | 任何知道 `round_id` 的调用方都能在别人的回合上发反馈、写归因 | `risks.md` R74 |
+| **R45** | **反馈正文留在只追加的事件流里**，不随 `DELETE /users/{id}/data` 消失——那条路径**只覆盖记忆** | 用户以为删掉的**原话**仍在事件表里。响应与文档都写明了删除范围，但它与用户直觉不一致 | `risks.md` R45 |
+| **R41** | **默认向量是词面 n-gram，不是语义向量**（`AI_PSI_EMBEDDING_PROVIDER=local`，零成本、离线） | "喜欢简洁"与"讨厌啰嗦"几乎正交——检索效果与语义相似度**不是一回事** | `risks.md` R41 |
+| **R43** | **换向量 Provider 后旧记忆会静默失效**：向量维度是数据库列的固定属性，旧索引不会自动重建 | 症状是"一条都检索不到，且不报错" | `risks.md` R43 |
+| **R60** | **ADR-0020 §2 与 ADR-README G19 曾声称的 `canonical_key` 部分唯一索引从未建立**（两个库实测该索引数均为 0） | 文档已**降级为设计意向**。后果限于存储冗余：同一回合的经验可被写入两次；门槛计数**不受影响**（计量单位是 `independence_group`） | `risks.md` R60 |
+| **R52** | **I01 / I13 的"运行期强制"实际为零**：`assert_hypothesis_not_fact` 与 `assert_user_model_not_confirmed` 的 `raise` 分支不可达，且在 `src/` 里没有调用者 | 真正的保证在**类型层**（属性没有为 `True` 的可能）。它们不是防线，是写在代码里的文档 | `risks.md` R52 |
+| **R78** | **生产路径没有 Evidence 输入**（`SubmitMessageRequest` 无 evidence 字段 → `RoundRequest.evidence` 恒为空） | 归因规则「假设 / 有支持证据 → `REASONING_ERROR`」**永不触发**，恒走"无支持证据 → `EVIDENCE_ERROR`"。可能系统性多产 `EVIDENCE_ERROR`、少产 `REASONING_ERROR` | `risks.md` R78 |
+
+> ⚠️ **还有一条不属于"风险"、但必须一起读的边界**：
+> **阶段 7 的正式路线图尚未开始**（见上"当前进度"）。
+> 因此本版本**没有** Golden Cases、Eval Runner、评测报告与 Prompt 版本比较；
+> 上面那些限制里，有多项（R46 漏报率、R38 成本、R32 反刍阈值）
+> 正是**要等阶段 7 的评测数据**才能定的。
+>
+> 另有一条**经 ADR 批准的延后**（不算缺陷）：**Anthropic Provider 未实现**
+> ——ADR-0016 §1（已接受）决定本阶段不写它，理由是"没有测试也跑不通的实现只是空壳"。
+> 配置它会在装配时**明确报错**，不会静默回落。任务书的那条要求**没有被删除**，只是被正式推迟。
 
 ---
 

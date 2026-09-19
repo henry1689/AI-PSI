@@ -1,4 +1,4 @@
-# 能力证据矩阵（阶段 0–6）
+# 能力证据矩阵（阶段 0–6，含阶段 7‑专项 R72）
 
 > **本文件回答一个问题：这个仓库里声称成立的能力，哪些是**真的能从外部触达并观察到**的？**
 >
@@ -132,14 +132,14 @@
 |---|---|---|---|---|---|---|---|---|---|---|
 | **C5.1** | 记忆写入必须过写入策略（`WritePolicy`） | `POST /conversations/{id}/messages`、`POST /cognitive-rounds/{id}/feedback` | `memory_service.py` → `memory/write_policy.py` | `memories` 行（10 条 CHECK） | `test_write_policy.py`、`test_memory_service.py` | ✅ `test_memory_postgres.py` | ❌ | ✅ | **E2** | 策略是纯函数，测试充分；但**绕过路径**（直接 `uow.memories.add`）没有被对抗性测试钉住 |
 | **C5.2** | 记忆检索（pgvector 512 维 + HNSW 余弦索引） | `GET /users/{user_id}/memories` | `memories.py` → `MemoryService.retrieve` → `memory/retrieval.py` + `ranking.py` | 无（只读） | `test_memory_ranking.py`、`test_embeddings.py` | ✅ `test_memory_postgres.py`（维度、索引、删除传播、空值语义） | ❌ | ❌ | **E2** | 🔴 默认向量是**词面 n-gram，非语义**（ADR-0017 §1）：`喜欢简洁` 与 `讨厌啰嗦` 几乎正交。换 Provider 必须重建索引，否则**一条都检索不到且不报错**（risks R43） |
-| **C5.3** | 记忆生命周期：纠正 / 删除 / 导出 / 用户数据删除 | `POST /memories/{id}/correct`、`DELETE /memories/{id}`、`POST /users/{id}/export`、`DELETE /users/{id}/data` | `memories.py` → `MemoryService` → `memory/lifecycle.py` | 记忆行 + 生命周期事件 | `test_memory_lifecycle.py`、`test_memory_redaction.py` | 部分 | ❌ | ❌ | **E2** | 用户隔离（A 的数据不混入 B）在单测与契约测试里成立，但**没有黑盒验证**——§七.17 要求补 |
+| **C5.3** | 记忆生命周期：纠正 / 删除 / 导出 / 用户数据删除 | `POST /memories/{id}/correct`、`DELETE /memories/{id}`、`POST /users/{id}/export`、`DELETE /users/{id}/data` | `memories.py` → `MemoryService` → `memory/lifecycle.py` | 记忆行 + 生命周期事件 | `test_memory_lifecycle.py`、`test_memory_redaction.py` | 部分 | ⚠️ **部分**：隔离那一半有黑盒（见右），纠正 / 删除 / 用户数据删除三半没有 | ❌ | **E2** | 🔄 **本栏 2026-09-19 更正**：原文写"用户隔离……**没有黑盒验证**——§七.17 要求补"，**已过期**——§七.17 已经补上了：`test_black_box_acceptance.py::TestUserIsolationHoldsThroughTheApi` 的两条（列表隔离 + 导出隔离，后者还断言整包里不含对方的任何痕迹）。**等级仍记 E2**，因为该能力声明含四件事，而黑盒只覆盖其中"导出/列表隔离"这一件；**纠正 / 删除 / 用户数据删除仍只有单测与契约证据** |
 
 ### 阶段 6 — 反馈、经验与改进提案
 
 | # | 能力声明 | 入口 | 调用链 | 副作用 | 单测 | PG 集成 | 黑盒 | 反例 | 等级 | 残余风险 |
 |---|---|---|---|---|---|---|---|---|---|---|
 | **C6.1** | 反馈接收 → 事件落库 → 条件性记忆更新（**单事务** + 记忆失败降级） | `POST /cognitive-rounds/{id}/feedback` | `feedback.py:35` → `FeedbackService.record()`（三步同一 uow，唯一 `commit` 在最后） | `user_feedback_received` + 可能的 `experience.evaluated` + 可能的 `memories` 行 | `test_feedback_service.py`、`test_api_feedback.py` | ✅ `test_input_contract.py`、`test_black_box_acceptance.py`（真实 PG） | 部分：`TestAtomicityAndConcurrency` 只覆盖**事务开始前**失败（404） | 部分 | **E2** | §三 已改为**单事务**（评审 C 用数据库触发器实测：记忆写入故障 → 整体回滚零残留；评价事件故障 → 反馈事件也被回滚）。⚠️ §八 评审 C 指出两点：① 黑盒的 §七.13 用例只覆盖"事务开始前失败"，**中途失败没有黑盒用例**；② 事务内仍有一次 embedding provider 调用与一次**无 limit** 的全表扫（R57 同类） |
-| **C6.2** | 经验构建 + **确定性**错误归因（含**用户纠正**那条路径） | 回合收尾隐式触发 + `POST /cognitive-rounds/{id}/feedback`（带指针） | `cognitive_runtime._close_round` → `ExperienceBuilder` → `ErrorClassifier`；纠正路径 `feedback_service._attribute_experiences` → 同一分类器 | `experience.created` + `experience.attributed` 事件 | `test_experience_builder.py`、`test_error_classifier.py`、`test_correction_attribution.py` | 部分 | ✅ 黑盒 A–H + `TestTheCorrectionClosesTheAttributionLoop` | ✅（指不出对象 → `None`，不猜；类别冲突 → `None`，不挑） | **E3** | ⚠️ 归因判据里**仍有 3 条在生产上不可达**（`_from_failure` / `_from_budget` / `_from_memory_rejection`，R58）。🔴 用户纠正那条**已接通**（阶段 6.6）：实测的四个值组合（有/无指针 × 有/无否定反馈）全部按预期分流。⚠️ 类别映射是**约定不是测量**（R71），且纠正是**策略性归因**——置信度 `MODERATE` 的语义写在 ADR-0023 §3 |
+| **C6.2** | 经验构建 + **确定性**错误归因（含**用户纠正**那条路径） | 回合收尾隐式触发 + `POST /cognitive-rounds/{id}/feedback`（带指针） | `cognitive_runtime._close_round` → `ExperienceBuilder` → `ErrorClassifier`；纠正路径 `feedback_service._attribute_experiences` → 同一分类器 | `experience.created` + `experience.attributed` 事件 | `test_experience_builder.py`、`test_error_classifier.py`、`test_correction_attribution.py` | 部分 | ✅ 黑盒 A–H + `TestTheCorrectionClosesTheAttributionLoop` | ✅（指不出对象 → `None`，不猜；类别冲突 → `None`，不挑） | **E3** | ⚠️ 归因判据里**仍有 3 条在生产上不可达**（`_from_failure` / `_from_budget` / `_from_memory_rejection`，R58）。🔴 用户纠正那条**已接通**（阶段 6.6）：实测的四个值组合（有/无指针 × 有/无否定反馈）全部按预期分流。⚠️ 类别映射是**约定不是测量**（R71），且纠正是**策略性归因**——置信度 `MODERATE` 的语义写在 ADR-0023 §3。🔴 **另有 R78**（2026-09-19 全阶段审计发现）：**生产路径没有 Evidence 输入**，导致 ADR-0023 §2 的规则「假设 / **有**支持证据 → `REASONING_ERROR`」**永不触发**，恒走"无支持证据 → `EVIDENCE_ERROR`"。规则本身没有实现缺陷，是**它的输入条件在当前接口下拿不到**；影响 `EVIDENCE_ERROR` / `REASONING_ERROR` 的比例，而两者之比正是阶段 7 要统计的归因指标 |
 | **C6.3** | 模式发现：按**独立性分组**计数同类错误 | CLI `python -m ai_psi.main learn` + `POST /learning/runs` | `learning_service.py:264 review` → `_detector.detect` | 无（只读事件流） | `test_pattern_detector.py` + `tests/scenarios/test_learning_chain.py` | 部分 | 部分：端点可达性已验，**模式的真实形成未在黑盒层验过** | ✅（2 回合不够、不可归因永不达门槛） | **E2** | 计量单位是 `Experience.independence_group`，§八 评审 B 实测它此前**可被随手填**（1 回合 + 1 纠正 → 门槛 3）。已加逐字一致性校验（ADR-0020 §2）。⚠️ 黑盒层仍**无法**造出"三次同类错误"——默认 Mock 下每条经验的 `error_type` 都是 `None` |
 | **C6.4** | 门槛裁决（`PromotionPolicy`）：`None` ≠ `False` | 同上 | `learning_service.py` → `_gate.review` → `_policy.decide` | 无 | `test_promotion_policy.py` | 部分 | 部分 | ✅ | **E2** | 同上：可达 ≠ 会跑。默认 Mock 下 `decide` **一次都不会被调用** |
 | **C6.5** | 提案生成（`ProposalGenerator`） | 同上 | `learning_service.py:371` → `_generator.generate` | `improvement_proposals` 行（经 `ProposalGate` 授权） | `test_proposal_generator.py` | 部分 | ✅ **脚本化 Mock + 真实 HTTP + 真实 PG 下真的落库了 DRAFT**（评审 A 实测） | ✅（伪造裁决被拒） | **E2** | 黑盒用默认 Mock 时同样不会被调用；评审 A 的实测用了一次**脚本化 Mock**——那仍是对被测系统的黑盒，但那条路径**没有固化成用例** |
@@ -147,22 +147,40 @@
 | **C6.7** | **学习链路端到端：三次同类错误 → DRAFT 提案** | 🔴 **自动**（第三次纠正提交后触发）+ CLI + `POST /learning/runs` | `feedback_service._run_learning_after_commit` → `learning_service.review` → 检测 → 门禁 → 生成 → 落库 | `improvement_proposals` + 事件 | ✅ `tests/scenarios/test_learning_chain.py` | 部分 | ✅ `test_black_box_acceptance.py::TestTheCorrectionClosesTheAttributionLoop`（**A–H 八个场景**） | ✅（2 回合不够、内部怀疑权重为 0、类别冲突不计入） | **E3** | 🔴 **这一条在阶段 6.5 被降级过，阶段 6.6 把它补上了。** 降级的原因不是做错了，而是**默认配置下不成立**——那时每条经验的 `error_type` 都是 `None`，`decide`/`generate` 一次都不会被调用。现在：**A 场景一次都不调 `/learning/runs`**，三个真实回合 + 三次有依据的同类纠正之后 DRAFT 提案自己出现。⚠️ **两个前提**：纠正必须**指得出被纠正的产物**（`related_artifact_id`，从回合摘要接口取），且回合要走到 **D2 以上**（D0 不做假设，没有可指的对象）。🔄 **"不重复创建提案"这一半已在阶段 7 第一项补齐**：阶段 6.6 的独立评审实测出**并发**下会各生成一条内容相同的 DRAFT（R72），现在由部分唯一索引 `uq_improvement_proposals_active_pattern` 裁决（ADR-0024），**顺序**重试仍由黑盒场景 D 钉住。证据见下表的 C6.10 |
 | **C6.8** | 认知宪法不被学习模块修改 | 无独立入口（测试层强制） | `tests/unit/test_learning_constitution_boundary.py`（AST 扫描 + 运行时指纹比对） | 无 | ✅ | 不适用 | ❌ | ✅（AST 而非字符串搜索） | **E1** | 它是**测试**而非**运行期强制**：宪法在运行时被学习模块改写不会被拦截，只会在测试里变红。V0.1 可接受，但应明确记录 |
 | **C6.9** | 离线评测（`OfflineEvaluator`） | CLI + `POST /learning/runs` | `learning_service.py:338 _evaluate_offline` → `evaluator.compare` | 无（只读） | `test_offline_evaluator.py` | 部分 | ✅ **`offline_regression` 的方向判定已在真实 HTTP + 真实 PG 上断言** | ✅（对照干净时报 `false`、单侧数据报 `null`） | **E3** | §一 记的"**完全的死代码**、零调用者"已在 §四 修掉。§八 评审 A 复查时指出**两个真实阻断点**（评审结论已实证）：① `regressed()` 只在 `for pattern in scan.patterns` 内部被调用，**没有模式就一次都不调**；② `LearningRunResponse` 里**没有这个结论的出口**。两条都已修——退化判定现在算一次、门禁与运行结果共用，并作为**必填三态**字段回传 |
-| **C6.10** | **同一业务模式至多一条活跃提案（并发安全）** | 所有提案写入路径（自动触发 / `POST /learning/runs`） | `SqlAlchemyProposalRepository.add` → 部分唯一索引 `uq_improvement_proposals_active_pattern`；冲突 → `LearningService.review` 用**新事务**读回胜出者 → 记入 `already_covered` | `improvement_proposals` 的活跃行（并发下至多一条） | `test_in_memory_pattern_uniqueness.py`（13 项，含两工作单元交错提交） | ✅ `ProposalRepositoryContract`（两后端 27 项同断言） | ✅ **真实 HTTP × 真实 PostgreSQL × barrier × 20 轮**（`test_proposal_pattern_concurrency.py`）；另有迁移 7 项（空库 / 有数据 / 有重复 / downgrade） | ✅ 绕过应用层直接 `INSERT` 两条同键活跃行 → 数据库拒绝；索引名分流依据单独钉住 | **E3** | 🔴 **关掉它就是红的**：`DROP INDEX` 后跑并发用例真的写出 2 条提案、用例变红，恢复索引后变绿（ADR-0024 §6）。⚠️ 降级会**静默**重新打开 R72，见 R76；`find_active_for_pattern` 的多行守卫不可达，见 R77 |
 
 ---
 
-## 四、按等级汇总（阶段 6.5 结束时的状态）
+### 阶段 7‑专项 — R72（编号沿用 `C6.10`，**不重编号**）
 
-> 🔄 **下表已含阶段 6.6 的更新**（C6.2、C6.7 升到 E3）。
+> 🔴 **为什么这一节单独列，却仍用 `C6.` 前缀。**
+> R72 是**进入阶段 7 之后**完成的专项加固，语义上属于阶段 7；
+> 但 `C6.10` 这个编号已被 `docs/adr/0024`、`stage-6-6-completion-report.md`
+> 与本节 §四 的汇总表引用。**重编号会让那些引用静默失效**——
+> 索引里指着一个不存在的编号，比编号不整齐危险得多。
+> 因此保留编号、移动位置，并在 §四 的汇总里注明它属于阶段 7‑专项。
+
+| # | 能力声明 | 入口 | 调用链 | 副作用 | 单测 | PG 集成 | 黑盒 | 反例 | 等级 | 残余风险 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **C6.10** | **同一业务模式至多一条活跃提案（并发安全）** | 所有提案写入路径（自动触发 / `POST /learning/runs`） | `SqlAlchemyProposalRepository.add` → 部分唯一索引 `uq_improvement_proposals_active_pattern`；冲突 → `LearningService.review` 用**新事务**读回胜出者 → 记入 `already_covered` | `improvement_proposals` 的活跃行（并发下至多一条） | `test_in_memory_pattern_uniqueness.py`（13 项，含两工作单元交错提交） | ✅ `ProposalRepositoryContract`（两后端 27 项同断言） | ✅ **真实 HTTP × 真实 PostgreSQL × barrier × 20 轮**（`test_proposal_pattern_concurrency.py`）；另有迁移 7 项（空库 / 有数据 / 有重复 / downgrade） | ✅ 绕过应用层直接 `INSERT` 两条同键活跃行 → 数据库拒绝；索引名分流依据单独钉住 | **E3** | 🔴 **关掉它就是红的**：`DROP INDEX` 后跑并发用例真的写出 2 条提案、用例变红，恢复索引后变绿（ADR-0024 §6）。⚠️ 降级会**静默**重新打开 R72，见 R76；`find_active_for_pattern` 的多行守卫不可达，见 R77 |
+
+## 四、按等级汇总
+
+> 🔄 **下表已含阶段 6.6 与阶段 7‑专项（R72）的更新**
+> （C6.2、C6.7 升到 E3；C6.10 为阶段 7‑专项新增）。
 
 | 等级 | 数量 | 能力 |
 |---|---|---|
 | **E4 抗对抗** | **0** | — |
-| **E3 黑盒验过** | **6** | C0.2、C2.3、C6.2、C6.7、C6.9、**C6.10**（阶段 7 第一项新增） |
+| **E3 黑盒验过** | **6** | C0.2、C2.3、C6.2、C6.7、C6.9、**C6.10**（阶段 7‑专项 R72） |
 | **E2 生产可达** | **16** | C0.1、C1.1、C1.2、C2.1、C2.2、C3.1、C4.1、C4.2、C5.1、C5.2、C5.3、C6.1、C6.3、C6.4、C6.5、C6.6 |
 | **E1 仅测试** | **2** | C3.2、C6.8 |
 | **E0 无** | 0 | — |
-| **合计** | **23** | 阶段 0（2）+ 阶段 1（2）+ 阶段 2（3）+ 阶段 3（2）+ 阶段 4（2）+ 阶段 5（3）+ 阶段 6（9） |
+| **合计** | **24** | 阶段 0（2）+ 阶段 1（2）+ 阶段 2（3）+ 阶段 3（2）+ 阶段 4（2）+ 阶段 5（3）+ 阶段 6（9）+ **阶段 7‑专项（1，编号 C6.10）** |
+
+> ⚠️ **本矩阵只覆盖到阶段 6 与阶段 7‑专项（R72）。**
+> **任务书 §18 定义的正式阶段 7 路线图（Golden Cases / Eval Runner / 指标 /
+> 报告 / 版本比较）一项都还没开始**，因此它在矩阵里**没有行**——
+> 那是"未实现"，不是"漏登记"。详见 `docs/implementation_plan.md` §2。
 
 **与 §一 的对比**（`0 项 E3` → `3 项 E3`，`7 项 E1` → `2 项 E1`）：
 

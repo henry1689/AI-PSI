@@ -62,6 +62,38 @@
 （`POST /memories/{id}/correct`），**问题**是用户自己提的——
 让用户"纠正自己的问题"不会指向系统犯的错。
 
+> ### ⚠️ 实现状态注记（post-acceptance，2026-09-19 补记）
+>
+> **上表的规则一条都没有被删除或改写。**下面这段只记录一条
+> **实现层面的可达性事实**——它是在全阶段审计中发现的，当时并未记录。
+>
+> 🔴 **规则「假设 / 有支持证据 → `REASONING_ERROR`」在当前的 HTTP 生产
+> 输入路径下不可达。**
+>
+> 原因是**上游**的，不在本 ADR 的决策范围内：
+>
+> * `SubmitMessageRequest`（`api/schemas.py`）**没有 evidence 字段**；
+>   `api/routes/conversations.py` 构造 `RoundRequest` 时也不传它；
+> * 因此生产路径上 `RoundRequest.evidence` **恒为空元组**
+>   （`application/cognitive_runtime.py` 里它的默认值就是 `()`）；
+> * 于是 `hypothesis_generator.evaluate` 里
+>   `supporting = [item.id for item in evidence if ...]` **恒为空**，
+>   `Hypothesis.supporting_evidence_ids` 恒为空列表；
+> * 于是本服务的 `CorrectionTarget.has_supporting_evidence` 恒为 `False`
+>   ——**永远走"没有支持证据"那一行**。
+>
+> **一处独立佐证**：阶段 7 的并发验收用例（`test_proposal_pattern_concurrency.py`）
+> 跑了 20 轮，每一轮的情境签名都是 `d2|no_evidence|h2`
+> ——`evidence_bucket` 恒为 `no_evidence`。
+>
+> **后果**：`EVIDENCE_ERROR` 可能被系统性多产、`REASONING_ERROR` 少产，
+> 而这两者的比例正是阶段 7 要统计的归因指标之一。
+> **不要**据此认为上表的规则设计有问题——**规则本身没有实现缺陷，
+> 是它的输入条件在当前接口下拿不到**。
+>
+> 处置：**保留为风险**，见 `docs/risks.md` **R78**。本注记**不**改变
+> 任何归因实现，也**不**意味着该规则已被实现或已被删除。
+
 ### 3. 🔴 **置信度说的是什么**（这一条最容易被说过头）
 
 `attribution_confidence` 定为 `MODERATE`。但它的语义**必须**表述为：
@@ -190,3 +222,7 @@ learning = await self._run_learning_after_commit(...)
 * 归因冲突在 V0.1 **没有裁决入口**：冲突的经验会一直不计入门槛，
   直到有人手工处理。这是刻意的（"冲突解决前不计数"），
   但没有 UI 或接口去解决它。
+* 🔴 **§2 的规则「有支持证据 → `REASONING_ERROR`」在当前 HTTP 生产
+  输入路径下不可达**（原因见 §2 的实现状态注记）。处置为保留风险，
+  见 `docs/risks.md` **R78**——它等阶段 7 的 Golden Cases 与归因指标
+  提供数据后再决定要不要补 evidence 输入。
