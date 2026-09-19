@@ -14,7 +14,8 @@ PY ?= $(UV) run python
 COV = --cov=ai_psi --cov-report=term-missing --cov-report=xml
 
 .PHONY: help install lint fmt typecheck test test-unit test-integration policy check \
-        up down logs ps bootstrap migrate migrate-new clean test-live eval-golden
+        up down logs ps bootstrap migrate migrate-new clean test-live eval-golden \
+        eval-golden-postgres
 
 help:
 	@echo "AI-PSI 开发命令："
@@ -27,6 +28,7 @@ help:
 	@echo "  test-integration 只跑集成测试（需要数据库）"
 	@echo "  test-live        真实模型端到端（**会花钱**，需 AI_PSI_RUN_LIVE_TESTS=1）"
 	@echo "  eval-golden      Golden Case 评测（Mock、不联网、不写生产库）"
+	@echo "  eval-golden-postgres  S2 评测（正式 HTTP + 专用 PostgreSQL；需 EVAL_DB/REF_DB）"
 	@echo "  policy           覆盖率闸门（domain/cognition 85%、总体 75%）"
 	@echo "  check            lint + typecheck + test + policy（提交前跑这个）"
 	@echo "  up               启动 PostgreSQL 16 + pgvector 容器"
@@ -79,6 +81,29 @@ eval-golden:
 		--dataset evals/datasets \
 		--output evals/reports/s1a-results.json \
 		--canonical-output evals/reports/s1a-canonical.json
+
+# S2 评测：正式 HTTP 路由 + 真实 PostgreSQL（阶段 7 · S2）。
+#
+# 🔴 **两座库都必须显式给出**，不从 AI_PSI_DATABASE_URL 猜：
+#
+#     make eval-golden-postgres \
+#         EVAL_DB="postgresql+psycopg://user:pw@host:port/xxx_eval_test" \
+#         REF_DB="postgresql+psycopg://user:pw@host:port/yyy_reference_test"
+#
+#   两个库名必须分别以 `_eval_test` / `_reference_test` 结尾，且互不相同；
+#   命令行入口会先跑完全部隔离预检，任一不过就一条案例都不执行。
+#
+# ⚠️ 本目标**不**打印连接串。它只把参数原样交给 CLI。
+eval-golden-postgres:
+	@test -n "$(EVAL_DB)" || { echo "缺少 EVAL_DB（专用评测库连接串）" >&2; exit 2; }
+	@test -n "$(REF_DB)" || { echo "缺少 REF_DB（专用参考库连接串）" >&2; exit 2; }
+	$(PY) -m ai_psi.evaluation.cli \
+		--mode postgres-http \
+		--dataset evals/datasets \
+		--evaluation-database-url "$(EVAL_DB)" \
+		--reference-database-url "$(REF_DB)" \
+		--output evals/reports/s2-results.json \
+		--canonical-output evals/reports/s2-canonical.json
 
 policy:
 	$(UV) run coverage report --fail-under=75

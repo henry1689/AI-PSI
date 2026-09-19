@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Final
 from uuid import UUID, uuid4
 
@@ -48,15 +49,49 @@ from ai_psi.evaluation.assertions import (
     CaseObservation,
     evaluate,
 )
+from ai_psi.evaluation.executors import CaseExecution, CaseExecutor
 from ai_psi.evaluation.models import GoldenCase
 
 __all__ = [
     "CaseResult",
+    "ExecutionMode",
     "GoldenRunner",
+    "MockRuntime",
     "RunResult",
+    "StorageIsolation",
     "build_mock_runtime",
     "deterministic_settings",
 ]
+
+
+class ExecutionMode(StrEnum):
+    """评测的执行模式（阶段 7）。
+
+    * ``in_memory`` —— S1a 的路径：内存后端 + Mock，直接调运行时。
+      它证明案例契约与断言判定，**不**证明正式 HTTP 路径；
+    * ``postgres_http`` —— S2 的路径：专用 PostgreSQL + 正式 HTTP 路由。
+    """
+
+    IN_MEMORY = "in_memory"
+    POSTGRES_HTTP = "postgres_http"
+
+
+class StorageIsolation(BaseModel):
+    """存储隔离证据（只有 ``postgres_http`` 模式才有）。
+
+    🔴 这里只有**库名**与**布尔结论**：没有完整 URL、没有用户名、
+    没有密码、没有主机凭据。报告会被提交到讨论区、粘进 issue，
+    三者都不该在那里出现。
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    evaluation_database: str
+    reference_database: str
+    same_database: bool
+    reference_snapshot_unchanged: bool
+    reference_learning_state_unchanged: bool
+
 
 #: 结果格式自身的版本。**与案例的 ``schema_version`` 是两回事**：
 #: 前者说"这份 JSON 长什么样"，后者说"案例文件长什么样"。
@@ -83,11 +118,70 @@ def deterministic_settings() -> Settings:
 
 @dataclass(frozen=True, slots=True)
 class MockRuntime:
-    """装配好的 Mock 运行时及其依赖。"""
+    """装配好的 Mock 运行时及其依赖。
+
+    它**同时**是 :class:`~ai_psi.evaluation.executors.CaseExecutor` 的一个实现：
+    有 ``provider_name``，也有 ``execute``。于是 ``GoldenRunner`` 可以在
+    "直接调运行时"与"走正式 HTTP"之间替换执行器，而断言判定与结果序列化
+    两个切片一行都不用改。
+    """
 
     runtime: CognitiveRuntime
     uow_factory: UnitOfWorkFactory
     provider_name: str
+
+    async def execute(self, case: GoldenCase) -> CaseExecution:
+        """执行一条案例（内存路径）。
+
+        ⚠️ **不捕获异常**：回合执行期的异常原样上抛，由
+        :meth:`GoldenRunner.run_case` 统一记成结构化失败。在这里吞掉它
+        会让"跑失败"与"跑成功但断言不过"变成同一个东西。
+
+        Args:
+            case: 待执行的案例。
+
+        Returns:
+            回合 id 与观测。
+        """
+        outcome = await self.runtime.run_round(
+            RoundRequest(
+                user_message=case.stimulus.input,
+                user_id=uuid4(),
+                requested_depth=case.stimulus.requested_depth,
+                conversation_summary=tuple(case.stimulus.user_context.conversation_summary),
+                open_questions=tuple(case.stimulus.user_context.open_questions),
+                confirmed_user_goals=tuple(case.stimulus.user_context.confirmed_user_goals),
+                system_status=tuple(case.stimulus.user_context.system_status),
+            )
+        )
+        return CaseExecution(
+            cognitive_round_id=outcome.cognitive_round_id,
+            observation=await self.observe(outcome),
+        )
+
+    async def observe(self, outcome: RoundOutcome) -> CaseObservation:
+        """读事件流并整理出观测。"""
+        events = await self.read_events(outcome.cognitive_round_id)
+        artifacts = project_artifacts(events)
+        analysis_kinds = tuple(
+            sorted(
+                {
+                    str(record.payload["analysis_kind"])
+                    for record in artifacts.of_type(EventType.COGNITION_ANALYSIS_COMPLETED)
+                    if "analysis_kind" in record.payload
+                }
+            )
+        )
+        return observation_of(
+            outcome,
+            hypothesis_count=len(artifacts.of_type(EventType.HYPOTHESIS_CREATED)),
+            analysis_kinds=analysis_kinds,
+        )
+
+    async def read_events(self, round_id: UUID) -> list[Event]:
+        """按回合读取事件流（**只读**，不开事务写任何东西）。"""
+        async with self.uow_factory() as uow:
+            return await uow.events.read_stream(cognitive_round_id=round_id)
 
 
 def build_mock_runtime() -> MockRuntime:
@@ -159,6 +253,10 @@ class RunResult(BaseModel):
     failed: int
     passed_overall: bool
     cases: tuple[CaseResult, ...] = Field(default_factory=tuple)
+    #: 本次运行走的是哪条执行路径（阶段 7 · S2）。
+    execution_mode: str = ExecutionMode.IN_MEMORY.value
+    #: 存储隔离证据；``in_memory`` 模式下为 ``None``（那时没有第二个库）。
+    storage_isolation: StorageIsolation | None = None
 
 
 def observation_of(
@@ -230,15 +328,24 @@ def _unevaluated(
 
 
 class GoldenRunner:
-    """在 Mock 上执行 Golden Case。"""
+    """在某个**执行器**上执行 Golden Case。
 
-    def __init__(self, runtime: MockRuntime) -> None:
+    🔴 **执行器是可替换的。** S1a 的"直接调运行时"（内存）与 S2 的
+    "走正式 HTTP"（PostgreSQL）都实现 :class:`CaseExecutor`；断言判定与
+    结果序列化对两者一视同仁——它们本来就不该知道回合是怎么跑起来的。
+
+    ``MockRuntime`` 自身就满足 ``CaseExecutor``，因此
+    ``GoldenRunner(build_mock_runtime())`` 仍是 S1a 那条路径，签名未变。
+    """
+
+    def __init__(self, executor: CaseExecutor) -> None:
         """初始化。
 
         Args:
-            runtime: 由 :func:`build_mock_runtime` 装配好的运行时。
+            executor: 执行器。传 :func:`build_mock_runtime` 的产物就是
+                内存路径。
         """
-        self._runtime = runtime
+        self._executor = executor
 
     async def run_case(self, case: GoldenCase) -> CaseResult:
         """执行一条案例。
@@ -255,18 +362,7 @@ class GoldenRunner:
         ]
 
         try:
-            outcome = await self._runtime.runtime.run_round(
-                RoundRequest(
-                    user_message=case.stimulus.input,
-                    user_id=uuid4(),
-                    requested_depth=case.stimulus.requested_depth,
-                    conversation_summary=tuple(case.stimulus.user_context.conversation_summary),
-                    open_questions=tuple(case.stimulus.user_context.open_questions),
-                    confirmed_user_goals=tuple(case.stimulus.user_context.confirmed_user_goals),
-                    system_status=tuple(case.stimulus.user_context.system_status),
-                )
-            )
-            observation = await self._observe(outcome)
+            execution = await self._executor.execute(case)
         except Exception as exc:
             # 🔴 **兜住一切，这是刻意的。**
             # 一条案例炸掉不该带走整个数据集——那样剩下的 9 条永远没机会说话。
@@ -285,6 +381,23 @@ class GoldenRunner:
                 failure_detail=f"{type(exc).__name__}: {exc}",
             )
 
+        observation = execution.observation
+        if observation is None:
+            # 🔴 执行器报告"跑完了，但观测不到"。这条路径同样**不算通过**：
+            # 一条没有观测的案例若被记成通过，报告会显示绿，而它什么都没验证。
+            reason = "回合执行完成但没有产生可观测结果"
+            return CaseResult(
+                case_id=case.case_id,
+                category=case.category.value,
+                cognitive_round_id=execution.cognitive_round_id,
+                assertions=tuple(
+                    _unevaluated(mode, expectation.assertion, expectation.expected, reason)
+                    for mode, expectation in expectations
+                ),
+                passed=False,
+                failure_reason=reason,
+            )
+
         assertions = tuple(
             evaluate(expectation.assertion, mode, expectation.expected, observation)
             for mode, expectation in expectations
@@ -293,51 +406,43 @@ class GoldenRunner:
         return CaseResult(
             case_id=case.case_id,
             category=case.category.value,
-            cognitive_round_id=outcome.cognitive_round_id,
+            cognitive_round_id=execution.cognitive_round_id,
             observation=observation,
             assertions=assertions,
             passed=not failed,
             failure_reason=None if not failed else f"未通过的断言：{'、'.join(failed)}",
         )
 
-    async def run_dataset(self, cases: tuple[GoldenCase, ...]) -> RunResult:
+    async def run_dataset(
+        self,
+        cases: tuple[GoldenCase, ...],
+        *,
+        execution_mode: ExecutionMode = ExecutionMode.IN_MEMORY,
+        storage_isolation: StorageIsolation | None = None,
+    ) -> RunResult:
         """顺序执行整个数据集，产出汇总结果。
 
         🔴 **顺序执行**，没有并发：V0.1 没有 worker 与队列（任务书 §12.1），
         评测不该成为第一个引入它们的地方。
+
+        Args:
+            cases: 案例（已按 ``case_id`` 排序）。
+            execution_mode: 本次运行走的是哪条执行路径。
+            storage_isolation: 存储隔离证据；只有 PostgreSQL 路径才有。
+
+        Returns:
+            汇总结果。
         """
         results = tuple([await self.run_case(case) for case in cases])
         passed = sum(1 for result in results if result.passed)
         return RunResult(
             case_type="cognitive_behavior",
-            provider=self._runtime.provider_name,
+            provider=self._executor.provider_name,
             total=len(results),
             passed=passed,
             failed=len(results) - passed,
             passed_overall=passed == len(results),
             cases=results,
+            execution_mode=execution_mode.value,
+            storage_isolation=storage_isolation,
         )
-
-    async def _observe(self, outcome: RoundOutcome) -> CaseObservation:
-        """读事件流并整理出观测。"""
-        events = await self._read_events(outcome.cognitive_round_id)
-        artifacts = project_artifacts(events)
-        analysis_kinds = tuple(
-            sorted(
-                {
-                    str(record.payload["analysis_kind"])
-                    for record in artifacts.of_type(EventType.COGNITION_ANALYSIS_COMPLETED)
-                    if "analysis_kind" in record.payload
-                }
-            )
-        )
-        return observation_of(
-            outcome,
-            hypothesis_count=len(artifacts.of_type(EventType.HYPOTHESIS_CREATED)),
-            analysis_kinds=analysis_kinds,
-        )
-
-    async def _read_events(self, round_id: UUID) -> list[Event]:
-        """按回合读取事件流（**只读**，不开事务写任何东西）。"""
-        async with self._runtime.uow_factory() as uow:
-            return await uow.events.read_stream(cognitive_round_id=round_id)

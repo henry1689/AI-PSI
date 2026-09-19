@@ -106,7 +106,6 @@ class TestExecutionFailures:
 
     async def test_an_exception_is_recorded_not_swallowed_as_a_pass(
         self,
-        runner: GoldenRunner,
         case_dict: CaseDict,
         write_dataset: WriteDataset,
         monkeypatch: pytest.MonkeyPatch,
@@ -117,7 +116,12 @@ class TestExecutionFailures:
             msg = "人为制造的回合失败"
             raise RuntimeError(msg)
 
-        monkeypatch.setattr(runner._runtime.runtime, "run_round", _boom)
+        # 就地装配一个运行时并打断它的回合入口。用的是**公开字段**
+        # （``MockRuntime.runtime``），不是执行器内部的私有属性——
+        # 后者在 S2 把执行器抽成可替换的之后就不再是稳定的接入点了。
+        runtime = build_mock_runtime()
+        monkeypatch.setattr(runtime.runtime, "run_round", _boom)
+        runner = GoldenRunner(runtime)
         dataset = load_dataset(write_dataset(case_dict))
         result = await runner.run_case(dataset.cases[0])
 

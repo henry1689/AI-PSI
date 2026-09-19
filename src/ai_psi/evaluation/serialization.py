@@ -98,12 +98,43 @@ def _case_payload(result: CaseResult, *, canonical: bool) -> dict[str, Any]:
     return payload
 
 
+def _isolation_payload(result: RunResult, *, canonical: bool) -> dict[str, Any] | None:
+    """存储隔离证据。
+
+    🔴 **canonical 里没有库名。** 两次独立的 PostgreSQL 运行用的是两个
+    **不同**的 evaluation database（每次都要是全新的、可丢弃的），
+    库名进 canonical 会让"逐字节一致"这条承诺当场失效。
+
+    留下来的三个布尔是**结论**，不是过程数据：
+    "两个库不是同一个""参考快照没变""参考学习状态没变"。
+    它们是稳定的，而且是读者真正要看的。
+    """
+    isolation = result.storage_isolation
+    if isolation is None:
+        return None
+    if canonical:
+        return {
+            "reference_learning_state_unchanged": isolation.reference_learning_state_unchanged,
+            "reference_snapshot_unchanged": isolation.reference_snapshot_unchanged,
+            "same_database": isolation.same_database,
+        }
+    return {
+        "evaluation_database": isolation.evaluation_database,
+        "reference_database": isolation.reference_database,
+        "same_database": isolation.same_database,
+        "reference_snapshot_unchanged": isolation.reference_snapshot_unchanged,
+        "reference_learning_state_unchanged": isolation.reference_learning_state_unchanged,
+    }
+
+
 def canonical_payload(result: RunResult) -> dict[str, Any]:
     """构造 canonical（可比较）结果。"""
     return {
         "schema_version": result.schema_version,
         "case_type": result.case_type,
         "provider": result.provider,
+        "execution_mode": result.execution_mode,
+        "storage_isolation": _isolation_payload(result, canonical=True),
         "summary": {
             "total": result.total,
             "passed": result.passed,
@@ -120,6 +151,8 @@ def raw_payload(result: RunResult) -> dict[str, Any]:
         "schema_version": result.schema_version,
         "case_type": result.case_type,
         "provider": result.provider,
+        "execution_mode": result.execution_mode,
+        "storage_isolation": _isolation_payload(result, canonical=False),
         "summary": {
             "total": result.total,
             "passed": result.passed,
