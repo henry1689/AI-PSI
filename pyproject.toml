@@ -27,6 +27,13 @@ dependencies = [
     # 阶段 4：真实 Provider 的 HTTP 客户端
     "httpx>=0.27",
     "pgvector>=0.5.0",
+    # 阶段 7：评测数据集以 YAML 承载（``evaluation/loader.py`` 直接 ``import yaml``）。
+    # 🔴 必须是**直接**依赖：它此前只因 ``uvicorn[standard]`` 的 extra 而进入锁定图，
+    # 那是传递依赖——uvicorn 调整 extra 或换安装后端（wheel/其他安装方式）时，
+    # ``ai_psi.evaluation`` 就会 import 失败。直接使用的包由本项目自己声明。
+    # （PyYAML 不带 ``py.typed``，类型边界收在 ``loader.py::_parse_yaml``，
+    #   见 pyproject.toml 的 [[tool.mypy.overrides]]。）
+    "pyyaml>=6.0",
 ]
 
 [dependency-groups]
@@ -132,8 +139,8 @@ disallow_incomplete_defs = false
 # * PyYAML **没有** `py.typed`，typeshed 里也没有它的 stub；
 # * 官方 stub 包 `types-PyYAML` 是一个**新的第三方依赖**——
 #   阶段 7·S1a 明确禁止新增依赖，因此不能靠装 stub 解决；
-# * 它本身不是我们引入的：`uvicorn[standard]`（本项目的运行时依赖）
-#   依赖 pyyaml，所以它在任何一次 `uv sync --all-groups` 之后都存在。
+# * 它由本项目**直接声明**（`[project].dependencies` 的 `pyyaml>=6.0`），
+#   不再依赖 `uvicorn[standard]` 的 extra 间接带入。
 #
 # ⚠️ 未类型化的边界被**收在一个函数里**（`evaluation/loader.py::_parse_yaml`），
 # 它的返回值是 `object`，调用方必须交给 pydantic 校验才能真正使用。
