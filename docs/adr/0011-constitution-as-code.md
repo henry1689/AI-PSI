@@ -51,8 +51,14 @@
 
 ### 4. 不变量测试
 
-`tests/unit/test_invariants.py` 逐条覆盖任务书 §14 的 20 条不变量中
+`tests/unit/test_constitution.py` 逐条覆盖任务书 §14 的 20 条不变量中
 可在纯领域层验证的部分（其余依赖数据库的不变量在阶段 2/5 补充）。
+
+> ⚠️ **2026-09-19 更正**：本节原写 `tests/unit/test_invariants.py`——
+> **该文件在 git 全历史里从未存在过**（已用 `git log --all` 核对）。
+> 目录级别的覆盖现在是 `tests/unit/test_constitution.py`；
+> 阶段 6.5 又补了 `tests/unit/test_invariant_counterexamples.py`
+> （每条不变量一个**只破坏它**的定向反例）。
 
 已可验证的（阶段 1）：
 

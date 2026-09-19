@@ -29,7 +29,7 @@
 | 密钥仅通过环境变量注入 | `pydantic-settings`，`.env` 已被 git 忽略 |
 | 密钥类型不可意外打印 | 一律 `SecretStr`；`Settings.redacted_summary()` 输出 `"***"` |
 | 不记录完整 Authorization Header | 日志层禁止记录请求头 |
-| 错误堆栈不返回给普通 API 客户端 | `api/error_handlers.py` 统一转换（阶段 3） |
+| 错误堆栈不返回给普通 API 客户端 | `api/errors.py` 统一转换（阶段 3） |
 | 数据库连接启用安全配置 | 凭证来自环境变量；`.env.example` 中只有开发用假值 |
 
 > **实测约定**：`.env` 与 `.env.local` 均在 `.gitignore` 中。

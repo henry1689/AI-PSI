@@ -201,7 +201,7 @@ Event Store、状态机（接仓储）、幂等支持、集成测试。
 | `cognition/context_builder.py` | 上下文选择；冲突与失效材料**不参与裁剪** |
 | `cognition/epistemic_analyzer.py` | 八类认知状态分类（确定性） |
 | `cognition/{concern_detector,inquiry_framer,hypothesis_generator,logical_analyzer,causal_analyzer,concept_analyzer,dialectical_analyzer,philosophical_analyzer,judgment_synthesizer,metacognition,response_renderer}.py` | 11 个模型调用模块 |
-| `cognition/hypothesis_evaluator.py`、`response_planner.py` | 确定性模块（评估、回答规划） |
+| `cognition/hypothesis_generator.py`（含确定性的 `HypothesisEvaluator`）、`response_planner.py` | 确定性模块（评估、回答规划）。⚠️ **2026-09-19 更正**：本栏原写 `hypothesis_evaluator.py`——那是**任务书目录规划里的文件名**，**实现从未建过这个模块**（`git log --all` 里没有它），假设评估一直住在 `hypothesis_generator.py` 里 |
 | `reliability/{budgets,repetition_detector,confidence}.py` | 预算记账、反刍信号、置信度上限 |
 | `memory/write_policy.py` | 四档写入裁决，默认拒绝 |
 | `infrastructure/in_memory/` | 事件存储 / 回合仓储 / 幂等键 / 记忆的内存实现 |

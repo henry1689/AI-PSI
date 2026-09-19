@@ -138,7 +138,9 @@ V0.1 中 `ProposalStatus` 没有 `ACTIVE`。
 
 - **运行时**：不变量断言失败 → 抛 `ConstitutionViolationError`，
   回合进入 `FAILED`，记录失败阶段与错误类别，**已写入事件保持有效**。
-- **测试时**：`tests/unit/test_invariants.py` 逐条覆盖，
-  任一不变量被违反则 CI 失败。
+- **测试时**：`tests/unit/test_constitution.py`（目录级别：
+  恰好 20 条、id 唯一、每条都有陈述与代码机制）与
+  `tests/unit/test_invariant_counterexamples.py`（每条一个**只破坏它**的定向反例）
+  逐条覆盖，任一不变量被违反则 CI 失败。
 - **评审时**：修改 `constitution.py` 的 PR 需显式说明：
   改的是哪条、为什么必须改、删除了什么保证。
