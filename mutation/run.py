@@ -362,7 +362,7 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
     Equivalent(
         module="experiences",
         operator="core/NumberReplacer",
-        line=297,
+        line=299,
         mutation="min_length= 0",
         reason=(
             "`canonical_key` 由 `_check_canonical_identity` 钉死为**派生值**"
@@ -376,7 +376,7 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
     Equivalent(
         module="experiences",
         operator="core/NumberReplacer",
-        line=297,
+        line=299,
         mutation="min_length= 2",
         reason=(
             "同上，方向反过来：把下界抬到 2 也不会拒掉任何东西——"
@@ -387,7 +387,7 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
     Equivalent(
         module="experiences",
         operator="core/NumberReplacer",
-        line=289,
+        line=291,
         mutation="min_length= 0",
         reason=(
             "`independence_group` **曾经**是自由字符串，那时这条是真变异；"
@@ -404,14 +404,14 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
     Equivalent(
         module="experiences",
         operator="core/NumberReplacer",
-        line=289,
+        line=291,
         mutation="min_length= 2",
         reason="同上，方向反过来：派生值最短也有 5 个字符，抬到 2 拒不掉任何东西",
     ),
     Equivalent(
         module="experiences",
         operator="core/ReplaceTrueWithFalse",
-        line=522,
+        line=584,
         mutation="slots=False",
         reason=(
             "`ExperienceAssessment` 的 `frozen=True` **本身**就拒绝一切属性"
@@ -424,7 +424,7 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
     Equivalent(
         module="experiences",
         operator="core/ReplaceComparisonOperator_Gt_GtE",
-        line=591,
+        line=693,
         mutation="rank >= evaluation.rank",
         reason=(
             "`ExperienceEvaluation` 四档的 `rank` **互异**（0/1/2/3，"
@@ -435,8 +435,23 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
     ),
     Equivalent(
         module="experiences",
+        operator="core/ReplaceComparisonOperator_Is_GtE",
+        line=750,
+        mutation="item.error_type >= only",
+        reason=(
+            "`_effective_attribution` 里这一行的原判据是 `item.error_type is only`，"
+            "而**走到它时 `kinds` 必然只有一个元素**——多于一个时上面已经"
+            "走了冲突分支提前返回。既然所有记录的 `error_type` 都等于 `only`，"
+            "`is` 与 `>=`（StrEnum 按字符串比，自己 ≥ 自己为真）同答案。"
+            "⚠️ 这条依赖「kinds 只有一个元素 ⟹ 全部记录同类别」，"
+            "而它由冲突分支保证；`test_two_extremes_disagreeing_is_a_conflict` "
+            "钉住了那个分支本身"
+        ),
+    ),
+    Equivalent(
+        module="experiences",
         operator="core/ReplaceComparisonOperator_IsNot_Lt",
-        line=632,
+        line=805,
         mutation="evaluation < ExperienceEvaluation.UNASSESSED",
         reason=(
             "StrEnum 的 `<` 比**字符串**。实测：suspected / supported / "
@@ -448,14 +463,14 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
     Equivalent(
         module="experiences",
         operator="core/ReplaceComparisonOperator_IsNot_NotEq",
-        line=632,
+        line=805,
         mutation="evaluation != ExperienceEvaluation.UNASSESSED",
         reason="《枚举比较》：同段说明。`!=` 与 `is not` 对成员输入同答案",
     ),
     Equivalent(
         module="experiences",
         operator="core/ReplaceComparisonOperator_Is_GtE",
-        line=640,
+        line=813,
         mutation="evaluation >= ExperienceEvaluation.UNASSESSED",
         reason=(
             "《StrEnum 的字典序》的另一半：除 unassessed 之外的三个值都"
@@ -466,14 +481,14 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
     Equivalent(
         module="experiences",
         operator="core/ReplaceComparisonOperator_Is_Eq",
-        line=640,
+        line=813,
         mutation="evaluation == ExperienceEvaluation.UNASSESSED",
         reason="《枚举比较》：同段说明",
     ),
     Equivalent(
         module="experiences",
         operator="core/ReplaceComparisonOperator_Is_Eq",
-        line=648,
+        line=821,
         mutation="evaluator == ExperienceEvaluator.INTERNAL_METACOGNITION",
         reason=(
             "《枚举比较》：同段说明。⚠️ 这一条尤其要记住它的边界——"
@@ -484,7 +499,7 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
     Equivalent(
         module="experiences",
         operator="core/ReplaceComparisonOperator_Gt_IsNot",
-        line=649,
+        line=822,
         mutation="rank is not ExperienceEvaluation.SUSPECTED.rank",
         reason=(
             "`_EXPERIENCE_EVALUATION_RANK` 的取值是 0/1/2/3，全部落在 CPython "
@@ -497,7 +512,7 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
     Equivalent(
         module="experiences",
         operator="core/ReplaceComparisonOperator_Gt_NotEq",
-        line=649,
+        line=822,
         mutation="rank != ExperienceEvaluation.SUSPECTED.rank",
         reason="同上：rank 的四个取值互异且都在小整数缓存内，`!=` 与 `>` 同答案",
     ),
@@ -558,7 +573,7 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
     Equivalent(
         module="pattern_detector",
         operator="core/ReplaceUnaryOperator_USub_Invert",
-        line=262,
+        line=282,
         mutation="(~item.weighted_count,",
         reason=(
             "`~x` 就是 `-x - 1`，是 `-x` 的**单调变换**（相差一个常数 1）。"
@@ -571,14 +586,14 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
     Equivalent(
         module="pattern_detector",
         operator="core/ReplaceUnaryOperator_USub_Invert",
-        line=265,
+        line=285,
         mutation="(~item.weighted_count,",
         reason="同上（`suppressed.sort` 用的是同一个键表达式）",
     ),
     Equivalent(
         module="pattern_detector",
         operator="core/NumberReplacer",
-        line=334,
+        line=355,
         mutation="evaluations[- 0]",
         reason=(
             "这一支**只在全部参与计数的评价权重都为 0 时**才进入"
@@ -592,7 +607,7 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
     Equivalent(
         module="pattern_detector",
         operator="core/ReplaceUnaryOperator_USub_Not",
-        line=334,
+        line=355,
         mutation="evaluations[not 1]",
         reason="同上：`not 1` 是 `False`，即下标 0——同样落在「全部权重为 0」的不可观察区间里",
     ),
@@ -613,7 +628,7 @@ EQUIVALENTS: tuple[Equivalent, ...] = (
     Equivalent(
         module="pattern_detector",
         operator="core/ReplaceBinaryOperator_Mul_Div",
-        line=194,
+        line=199,
         mutation="/,",
         reason="《`*,` → `/,` 族》",
     ),

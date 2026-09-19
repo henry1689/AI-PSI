@@ -765,3 +765,52 @@ class TestTheEffectiveAttribution:
         (assessment,) = assess_experiences([mine], (), [_attribution(other, ErrorType.SCOPE_ERROR)])
         assert assessment.effective_error_type is None
         assert assessment.attributions == ()
+
+    def test_the_basis_comes_from_the_records_that_agree(self, make_experience) -> None:
+        """🔴 ``attribution_basis`` 只收**与有效类别一致**的那些理由。
+
+        ⚠️ 变异测试抓到过这里：把筛选条件反过来（``is`` → ``is not``），
+        在正常路径上理由会**全部丢掉**而没有任何用例变红——
+        而"依据"正是归因记录存在的理由（第 7 条要求它可审计）。
+        """
+        experience = make_experience(error_type=None)
+        (assessment,) = assess_experiences(
+            [experience], (), [_attribution(experience, ErrorType.EVIDENCE_ERROR)]
+        )
+        assert assessment.attribution_basis == ("判据：evidence_error",)
+
+    def test_a_conflict_has_no_basis_at_all(self, make_experience) -> None:
+        """冲突时有效类别是 ``None``，因此**没有**任何依据可归属于它。
+
+        ⚠️ 与上一条是同一次变异的两侧：只测正常路径的话，
+        一条"冲突时也把理由挂上去"的实现在下面全绿——而那会让
+        读者以为"这些理由是支撑那个类别的"，可那个类别根本不存在。
+        """
+        experience = make_experience(error_type=None)
+        (assessment,) = assess_experiences(
+            [experience],
+            (),
+            [
+                _attribution(experience, ErrorType.EVIDENCE_ERROR),
+                _attribution(experience, ErrorType.REASONING_ERROR),
+            ],
+        )
+        assert assessment.attribution_conflict is True
+        assert assessment.attribution_basis == ()
+
+
+class TestTheAttributionRecordHasItsOwnBoundary:
+    """新记录的身份字段与评价记录**同一条边界**（变异测试补齐）。"""
+
+    @pytest.mark.parametrize("field_name", ["experience_canonical_key", "classifier_version"])
+    def test_blank_is_refused(self, make_experience, field_name: str) -> None:
+        experience = make_experience(error_type=None)
+        with pytest.raises(ValidationError):
+            _attribution(experience, ErrorType.EVIDENCE_ERROR, **{field_name: ""})
+
+    @pytest.mark.parametrize("field_name", ["experience_canonical_key", "classifier_version"])
+    def test_a_single_character_is_enough(self, make_experience, field_name: str) -> None:
+        """⚠️ **下界的两侧都要测**：抬到 2 不会报错，只会让一类取值静默写不进来。"""
+        experience = make_experience(error_type=None)
+        record = _attribution(experience, ErrorType.EVIDENCE_ERROR, **{field_name: "x"})
+        assert getattr(record, field_name) == "x"

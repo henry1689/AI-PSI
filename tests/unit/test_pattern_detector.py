@@ -618,6 +618,10 @@ class TestTheCountingFieldsDefaultToNothing:
         assert scan.suppressed == ()
         assert scan.unattributable_count == 0
         assert scan.low_confidence_count == 0
+        # 🔴 阶段 6.6 新增的字段**必须加进这一条**：不加的话，
+        # 它的默认值改成 1 或 -1 会活下来——而症状是
+        # "什么都没发生"的报告里凭空多出一次冲突（变异实测抓到过）。
+        assert scan.conflicting_attributions == 0
 
 
 class TestTheResultsAreImmutable:
