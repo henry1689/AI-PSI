@@ -69,7 +69,9 @@ class Invariant:
 
 #: 任务书 §14 的全部 20 条认知不变量。
 #:
-#: 🔴 **本元组必须恰好包含 20 项**，由 ``tests/unit/test_invariants.py`` 断言。
+#: 🔴 **本元组必须恰好包含 20 项**，由 ``tests/unit/test_constitution.py`` 断言
+#: （另有 ``tests/unit/test_invariant_counterexamples.py``，为每条不变量
+#: 配一个**只破坏它**的定向反例）。
 #: 少一条意味着某个边界失去了记录；多一条意味着任务书被超范围解读。
 INVARIANTS: Final[tuple[Invariant, ...]] = (
     Invariant(
