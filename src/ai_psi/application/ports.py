@@ -25,16 +25,97 @@ from ai_psi.domain.improvement_proposals import ImprovementProposal
 from ai_psi.domain.memories import Memory
 
 __all__ = [
+    "LEARNING_TRIGGER_FAILED",
     "EventStore",
     "IdempotencyOutcome",
     "IdempotencyReservation",
     "IdempotencyStore",
+    "LearningTrigger",
+    "LearningTriggerOutcome",
+    "LearningTriggerStatus",
     "MemoryRepository",
     "ProposalRepository",
     "RoundRepository",
     "UnitOfWork",
     "UnitOfWorkFactory",
 ]
+
+
+#: 学习触发失败的**稳定错误码**。
+#:
+#: 🔴 **API 只回这一个码，不回异常原文。**
+#: 异常消息里可能带 SQL、文件路径、连接串片段与堆栈——那些是服务端的
+#: 排障材料，不是客户端该看到的东西。完整异常进服务端日志，
+#: 对外只给这个码 + 一个 ``trace_id``。
+LEARNING_TRIGGER_FAILED = "learning_trigger_failed"
+
+
+class LearningTriggerStatus(StrEnum):
+    """一次学习触发的结果。"""
+
+    NOT_TRIGGERED = "not_triggered"
+    """本次反馈没有产生有效归因，因此**没有**触发学习链路。
+
+    🔴 这与"触发了但失败了"是两件事，不能合并成一个 ``False``：
+    前者说明纠正还没指到任何产物（用户该补一个指针），
+    后者说明系统出了故障（该看日志）。
+    """
+
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class LearningTriggerOutcome:
+    """学习链路的触发结果（阶段 6.6）。
+
+    Attributes:
+        status: 见 :class:`LearningTriggerStatus`。
+        created_proposal_ids: 本次运行**新建**的提案 id。已经存在的提案
+            不会被重复创建——因此"触发多次只有一条提案"。
+        error_code: 失败时的**稳定错误码**；其余情况为 ``None``。
+        trace_id: 失败时与服务端日志对应的一次性标识。
+            🔴 异常原文、SQL、路径、堆栈**只进日志**，不进这里。
+    """
+
+    status: LearningTriggerStatus
+    created_proposal_ids: tuple[UUID, ...] = ()
+    error_code: str | None = None
+    trace_id: str | None = None
+
+
+@runtime_checkable
+class LearningTrigger(Protocol):
+    """反馈路径在**事务提交之后**触发一次学习运行的入口（阶段 6.6）。
+
+    🔴 **为什么它必须是"提交之后"。**
+
+    学习链路（``LearningService.review``）通过 ``ExperienceReader``
+    开**自己的**事务去读事件流。如果它在反馈的那个事务里被调用，
+    那个新连接**看不到尚未提交的归因事件**——于是"第三次纠正到达后
+    自动生成提案"这件事会静默地不发生，而库里一切正常。
+    这正是阶段 6.5 那类"数据可读但生产链路不会运行"的失败形态。
+
+    🔴 **为什么是同步调用，而不是后台任务。**
+
+    V0.1 没有 worker、没有队列（任务书 §12.1：回合在请求内同步执行完毕）。
+    凭空引入一个后台任务就是阶段 7 的活。同步调用是这里唯一
+    不引入新基础设施、又能保证读到已提交数据的选项。
+
+    ⚠️ **实现方可以抛异常**：调用方（``FeedbackService``）会把异常
+    兜住并**只记日志**——那一刻反馈与归因**已经提交**，
+    把一个已经成功的反馈报成 500 会让客户端重试一整天。
+    """
+
+    async def __call__(self) -> LearningTriggerOutcome:
+        """跑一次学习链路。
+
+        Returns:
+            本次运行的结果。已经存在的提案不重复创建
+            （``LearningService._covered_keys`` 保证），因此
+            "触发多次 → 只有一条提案"。
+        """
+        ...
 
 
 # ---------------------------------------------------------------------------

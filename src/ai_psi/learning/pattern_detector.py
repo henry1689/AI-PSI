@@ -178,12 +178,17 @@ class PatternScan:
         suppressed: 未达门槛的分组，按同样规则排列。
         unattributable_count: 因无法归因而被跳过的经验条数。
         low_confidence_count: 因归因置信度过低而被跳过的经验条数。
+        conflicting_attributions: 因**归因互相矛盾**而被跳过的经验条数
+            （阶段 6.6）。🔴 与 ``unattributable_count`` **分开计数**：
+            "指不出是哪一类错"与"有两套说法且互相矛盾"需要完全不同的
+            下一步动作——后者要人去裁决，前者只是信息不足。
     """
 
     patterns: tuple[ErrorPattern, ...] = ()
     suppressed: tuple[SuppressedPattern, ...] = ()
     unattributable_count: int = 0
     low_confidence_count: int = 0
+    conflicting_attributions: int = 0
 
 
 class PatternDetector:
@@ -238,15 +243,30 @@ class PatternDetector:
         grouped: dict[tuple[ErrorType, str], list[ExperienceAssessment]] = defaultdict(list)
         unattributable = 0
         low_confidence = 0
+        conflicted = 0
         for item in assessments:
             experience = item.experience
-            if experience.error_type is None:
+            # 🔴 **归因冲突先于一切**：该经验有两套互相矛盾的归因，
+            # 在矛盾解决之前它**不计入任何门槛**。顺序不能反——
+            # 先取 `effective_error_type` 的话，冲突的经验本来也会是
+            # `None`（见 `_effective_attribution`），但那时它会被算进
+            # `unattributable`，"有矛盾"与"指不出来"就混成了一个数。
+            if item.attribution_conflict:
+                conflicted += 1
+                continue
+            # 🔴 **读的是「有效」归因，不是 `experience.error_type`。**
+            # 后者是**抽取时刻**的快照，那一刻唯一的评估者是系统自己，
+            # 因此在默认配置下恒为 `None`；用户纠正带来的归因在那之后
+            # 才到。按快照过滤，等于让"三次同类错误生成提案"这条
+            # 验收条件在生产配置下永远不可能发生（阶段 6.5 的 C6.7）。
+            error_type = item.effective_error_type
+            if error_type is None:
                 unattributable += 1
                 continue
-            if experience.attribution_confidence.rank < _MIN_ATTRIBUTION_CONFIDENCE:
+            if item.effective_attribution_confidence.rank < _MIN_ATTRIBUTION_CONFIDENCE:
                 low_confidence += 1
                 continue
-            grouped[(experience.error_type, experience.situation_signature)].append(item)
+            grouped[(error_type, experience.situation_signature)].append(item)
 
         patterns: list[ErrorPattern] = []
         suppressed: list[SuppressedPattern] = []
@@ -269,6 +289,7 @@ class PatternDetector:
             suppressed=tuple(suppressed),
             unattributable_count=unattributable,
             low_confidence_count=low_confidence,
+            conflicting_attributions=conflicted,
         )
 
     def _build_pattern(

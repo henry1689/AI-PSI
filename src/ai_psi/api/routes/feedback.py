@@ -25,7 +25,13 @@ from uuid import UUID
 from fastapi import APIRouter
 
 from ai_psi.api.dependencies import ContainerDep
-from ai_psi.api.schemas import FeedbackRequest, FeedbackResponse
+from ai_psi.api.schemas import (
+    AttributionView,
+    FeedbackRequest,
+    FeedbackResponse,
+    LearningTriggerView,
+)
+from ai_psi.application.ports import LearningTriggerOutcome, LearningTriggerStatus
 
 __all__ = ["router"]
 
@@ -64,6 +70,7 @@ async def submit_feedback(
         feedback_type=body.feedback_type,
         content=body.content,
         related_claim=body.related_claim,
+        related_artifact_id=body.related_artifact_id,
         allow_memory_update=body.allow_memory_update,
     )
     return FeedbackResponse(
@@ -73,5 +80,15 @@ async def submit_feedback(
         memory_effect=outcome.memory_effect,
         memory_id=outcome.memory.id if outcome.memory is not None else None,
         memory_written=outcome.memory_written,
+        # 🔴 只回**第一条**归因：一条回合的纠正会对该回合的经验逐条归因，
+        # 而当前每个回合只有一条经验。多条时用 `GET /learning/runs`
+        # 或审计事件看全貌——把列表塞进反馈响应会让"这次纠正到底
+        # 形成了什么"这个最常问的问题变成一个要遍历的数组。
+        attribution=(
+            AttributionView.from_record(outcome.attributions[0]) if outcome.attributions else None
+        ),
+        learning=LearningTriggerView.from_outcome(
+            outcome.learning or LearningTriggerOutcome(status=LearningTriggerStatus.NOT_TRIGGERED)
+        ),
         reasons=list(outcome.reasons),
     )

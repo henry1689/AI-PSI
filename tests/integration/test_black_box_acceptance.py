@@ -113,13 +113,28 @@ async def client(
 _RUMINATING_QUESTION = "我应该原谅他吗？这是不是道德上正确的选择？"
 
 
-async def _run_round(client: httpx.AsyncClient, *, question: str = _QUESTION) -> str:
-    """跑一个真实回合，返回它的 id。"""
+async def _run_round(
+    client: httpx.AsyncClient, *, question: str = _QUESTION, depth: str | None = None
+) -> str:
+    """跑一个真实回合，返回它的 id。
+
+    Args:
+        client: 客户端。
+        question: 问句。它决定深度路由选哪一档。
+        depth: 显式请求的深度。⚠️ **阶段 6.6 的纠正场景必须请求 D2**——
+            D0 是"直接回答，**不做假设**"（`cognition/orchestrator.py`），
+            而"用户指得出被纠正的是哪一条产物"需要一个**可指的对象**。
+            不显式请求的话，指针恒为 `None`，于是"没有提案"的断言
+            会因为**前提不成立**而空过。
+    """
     created = await client.post(f"{API_PREFIX}/conversations")
     conversation_id = created.json()["conversation_id"]
+    payload: dict[str, Any] = {"content": question}
+    if depth is not None:
+        payload["requested_depth"] = depth
     response = await client.post(
         f"{API_PREFIX}/conversations/{conversation_id}/messages",
-        json={"content": question},
+        json=payload,
     )
     assert response.status_code == 201, response.text
     return str(response.json()["cognitive_round_id"])
@@ -238,6 +253,318 @@ class TestTheLearningChainIsReachableThroughTheApi:
         )
         assert response.status_code == 422, response.text
         assert response.json()["code"] == "invalid_request"
+
+
+async def _artifacts_of(client: httpx.AsyncClient, round_id: str) -> dict[str, str | None]:
+    """从**回合摘要接口**读回这一回合里可被指认的产物 id。
+
+    🔴 **指针只能从正式 API 拿。** 本文件不许手工构造领域对象、
+    不许直连数据库造数据（§七 开头的明文要求），因此
+    "用户指得出被纠正的是哪一条"这件事必须通过
+    ``GET /cognitive-rounds/{id}/summary`` 达成——而那正是
+    真实客户端会做的事。
+
+    Returns:
+        ``{"judgment": …, "hypothesis": …, "inquiry": …}``，取不到的为 ``None``。
+    """
+    response = await client.get(f"{API_PREFIX}/cognitive-rounds/{round_id}/summary")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    judgment = body.get("judgment") or {}
+    hypotheses = body.get("hypotheses") or []
+    inquiry = body.get("inquiry") or {}
+    return {
+        "judgment": judgment.get("judgment_id"),
+        "hypothesis": (hypotheses[0] or {}).get("id") if hypotheses else None,
+        "inquiry": inquiry.get("id"),
+    }
+
+
+async def _correct_at(
+    client: httpx.AsyncClient,
+    round_id: str,
+    *,
+    artifact_id: str | None = None,
+    feedback_type: str = "correction",
+) -> httpx.Response:
+    """在 ``round_id`` 上发一条纠正，可选地指出被纠正的产物。"""
+    body: dict[str, Any] = {
+        "feedback_type": feedback_type,
+        "content": "你这里判断错了：证据不足时不该下这个结论",
+        "allow_memory_update": False,
+    }
+    if artifact_id is not None:
+        body["related_artifact_id"] = artifact_id
+    return await client.post(f"{API_PREFIX}/cognitive-rounds/{round_id}/feedback", json=body)
+
+
+async def _proposals(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    """当前全部提案（走正式接口）。"""
+    response = await client.get(f"{API_PREFIX}/improvement-proposals")
+    assert response.status_code == 200, response.text
+    return list(response.json()["proposals"])
+
+
+async def _attributed_experiences(engine: AsyncEngine) -> int:
+    """库里 ``experience.attributed`` 事件的条数（直接查库，只读）。"""
+    async with engine.begin() as conn:
+        result = await conn.execute(
+            text("SELECT count(*) FROM events WHERE event_type = 'experience.attributed'")
+        )
+        return int(result.scalar_one())
+
+
+class TestTheCorrectionClosesTheAttributionLoop:
+    """🔴 **阶段 6.6 A–H：真实 HTTP × 真实 PostgreSQL × 默认配置。**
+
+    被证明的能力只有一句：
+
+    > 三个真实回合 + 三次**有依据**的同类纠正，
+    > **在没有人调用过 `/learning/runs` 的情况下**，
+    > 让一条 DRAFT 提案自己出现。
+
+    在此之前这是不可能的：默认配置下每条经验的 ``error_type``
+    都是 ``None``，模式发现把它们**全部过滤掉**，
+    于是 ``decide`` / ``generate`` 一次都不会被调用。
+    """
+
+    async def test_a_three_pointed_corrections_produce_a_draft(
+        self, client: httpx.AsyncClient, engine: AsyncEngine
+    ) -> None:
+        """**A**：三个独立回合、三次有依据的同类纠正 → DRAFT 提案。
+
+        🔴 **本用例一次都没有调用 `/learning/runs`。**
+        提案只能来自"第三次纠正 → 反馈提交 → 触发学习链路 →
+        模式发现 → 门禁 → 生成器"。
+        """
+        round_ids = [await _run_round(client, depth="d2") for _ in range(3)]
+        for round_id in round_ids:
+            artifacts = await _artifacts_of(client, round_id)
+            # 🔴 **前提必须先立住。** 指针为空时 `_correct_at` 会退化成
+            # "没给指针"，于是后面的"没有提案"断言会因为**前提不成立**
+            # 而空过——那正是 `_write_a_memory` 的文档里记的那次教训。
+            assert artifacts["hypothesis"] is not None, (
+                f"回合 {round_id} 的摘要里没有可指的假设，本用例的前提不成立"
+            )
+            response = await _correct_at(client, round_id, artifact_id=artifacts["hypothesis"])
+            assert response.status_code == 201, response.text
+            assert response.json()["attribution"] is not None, response.text
+
+        # 🔴 归因真的落库了（不是只在响应里）
+        assert await _attributed_experiences(engine) == 3
+
+        proposals = await _proposals(client)
+        assert len(proposals) == 1, proposals
+        proposal = proposals[0]
+        assert proposal["status"] == "draft"
+        assert proposal["can_become_active"] is False
+        # 🔴 提案引用的经验**正是**那三个回合产出的三条——
+        # 少了这条断言，"提案出现"可能是别的机制凑出来的
+        assert proposal["supporting_experience_count"] == 3
+
+    async def test_b_two_pointed_corrections_are_not_enough(
+        self, client: httpx.AsyncClient, engine: AsyncEngine
+    ) -> None:
+        """**B**：只有两个独立回合 → 不生成 Proposal（不变量 10）。"""
+        for _ in range(2):
+            round_id = await _run_round(client, depth="d2")
+            artifacts = await _artifacts_of(client, round_id)
+            await _correct_at(client, round_id, artifact_id=artifacts["hypothesis"])
+
+        assert await _attributed_experiences(engine) == 2
+        assert await _proposals(client) == []
+
+    async def test_c_corrections_without_a_pointer_are_not_attributed(
+        self, client: httpx.AsyncClient, engine: AsyncEngine
+    ) -> None:
+        """**C**：三次纠正，但**指不出被纠正的是哪一条产物** → 不归因 → 不生成。
+
+        ⚠️ 它们仍然抬高经验评价（用户确实纠正了），因此
+        **没有提案不是因为权重不够，是因为类别是 ``None``**。
+        两者的区别要在断言里显式钉住，否则这条用例对
+        "反馈压根没生效"的实现也会绿。
+        """
+        for _ in range(3):
+            round_id = await _run_round(client, depth="d2")
+            response = await _correct_at(client, round_id)  # 不给指针
+            assert response.status_code == 201, response.text
+            body = response.json()
+            assert body["attribution"] is None
+            # 🔴 反向：纠正本身**被记下了**，理由也说清了为什么没归因
+            assert body["reasons"]
+
+        assert await _attributed_experiences(engine) == 0
+        assert await _proposals(client) == []
+
+    async def test_d_repeating_one_round_counts_once(
+        self, client: httpx.AsyncClient, engine: AsyncEngine
+    ) -> None:
+        """**D**：同一个回合纠正三次 → 只算**一次发生** → 不生成。
+
+        门槛的计量单位是 ``Experience.independence_group``
+        （阶段 6.5 §二.12），不是归因事件的条数。
+        """
+        round_id = await _run_round(client, depth="d2")
+        artifacts = await _artifacts_of(client, round_id)
+        for _ in range(3):
+            response = await _correct_at(client, round_id, artifact_id=artifacts["hypothesis"])
+            assert response.status_code == 201, response.text
+
+        # 去重生效：三次纠正只留下一条归因（同一件事不说两遍）
+        assert await _attributed_experiences(engine) == 1
+        assert await _proposals(client) == []
+
+    async def test_e_different_kinds_do_not_aggregate(self, client: httpx.AsyncClient) -> None:
+        """**E**：三次纠正指到**不同类型**的产物 → 类别不同 → 不聚合成一个模式。
+
+        两个回合指到假设（→ ``evidence_error``）、一个指到判断
+        （→ ``reasoning_error``），于是两个模式各自只有 2 次和 1 次，
+        都够不到 3。
+        """
+        rounds = [await _run_round(client, depth="d2") for _ in range(3)]
+        kinds = ["hypothesis", "hypothesis", "judgment"]
+        for round_id, kind in zip(rounds, kinds, strict=True):
+            artifacts = await _artifacts_of(client, round_id)
+            assert artifacts[kind] is not None, f"本回合没有 {kind} 可指"
+            await _correct_at(client, round_id, artifact_id=artifacts[kind])
+
+        assert await _proposals(client) == []
+
+    async def test_f_internal_doubt_alone_is_not_an_error(
+        self, client: httpx.AsyncClient, engine: AsyncEngine
+    ) -> None:
+        """**F**：三个回合、零纠正 → 不生成。
+
+        默认配置下每条经验的 ``error_type`` 都是 ``None``——
+        系统自己的怀疑不构成"已确认的错误"（§二.4、不变量 4）。
+        """
+        for _ in range(3):
+            await _run_round(client, depth="d2")
+
+        assert await _attributed_experiences(engine) == 0
+        assert await _proposals(client) == []
+
+    @pytest.mark.parametrize(
+        "forged",
+        [
+            {"error_type": "reasoning_error"},
+            {"independence_group": "idem:我自己编的"},
+            {"attribution": {"error_type": "reasoning_error"}},
+        ],
+    )
+    async def test_g_a_client_cannot_dictate_the_category(
+        self, client: httpx.AsyncClient, engine: AsyncEngine, forged: dict[str, Any]
+    ) -> None:
+        """**G**：客户端伪造 ``error_type`` / ``independence_group`` → 被边界拒绝。
+
+        🔴 类别由**服务端**从回合事件流里解析产物类型后推出。
+        让调用方直接指定它，等于把归因规则交给调用方决定——
+        而归因规则决定系统之后学什么。
+        """
+        round_id = await _run_round(client, depth="d2")
+        artifacts = await _artifacts_of(client, round_id)
+        body: dict[str, Any] = {
+            "feedback_type": "correction",
+            "content": "你这里判断错了",
+            **forged,
+        }
+        if "attribution" not in forged:
+            body["related_artifact_id"] = artifacts["hypothesis"]
+
+        response = await client.post(
+            f"{API_PREFIX}/cognitive-rounds/{round_id}/feedback", json=body
+        )
+        assert response.status_code == 422, response.text
+        assert response.json()["code"] == "invalid_request"
+        # 而且**什么归因都没留下**
+        assert await _attributed_experiences(engine) == 0
+
+    @pytest.mark.parametrize(
+        "pointer_from",
+        ["another_round", "random", "inquiry", "memory"],
+    )
+    async def test_h_a_pointer_that_cannot_be_resolved_is_not_attributed(
+        self,
+        client: httpx.AsyncClient,
+        engine: AsyncEngine,
+        pointer_from: str,
+    ) -> None:
+        """**H**：指针解析不到、或不被接受 → 不归因、不计入门槛、不生成。
+
+        | 指针来源 | 走哪一条 |
+        |---|---|
+        | ``another_round`` | 别的回合的产物 |
+        | ``random`` | 一个随机 UUID |
+        | ``inquiry`` | 本回合的问题——**找到了，但这类产物不接受纠正** |
+        | ``memory`` | 别的用户/别的表里的 id（不在本回合的事件流里） |
+
+        🔴 **反馈仍然成功（201）**：不能因为指针无效就让用户那句纠正丢失。
+        归因没有发生这件事由 ``attribution: null`` 与 ``reasons`` 说清。
+        """
+        round_id = await _run_round(client, depth="d2")
+        artifacts = await _artifacts_of(client, round_id)
+
+        if pointer_from == "another_round":
+            other = await _run_round(client, depth="d2")
+            pointer = (await _artifacts_of(client, other))["hypothesis"]
+        elif pointer_from == "random":
+            pointer = str(uuid4())
+        elif pointer_from == "inquiry":
+            pointer = artifacts["inquiry"]
+            assert pointer is not None, "本回合没有问题可指——夹具前提不成立"
+        else:
+            pointer = str(uuid4())  # 记忆 id 不在本回合事件流里，与随机 id 同路
+
+        response = await _correct_at(client, round_id, artifact_id=pointer)
+
+        assert response.status_code == 201, response.text
+        body = response.json()
+        assert body["attribution"] is None, body
+        assert body["reasons"], "必须说清为什么没有归因"
+        assert await _attributed_experiences(engine) == 0
+        assert await _proposals(client) == []
+
+    async def test_the_audit_trail_is_queryable_in_postgres(
+        self, client: httpx.AsyncClient, engine: AsyncEngine
+    ) -> None:
+        """🔴 第 7 条要求：**审计来源必须在 PostgreSQL 里查得到。**
+
+        一条 ``experience.attributed`` 必须同时说清六件事：
+        关联回合、关联原判断、纠正内容（反馈事件）、分类结果、
+        分类依据、分类器版本。
+        """
+        round_id = await _run_round(client, depth="d2")
+        artifacts = await _artifacts_of(client, round_id)
+        await _correct_at(client, round_id, artifact_id=artifacts["hypothesis"])
+
+        async with engine.begin() as conn:
+            result = await conn.execute(
+                text(
+                    """
+                    SELECT payload -> 'attribution' AS attribution
+                    FROM events WHERE event_type = 'experience.attributed'
+                    """
+                )
+            )
+            rows = [row[0] for row in result.all()]
+
+        assert len(rows) == 1, rows
+        record = rows[0]
+        for key in (
+            "cognitive_round_id",  # 关联回合
+            "judgment_id",  # 关联原判断
+            "related_artifact_id",  # 被指产物
+            "artifact_kind",  # 它的类别（服务端解析）
+            "error_type",  # 分类结果
+            "reasons",  # 分类依据
+            "classifier_version",  # 分类器版本
+            "evidence_refs",  # 纠正内容所在的那条事件
+        ):
+            assert record.get(key), f"审计字段缺失：{key}"
+
+        assert record["error_type"] == "evidence_error"
+        assert record["artifact_kind"] == "hypothesis"
+        assert str(record["cognitive_round_id"]) == round_id
 
 
 # ---------------------------------------------------------------------------

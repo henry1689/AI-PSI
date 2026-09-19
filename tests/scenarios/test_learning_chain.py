@@ -203,29 +203,76 @@ class TestThreeRealRoundsCanProduceAProposal:
     ``experience.evaluated`` 事件里长出来，提案由**门禁**复核后落库。
     """
 
-    async def test_end_to_end_from_real_rounds_to_a_draft_proposal(self, harness_factory) -> None:
-        """三个独立回合 + 各自的用户纠正 → DRAFT 提案。"""
+    @pytest.mark.parametrize("again", [False, True], ids=["首次运行", "重复运行"])
+    async def test_end_to_end_from_real_rounds_to_a_draft_proposal(
+        self, harness_factory, again: bool
+    ) -> None:
+        """三个独立回合 + 各自的用户纠正 → **恰好一条** DRAFT 提案。
+
+        🔴 **阶段 6.6 起，提案是"自己出现"的。**
+
+        第三次纠正提交之后，``FeedbackService`` 在**提交之后**触发一次
+        学习运行——本用例**一次都没有调用过 `review()`**，
+        提案却已经在库里。这正是本次唯一的交付目标。
+
+        ``again=True`` 那一支再显式跑一次，断言的是**同一件事不会
+        因为多跑一遍就多出一条提案**：第二次运行看到的必须是
+        「已覆盖」，而不是又生成一条。
+        """
         harness: Harness = harness_factory(responses=_scripted_round(missing_counterexample=True))
         round_ids = await _rounds_with_correction(harness, count=3, correction=True)
 
-        run = await harness.learning_service.review()
+        if again:
+            rerun = await harness.learning_service.review()
+            assert rerun.created == (), "重复运行不该再造一条提案"
+            assert len(rerun.already_covered) == 1, rerun.summary()
 
-        assert run.summary()
-        assert len(run.created) == 1, run.summary()
-        proposal = run.created[0].proposal
+        listing = await harness.proposal_service.list_all()
+        assert len(listing) == 1, f"期望恰好一条提案，实际 {len(listing)} 条"
+        proposal = listing[0]
         assert proposal.status.value == "draft"
         assert proposal.error_class is ErrorType.REASONING_ERROR
-        # 门禁复核过的次数就是三个回合，不多不少
-        assert run.created[0].weighted_count == 3
 
         # 🔴 提案引用的经验必须**正是**那三个回合产出的那几条。
         # 情境签名不写死：它由深度、证据量、假设量派生，
         # 写死它会让"规则一改签名就变"变成一次无意义的红灯。
-        expected: set[Any] = set()
+        produced: list[Experience] = []
         for round_id in round_ids:
-            expected |= {item.id for item in await _experiences_from(harness, round_id)}
-        assert set(proposal.supporting_experience_ids) == expected
-        assert proposal.applicability == [run.patterns[0].situation_signature]
+            produced.extend(await _experiences_from(harness, round_id))
+        assert set(proposal.supporting_experience_ids) == {item.id for item in produced}
+
+        # ⚠️ 适用条件由**经验自己的签名**推出，而不是从 `run.patterns` 取：
+        # 自动触发那一支根本没有 `run`。三个回合用的是同一份脚本，
+        # 因此它们的签名必须相同——那正是"同类"的定义。
+        signatures = {item.situation_signature for item in produced}
+        assert len(signatures) == 1, signatures
+        assert proposal.applicability == [next(iter(signatures))]
+
+    async def test_the_third_correction_brings_the_proposal_into_being_by_itself(
+        self, harness_factory
+    ) -> None:
+        """🔴 **P0：第三次纠正之后，提案自己出现——没有人调用过 `review()`。**
+
+        这是阶段 6.6 唯一的交付目标。此前那条链路**只有**两个入口
+        （CLI 与 `POST /learning/runs`），**都不是自动的**：
+        第三次纠正到达后库里会有三条归因，而提案不会出现——
+        那正是"数据可读但生产链路不会运行"的失败形态。
+
+        本用例分三次**逐步**推进，而不是一次性跑三个回合再断言：
+        中间那一步（两个回合时**不该**有提案）证明门槛仍然成立，
+        少了它，"每来一次反馈就发一条提案"的实现也会全绿。
+        """
+        harness: Harness = harness_factory(responses=_scripted_round(missing_counterexample=True))
+        assert await harness.proposal_service.list_all() == []
+
+        await _rounds_with_correction(harness, count=2, correction=True)
+        assert await harness.proposal_service.list_all() == [], "两个回合不该够门槛"
+
+        # 第三次纠正：反馈提交之后自动跑一次学习链路
+        await _rounds_with_correction(harness, count=1, correction=True)
+        created = await harness.proposal_service.list_all()
+        assert len(created) == 1, f"期望恰好一条提案，实际 {len(created)} 条"
+        assert created[0].status.value == "draft"
 
     async def test_suspected_rounds_alone_never_reach_the_threshold(self, harness_factory) -> None:
         """🔴 **阶段 6.5 §二.6–7：三次内部怀疑不是三次证据。**
@@ -325,9 +372,13 @@ class TestThreeRealRoundsCanProduceAProposal:
         harness: Harness = harness_factory(responses=_scripted_round(missing_counterexample=True))
         await _rounds_with_correction(harness, count=3, correction=True)
 
-        first = await harness.learning_service.review()
-        assert len(first.created) == 1, first.summary()
-        proposal = first.created[0].proposal
+        # ⚠️ 阶段 6.6 起第三次纠正会**自动**跑一次学习链路，
+        # 提案在 `_rounds_with_correction` 返回时就已经存在。
+        # 这里取回来，而不是再调一次 `review()`——再调一次拿到的是
+        # "已覆盖"，那是另一条断言（下面的 `second`）。
+        listing = await harness.proposal_service.list_all()
+        assert len(listing) == 1, listing
+        proposal = listing[0]
         await harness.proposal_service.evaluate(
             proposal.id,
             evaluation=ProposalEvaluation(
@@ -367,5 +418,9 @@ class TestThreeRealRoundsCanProduceAProposal:
 
         run = await harness.learning_service.review()
 
-        assert len(run.created) == 1, run.summary()
+        # ⚠️ 阶段 6.6 起第三次不同意已经在**提交之后**自动跑过一次，
+        # 提案那时就生成了。这一次显式运行看到的是"已覆盖"——
+        # 而模式本身仍在 `run.patterns` 里，档位断言因此照旧。
+        assert len(run.already_covered) == 1, run.summary()
         assert run.patterns[0].evaluations == (ExperienceEvaluation.SUPPORTED,)
+        assert (await harness.proposal_service.list_all())[0].status.value == "draft"

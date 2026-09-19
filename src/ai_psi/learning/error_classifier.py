@@ -22,7 +22,9 @@ from dataclasses import dataclass, field
 from typing import Final
 
 from ai_psi.domain.enums import (
+    CORRECTABLE_KINDS,
     ConfidenceBand,
+    CorrectedArtifactKind,
     EpistemicAction,
     ErrorType,
     FeedbackType,
@@ -30,7 +32,63 @@ from ai_psi.domain.enums import (
     UncertaintyType,
 )
 
-__all__ = ["ErrorAttribution", "ErrorClassifier", "ErrorSignals"]
+__all__ = [
+    "CLASSIFIER_VERSION",
+    "CorrectionTarget",
+    "ErrorAttribution",
+    "ErrorClassifier",
+    "ErrorSignals",
+]
+
+#: 错误分类逻辑的版本（阶段 6.6，ADR-0023）。
+#:
+#: 🔴 **改动这里任何一条归因规则都必须递增它**，因为它是每条
+#: ``ExperienceAttributionRecord`` 留档的一段。归因决定了系统之后学什么，
+#: 而"这条归因是哪一版规则给出的"是事后复核它的唯一入口——
+#: 没有版本号，规则一改，历史归因就只能靠猜它当时用的是哪一套。
+CLASSIFIER_VERSION: str = "error-classifier/1"
+
+
+@dataclass(frozen=True, slots=True)
+class CorrectionTarget:
+    """用户纠正**指到的那个产物**，以及它的结构信号（阶段 6.6）。
+
+    🔴 **它由服务端从回合的事件流里解析出来，不由客户端声明。**
+    客户端只给一个 id；"它是哪一类产物"是服务端查出来的。
+    让客户端报类别，等于让调用方决定归因规则吃哪一条分支——
+    而归因规则决定系统之后学什么。
+
+    🔴 **只能装可纠正的类别**（:data:`~ai_psi.domain.enums.CORRECTABLE_KINDS`）。
+    这是本阶段的**唯一执行点**：不可纠正的类别（记忆、问题本身）
+    在构造这里就被拒绝，而不是让分类器悄悄少判一条。
+
+    Attributes:
+        artifact_kind: 被指产物的类别。
+        has_supporting_evidence: 被指的**假设**当时有没有支持证据。
+            只有 ``HYPOTHESIS`` 有意义；其余类别忽略它。
+        uncertainty_type: 被指的**判断**声明的确定性类型。
+            只有 ``JUDGMENT`` 有意义；其余类别忽略它。
+    """
+
+    artifact_kind: CorrectedArtifactKind
+    has_supporting_evidence: bool = False
+    uncertainty_type: UncertaintyType | None = None
+
+    def __post_init__(self) -> None:
+        """🔴 拒绝不可纠正的类别——**在归因之前，不是之后**。
+
+        ``MEMORY`` 有它自己的纠正入口（``POST /memories/{id}/correct``），
+        ``INQUIRY`` 是**用户自己提的**问题。让它们走到归因层，
+        评审查到的会是一条"这个 id 为什么没有类别"的死分支，
+        而真正该说的是"这类产物根本不接受纠正"。
+        """
+        if self.artifact_kind not in CORRECTABLE_KINDS:
+            msg = (
+                f"{self.artifact_kind.value} 不是可纠正的产物类别。"
+                "记忆有它自己的纠正入口；问题是用户自己提的。"
+                "这件事必须在构造 CorrectionTarget 之前被挡住"
+            )
+            raise ValueError(msg)
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +141,21 @@ class ErrorSignals:
 
     feedback_types: tuple[FeedbackType, ...] = ()
     """本次回合收到的用户反馈类型（**只有类型，没有内容**）。"""
+
+    correction: CorrectionTarget | None = None
+    """用户纠正**指到的那个产物**（阶段 6.6）。
+
+    🔴 **它是"用户纠正"与"归因"之间那道闸门的另一半。**
+
+    ``feedback_types`` 只说"用户说了不对"，没说"哪里不对"。少了
+    本字段，一条纠正只能被归成"不知道哪一类"，或者更糟——被猜成
+    一个看起来具体的类别。有了它，``_from_user_correction`` 才能
+    按**被指产物的结构**给出一个有依据的类别。
+
+    ⚠️ 它是 ``None`` 时**不归因**（而不是退到某个笼统类别）：
+    "用户指出了一条我们识别不了的产物"与"用户只是笼统地说不对"
+    都不足以支撑一个类别。
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,7 +219,7 @@ class ErrorClassifier:
             self._from_unsupported_certainty,
             self._from_value_substitution,
             self._from_reasoning_signals,
-            self._from_user_feedback,
+            self._from_user_correction,
         ):
             attribution = rule(signals)
             if attribution is not None:
@@ -294,20 +367,39 @@ class ErrorClassifier:
             ),
         )
 
-    def _from_user_feedback(self, signals: ErrorSignals) -> ErrorAttribution | None:
-        """用户明确表示判断有误。
+    def _from_user_correction(self, signals: ErrorSignals) -> ErrorAttribution | None:
+        """用户明确纠正，**并且**指出了被纠正的是哪一条产物（阶段 6.6）。
 
-        🔴 **这是"确实错了"的最强证据，但它不告诉我们错在哪。**
+        🔴 **两个条件缺一不可。**
 
-        错误类别需要理解用户到底在纠正什么，而那是语义判断——
-        本层刻意不做。给一个看起来具体的类别（比如一律判成
-        ``FACTUAL_ERROR``）会让模式发现把一堆互不相干的错误
-        聚成一类，然后生成一个针对错误问题的提案。
+        用户纠正证明"确实错了"，但它**不说明错在哪一类**。要得到类别，
+        系统必须知道用户指的是哪一层产物——那是结构信息，
+        由服务端从回合事件流里解析（``CorrectionTarget``）。
 
-        因此这里归为 ``UNKNOWN_ERROR`` 并**在理由里说清楚为什么**。
-        任务书 §11.3 明确把"用户纠正显示现有规则具有系统性问题"
-        列为提案的合法触发条件之一，所以这条归因是有用的：
-        它标记出"用户反复纠正"这件事本身，而不是假装知道原因。
+        只满足第一条时**不归因**（``error_type=None``）。
+        这是刻意的：猜测一个"看起来具体"的类别会让模式发现把一堆
+        互不相干的错误聚成一类，然后生成一个针对错误问题的提案——
+        而归错类比不归因糟得多。
+
+        ## 类别怎么来的：**被指产物 + 它的结构信号**
+
+        映射规则是 V0.1 的**约定**，不是对错误本质的独立测量。
+        每一步都能被指出来，因而也能被推翻：
+
+        | 被指产物 | 结构信号 | 类别 |
+        |---|---|---|
+        | 证据 | — | ``EVIDENCE_ERROR`` |
+        | 假设 | 没有支持证据 | ``EVIDENCE_ERROR`` |
+        | 假设 | 有支持证据 | ``REASONING_ERROR`` |
+        | 判断 | 声明为 ``NORMATIVE`` | ``VALUE_SUBSTITUTION`` |
+        | 判断 | 其余 | ``REASONING_ERROR`` |
+        | 回答 | — | ``EXPRESSION_ERROR`` |
+
+        ⚠️ **置信度是 ``MODERATE``，但它的语义要说准**：这是
+        「用户明确纠正」+「V0.1 结构映射规则」两条**非独立**的依据
+        形成的**策略性归因**，不是两个独立来源共同确认了客观错误类别。
+        映射规则是本系统的约定，把它说成"互相印证"是把一条策略
+        抬高成一次验证（ADR-0023 §置信度）。
         """
         corrections = {
             FeedbackType.CORRECTION,
@@ -315,17 +407,91 @@ class ErrorClassifier:
         }
         matched = [item for item in signals.feedback_types if item in corrections]
         if not matched:
+            # 没有否定反馈 —— 交给下一族判据（本规则是最后一条）。
             return None
+
+        heard = f"用户给出了明确的否定反馈：{'、'.join(item.value for item in matched)}"
+
+        if signals.correction is None:
+            # 🔴 **本规则是链条的最后一条**，所以这里返回一个
+            # `error_type=None` 的结论不是"跳过"，而是**最终答案**：
+            # 有纠正、但指不出被纠正的对象 → 不归因。
+            return ErrorAttribution(
+                error_type=None,
+                confidence=ConfidenceBand.VERY_LOW,
+                reasons=(
+                    heard,
+                    "但这次纠正**没有指出被纠正的是哪一条产物**"
+                    "（缺少 related_artifact_id，或它解析不到本回合的任何产物）",
+                    "🔴 只说得出「有错」、说不出「错在哪一条」，"
+                    "不足以支撑一个错误类别——保持不归因，而不是猜一个",
+                ),
+            )
+
+        target = signals.correction
+        error_type, detail = _category_for_correction(target)
         return ErrorAttribution(
-            error_type=ErrorType.UNKNOWN_ERROR,
-            confidence=ConfidenceBand.LOW,
+            error_type=error_type,
+            confidence=ConfidenceBand.MODERATE,
             reasons=(
-                f"用户给出了明确的否定反馈：{'、'.join(item.value for item in matched)}",
-                "用户反馈证明判断有误，但**错误类别需要语义判断**，"
-                "确定性规则无法给出——因此记为 unknown_error 而不是猜一个具体类别",
-                "如果这类反馈反复出现，它本身就是 §11.3 认可的提案触发条件",
+                heard,
+                f"并且指出了被纠正的产物：一条 **{_KIND_LABEL[target.artifact_kind]}**",
+                detail,
+                f"🔴 这是**策略性归因**：它来自「用户明确纠正」+「V0.1 结构映射规则」"
+                f"（{CLASSIFIER_VERSION}），**不是两个独立来源共同确认**了客观错误类别",
             ),
         )
+
+
+#: 被指产物类别在理由里的说法。
+_KIND_LABEL: Final[dict[CorrectedArtifactKind, str]] = {
+    CorrectedArtifactKind.EVIDENCE: "证据",
+    CorrectedArtifactKind.HYPOTHESIS: "论断（假设）",
+    CorrectedArtifactKind.JUDGMENT: "判断",
+    CorrectedArtifactKind.RESPONSE: "回答",
+}
+
+
+def _category_for_correction(target: CorrectionTarget) -> tuple[ErrorType, str]:
+    """按被指产物推出错误类别与一句可读的判据。
+
+    🔴 **每个可纠正的类别都必须在这里有一支。**
+    少了任何一支，下面那个 ``raise`` 会**炸掉**而不是静默地不归因——
+    fail-closed：往 ``CORRECTABLE_KINDS`` 里加一类却忘了加规则，
+    症状应该是"归因时立刻报错"，而不是"这类纠正悄悄不算数"。
+
+    Returns:
+        ``(错误类别, 判据)``。
+    """
+    kind = target.artifact_kind
+    if kind is CorrectedArtifactKind.EVIDENCE:
+        return ErrorType.EVIDENCE_ERROR, "被纠正的对象是**证据本身**——这是证据层的问题"
+    if kind is CorrectedArtifactKind.HYPOTHESIS:
+        if not target.has_supporting_evidence:
+            return (
+                ErrorType.EVIDENCE_ERROR,
+                "这条论断在那时**没有任何证据支撑**——问题出在证据层，不是推理层",
+            )
+        return (
+            ErrorType.REASONING_ERROR,
+            "这条论断有证据支撑，而用户仍指出它错了——证据在那儿，是推理用错了",
+        )
+    if kind is CorrectedArtifactKind.JUDGMENT:
+        if target.uncertainty_type is UncertaintyType.NORMATIVE:
+            return (
+                ErrorType.VALUE_SUBSTITUTION,
+                "被纠正的判断自己声明了 value 层面无法由事实决定（normative），"
+                "却给出了可下结论的结论——这不是「答错了」，是「用事实的口气回答了价值问题」",
+            )
+        return ErrorType.REASONING_ERROR, "被纠正的是**判断本身**——推理层的产物"
+    if kind is CorrectedArtifactKind.RESPONSE:
+        return ErrorType.EXPRESSION_ERROR, "被纠正的是**给用户的回答**——表达层的产物"
+
+    msg = (
+        f"没有为 {kind.value} 定义归因规则。它本该在构造 CorrectionTarget 时"
+        "就被 CORRECTABLE_KINDS 挡住——往那张表里加类别时，这里必须同时加一支"
+    )
+    raise ValueError(msg)
 
 
 #: 阶段名到错误类别的映射。

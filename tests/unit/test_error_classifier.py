@@ -18,6 +18,7 @@ import pytest
 from ai_psi.application import cognitive_runtime
 from ai_psi.domain.enums import (
     ConfidenceBand,
+    CorrectedArtifactKind,
     EpistemicAction,
     ErrorType,
     FeedbackType,
@@ -26,6 +27,7 @@ from ai_psi.domain.enums import (
 )
 from ai_psi.learning.error_classifier import (
     STAGE_ERROR_CATEGORY,
+    CorrectionTarget,
     ErrorAttribution,
     ErrorClassifier,
     ErrorSignals,
@@ -46,6 +48,13 @@ def _signals(**overrides: object) -> ErrorSignals:
     payload: dict[str, object] = {"round_state": RoundState.COMPLETED}
     payload.update(overrides)
     return ErrorSignals(**payload)  # type: ignore[arg-type]
+
+
+def _target(kind: CorrectedArtifactKind, **overrides: object) -> CorrectionTarget:
+    """构造一个纠正目标。默认是最简单的那种：指到一条证据。"""
+    payload: dict[str, object] = {"artifact_kind": kind}
+    payload.update(overrides)
+    return CorrectionTarget(**payload)  # type: ignore[arg-type]
 
 
 class TestNoAttribution:
@@ -77,7 +86,10 @@ class TestNoAttribution:
                 epistemic_action=EpistemicAction.ANSWER,
             ),
             _signals(missing_counterexample_detected=True),
-            _signals(feedback_types=(FeedbackType.CORRECTION,)),
+            _signals(
+                feedback_types=(FeedbackType.CORRECTION,),
+                correction=_target(CorrectedArtifactKind.HYPOTHESIS),
+            ),
         ]
         for signals in samples:
             attribution = classifier.classify(signals)
@@ -249,22 +261,38 @@ class TestReasoningSignals:
         assert attribution.error_type is ErrorType.REASONING_ERROR
 
 
-class TestUserFeedbackRule:
-    """用户纠正是最强的"确实错了"证据，但它**不告诉我们错在哪**。"""
+class TestUserCorrectionRule:
+    """🔴 用户纠正要形成归因，**两个条件缺一不可**（阶段 6.6，ADR-0023）。
+
+    反馈类型是否定性的（``CORRECTION`` / ``DISAGREEMENT``），
+    **并且**它指得出被纠正的是哪一条产物。
+
+    ⚠️ **阶段 6.5 的版本只要求第一条**，一律归成 ``UNKNOWN_ERROR``。
+    那个类别诚实但**没有分辨力**：所有被纠正过的回合都会落进同一个
+    模式，"三次同类错误"于是退化成"三次被纠正过"——而模式发现
+    存在的理由恰恰是分辨"哪一类错在反复发生"。
+    """
 
     @pytest.mark.parametrize("feedback", [FeedbackType.CORRECTION, FeedbackType.DISAGREEMENT])
-    def test_negative_feedback_is_unknown_error(
+    def test_negative_feedback_without_a_target_is_not_attributed(
         self, classifier: ErrorClassifier, feedback: FeedbackType
     ) -> None:
-        attribution = classifier.classify(_signals(feedback_types=(feedback,)))
-        assert attribution.error_type is ErrorType.UNKNOWN_ERROR
-        assert attribution.confidence is ConfidenceBand.LOW
+        """🔴 只说得出「有错」、说不出「错在哪一条」→ **不归因**。
 
-    def test_reason_admits_it_cannot_name_the_category(self, classifier: ErrorClassifier) -> None:
-        """理由必须说清"为什么给不出具体类别"，否则它看起来像一次失败。"""
+        这里**不返回 ``UNKNOWN_ERROR``**：那会让"指不出对象"与
+        "对象指对了但类别未知"在计数时长得一样，而两者的下一步
+        动作完全不同——前者要用户补一个指针，后者要人去看。
+        """
+        attribution = classifier.classify(_signals(feedback_types=(feedback,)))
+        assert attribution.error_type is None
+        assert attribution.confidence is ConfidenceBand.VERY_LOW
+
+    def test_the_reason_says_why_it_holds_back(self, classifier: ErrorClassifier) -> None:
+        """理由必须说清"为什么没有归因"，否则它看起来像一次失败。"""
         attribution = classifier.classify(_signals(feedback_types=(FeedbackType.CORRECTION,)))
         joined = "".join(attribution.reasons)
-        assert "语义" in joined
+        assert "没有指出被纠正的是哪一条产物" in joined
+        assert "不归因" in joined
 
     @pytest.mark.parametrize(
         "feedback",
@@ -282,6 +310,133 @@ class TestUserFeedbackRule:
             classifier.classify(_signals(feedback_types=(FeedbackType.CLARIFICATION,))).error_type
             is None
         )
+
+
+class TestWhatTheCorrectedArtifactImplies:
+    """🔴 类别由**被指产物的结构**推出来（阶段 6.6）。
+
+    ⚠️ 映射规则是 V0.1 的**约定**，不是对错误本质的独立测量。
+    正因为如此，每一步都必须能被指出来——下面每条用例断言的
+    就是"哪一步推出了哪一个类别"。
+    """
+
+    @pytest.mark.parametrize(
+        ("kind", "expected"),
+        [
+            (CorrectedArtifactKind.EVIDENCE, ErrorType.EVIDENCE_ERROR),
+            (CorrectedArtifactKind.RESPONSE, ErrorType.EXPRESSION_ERROR),
+        ],
+    )
+    def test_the_kind_alone_decides(
+        self, classifier: ErrorClassifier, kind: CorrectedArtifactKind, expected: ErrorType
+    ) -> None:
+        attribution = classifier.classify(
+            _signals(feedback_types=(FeedbackType.CORRECTION,), correction=_target(kind))
+        )
+        assert attribution.error_type is expected
+        assert attribution.confidence is ConfidenceBand.MODERATE
+
+    def test_a_hypothesis_without_support_is_an_evidence_error(
+        self, classifier: ErrorClassifier
+    ) -> None:
+        """用户指出一条**当时就没有证据**的论断 → 问题在证据层。"""
+        attribution = classifier.classify(
+            _signals(
+                feedback_types=(FeedbackType.CORRECTION,),
+                correction=_target(CorrectedArtifactKind.HYPOTHESIS, has_supporting_evidence=False),
+            )
+        )
+        assert attribution.error_type is ErrorType.EVIDENCE_ERROR
+
+    def test_a_hypothesis_with_support_is_a_reasoning_error(
+        self, classifier: ErrorClassifier
+    ) -> None:
+        """🔴 同一种产物，结构不同 → 类别不同。这条与上一条**成对**。
+
+        少了它，"假设一律归 evidence_error"的实现也能全绿——
+        而那正是本层最该避免的"看起来具体其实笼统"。
+        """
+        attribution = classifier.classify(
+            _signals(
+                feedback_types=(FeedbackType.CORRECTION,),
+                correction=_target(CorrectedArtifactKind.HYPOTHESIS, has_supporting_evidence=True),
+            )
+        )
+        assert attribution.error_type is ErrorType.REASONING_ERROR
+
+    def test_a_normative_judgment_is_a_value_substitution(
+        self, classifier: ErrorClassifier
+    ) -> None:
+        attribution = classifier.classify(
+            _signals(
+                feedback_types=(FeedbackType.CORRECTION,),
+                correction=_target(
+                    CorrectedArtifactKind.JUDGMENT, uncertainty_type=UncertaintyType.NORMATIVE
+                ),
+            )
+        )
+        assert attribution.error_type is ErrorType.VALUE_SUBSTITUTION
+
+    def test_an_ordinary_judgment_is_a_reasoning_error(self, classifier: ErrorClassifier) -> None:
+        """与上一条成对：普通判断不该被归成价值替换。"""
+        attribution = classifier.classify(
+            _signals(
+                feedback_types=(FeedbackType.CORRECTION,),
+                correction=_target(CorrectedArtifactKind.JUDGMENT),
+            )
+        )
+        assert attribution.error_type is ErrorType.REASONING_ERROR
+
+    def test_the_confidence_is_described_as_strategic(self, classifier: ErrorClassifier) -> None:
+        """🔴 理由里必须写清它**是策略性归因**，不是两个独立来源的印证。
+
+        `MODERATE` 这个档位本身不说明任何事——说明事的是理由。
+        把"用户说了 + 我们查出来它是什么"说成"两个独立来源互相印证"，
+        是把一条约定抬高成一次验证。
+        """
+        attribution = classifier.classify(
+            _signals(
+                feedback_types=(FeedbackType.CORRECTION,),
+                correction=_target(CorrectedArtifactKind.EVIDENCE),
+            )
+        )
+        joined = "".join(attribution.reasons)
+        assert "策略性归因" in joined
+        assert "不是两个独立来源" in joined
+
+    @pytest.mark.parametrize("kind", [CorrectedArtifactKind.MEMORY, CorrectedArtifactKind.INQUIRY])
+    def test_non_correctable_kinds_cannot_even_be_constructed(
+        self, kind: CorrectedArtifactKind
+    ) -> None:
+        """🔴 **唯一执行点在构造处**，不在归因层。
+
+        记忆有自己的纠正入口，问题是用户自己提的。让它们走到归因层，
+        评审查到的是一条"这个 id 为什么没有类别"的死分支——
+        而真正该说的是"这类产物根本不接受纠正"。
+        """
+        with pytest.raises(ValueError, match="不是可纠正的产物类别"):
+            _target(kind)
+
+    @pytest.mark.parametrize(
+        "feedback",
+        [
+            FeedbackType.AGREEMENT,
+            FeedbackType.ACKNOWLEDGEMENT,
+            FeedbackType.RATING,
+            FeedbackType.CLARIFICATION,
+        ],
+    )
+    def test_a_target_without_negative_feedback_is_not_an_error(
+        self, classifier: ErrorClassifier, feedback: FeedbackType
+    ) -> None:
+        """反向：**指得出对象，但反馈不是否定性的** → 仍然不归因。
+
+        与「有否定反馈但指不出对象」合起来，才是"两者都要"的完整矩阵。
+        """
+        attribution = classifier.classify(
+            _signals(feedback_types=(feedback,), correction=_target(CorrectedArtifactKind.JUDGMENT))
+        )
+        assert attribution.error_type is None
 
 
 class TestAttributableBoundary:

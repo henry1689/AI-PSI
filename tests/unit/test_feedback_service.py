@@ -40,6 +40,7 @@ from ai_psi.memory.write_policy import (
     WritePolicyDecision,
 )
 from ai_psi.providers.embeddings import LocalHashingEmbedding
+from tests.helpers import RecordingTrigger
 
 pytestmark = pytest.mark.unit
 
@@ -74,9 +75,24 @@ def memory_service(
     return MemoryService(uow_factory, embeddings)
 
 
+def _service(
+    uow_factory: UnitOfWorkFactory,
+    memory_service: MemoryService,
+    *,
+    trigger: RecordingTrigger | None = None,
+) -> FeedbackService:
+    """构造一个反馈服务。
+
+    🔴 **触发器必须显式给。** `FeedbackService` 的构造参数刻意没有默认值
+    （给了 `None` 默认值的症状是"静默地不再触发学习"），
+    因此测试也不能靠省略它——见 `tests.helpers.RecordingTrigger`。
+    """
+    return FeedbackService(uow_factory, memory_service, trigger or RecordingTrigger())
+
+
 @pytest.fixture
 def service(uow_factory: UnitOfWorkFactory, memory_service: MemoryService) -> FeedbackService:
-    return FeedbackService(uow_factory, memory_service)
+    return _service(uow_factory, memory_service)
 
 
 async def _make_round(uow_factory: UnitOfWorkFactory, *, user_id: UUID | None) -> UUID:
@@ -442,7 +458,7 @@ class TestFeedbackCannotBypassTheWritePolicy:
     ) -> None:
         user_id = uuid4()
         round_id = await _make_round(uow_factory, user_id=user_id)
-        service = FeedbackService(
+        service = _service(
             uow_factory, MemoryService(uow_factory, embeddings, policy=_DenyAllPolicy())
         )
 
@@ -533,7 +549,7 @@ class TestFeedbackIsAtomicWithItsMemoryUpdate:
         self, uow_factory: UnitOfWorkFactory
     ) -> None:
         round_id = await _make_round(uow_factory, user_id=uuid4())
-        service = FeedbackService(uow_factory, _Exploding(uow_factory, LocalHashingEmbedding()))
+        service = _service(uow_factory, _Exploding(uow_factory, LocalHashingEmbedding()))
 
         with pytest.raises(RuntimeError, match="模拟记忆写入过程中崩溃"):
             await service.record(
@@ -549,7 +565,7 @@ class TestFeedbackIsAtomicWithItsMemoryUpdate:
         self, uow_factory: UnitOfWorkFactory
     ) -> None:
         """回合不存在时同样不留任何东西。"""
-        service = FeedbackService(uow_factory, MemoryService(uow_factory, LocalHashingEmbedding()))
+        service = _service(uow_factory, MemoryService(uow_factory, LocalHashingEmbedding()))
 
         with pytest.raises(NotFoundError):
             await service.record(
@@ -574,7 +590,7 @@ class TestPolicyRejectionStillKeepsTheFeedback:
         self, uow_factory: UnitOfWorkFactory
     ) -> None:
         round_id = await _make_round(uow_factory, user_id=uuid4())
-        service = FeedbackService(
+        service = _service(
             uow_factory,
             MemoryService(uow_factory, LocalHashingEmbedding(), policy=_DenyAllPolicy()),
         )

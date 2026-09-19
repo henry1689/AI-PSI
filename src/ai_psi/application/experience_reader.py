@@ -25,6 +25,7 @@ from ai_psi.domain.events import Event
 from ai_psi.domain.experiences import (
     Experience,
     ExperienceAssessment,
+    ExperienceAttributionRecord,
     ExperienceEvaluationRecord,
     assess_experiences,
 )
@@ -32,6 +33,7 @@ from ai_psi.domain.experiences import (
 __all__ = [
     "ExperienceLoad",
     "ExperienceReader",
+    "attribution_from_event",
     "evaluation_from_event",
     "experience_from_event",
 ]
@@ -64,13 +66,22 @@ class ExperienceLoad:
         assessments: 经验及其**有效评价**（已合并追加评价）。
         unreadable_experiences: 负载解析失败的经验条数。
         unreadable_evaluations: 负载解析失败的评价条数。
+        unreadable_attributions: 负载解析失败的**归因**条数。
         orphan_evaluations: 指向不存在经验的评价条数。
+        orphan_attributions: 指向不存在经验的归因条数。
+        conflicting_attributions: 出现了**互相矛盾**归因的经验条数
+            （阶段 6.6）。它随 :meth:`GateVerdict.data_quality <...>`
+            一起交给评审——冲突是**要人去裁决**的事，
+            不能在链路里悄悄消掉。
     """
 
     assessments: tuple[ExperienceAssessment, ...] = ()
     unreadable_experiences: int = 0
     unreadable_evaluations: int = 0
+    unreadable_attributions: int = 0
     orphan_evaluations: int = 0
+    orphan_attributions: int = 0
+    conflicting_attributions: int = 0
 
     @property
     def experiences(self) -> tuple[Experience, ...]:
@@ -100,6 +111,9 @@ class ExperienceReader:
             evaluated = await uow.events.read_by_event_type(
                 event_type=EventType.EXPERIENCE_EVALUATED
             )
+            attributed = await uow.events.read_by_event_type(
+                event_type=EventType.EXPERIENCE_ATTRIBUTED
+            )
 
         experiences: list[Experience] = []
         unreadable_experiences = 0
@@ -119,15 +133,34 @@ class ExperienceReader:
             else:
                 records.append(record)
 
+        attributions: list[ExperienceAttributionRecord] = []
+        unreadable_attributions = 0
+        for event in attributed:
+            attribution = attribution_from_event(event)
+            if attribution is None:
+                unreadable_attributions += 1
+            else:
+                attributions.append(attribution)
+
         known = {item.id for item in experiences}
         orphan = [item for item in records if item.experience_id not in known]
         kept = [item for item in records if item.experience_id in known]
+        orphan_attr = [item for item in attributions if item.experience_id not in known]
+        kept_attr = [item for item in attributions if item.experience_id in known]
+
+        assessments = assess_experiences(experiences, kept, kept_attr)
 
         return ExperienceLoad(
-            assessments=assess_experiences(experiences, kept),
+            assessments=assessments,
             unreadable_experiences=unreadable_experiences,
             unreadable_evaluations=unreadable_evaluations,
+            unreadable_attributions=unreadable_attributions,
             orphan_evaluations=len(orphan),
+            orphan_attributions=len(orphan_attr),
+            # 🔴 在**合并之后**数，而不是在事件里数：
+            # "两条同类别归因"不是冲突，"一正一反"才是。
+            # 只有合并那一步知道该经验的全部分组视图。
+            conflicting_attributions=sum(1 for item in assessments if item.attribution_conflict),
         )
 
 
@@ -151,6 +184,22 @@ def experience_from_event(event: Event) -> Experience | None:
         # ⚠️ 这里**刻意吞掉一切异常**：单条坏记录不该让整段历史作废。
         # 代价是"读不回来"必须被计数上报（见 ExperienceLoad.unreadable_experiences），
         # 否则"只读到 2 条"会被误当成"历史上只有 2 条"。
+        return None
+
+
+def attribution_from_event(event: Event) -> ExperienceAttributionRecord | None:
+    """把 ``experience.attributed`` 的负载还原成领域对象；失败返回 ``None``。
+
+    与 :func:`experience_from_event` 同理：**只此一处实现**。
+    """
+    payload = event.payload.get("attribution")
+    if not isinstance(payload, dict):  # pragma: no cover - 负载恒为字典
+        return None
+    try:
+        return ExperienceAttributionRecord.model_validate(payload)
+    except Exception:
+        # 与评价同理：一条坏的归因不该让整段历史作废。
+        # 代价是它会**降低**这条经验的归因可用性——因此也要计数上报。
         return None
 
 

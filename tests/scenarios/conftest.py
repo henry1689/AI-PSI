@@ -32,7 +32,11 @@ from ai_psi.application.feedback_service import FeedbackService
 from ai_psi.application.learning_service import LearningService
 from ai_psi.application.memory_service import MemoryService
 from ai_psi.application.metrics_reader import RoundMetricsReader
-from ai_psi.application.ports import UnitOfWorkFactory
+from ai_psi.application.ports import (
+    LearningTriggerOutcome,
+    LearningTriggerStatus,
+    UnitOfWorkFactory,
+)
 from ai_psi.application.proposal_gate import ProposalGate
 from ai_psi.application.proposal_service import ProposalService
 from ai_psi.cognition.projection import ArtifactView, project_artifacts
@@ -312,7 +316,6 @@ def harness_factory() -> Callable[..., Harness]:
         # 🔴 与容器**同一套装配**。场景测试若要验证学习链路，
         # 用的一定是生产里那条链路——在测试夹具里另拼一套，
         # 验证的就不是系统了。
-        feedback_service = FeedbackService(uow_factory, memory_service)
         proposal_service = ProposalService(uow_factory)
         experience_reader = ExperienceReader(uow_factory)
         proposal_gate = ProposalGate(experience_reader)
@@ -324,6 +327,23 @@ def harness_factory() -> Callable[..., Harness]:
             proposal_service,
             metrics_reader,
         )
+
+        async def _trigger_learning() -> LearningTriggerOutcome:
+            """与组合根**逐字同构**的触发入口（阶段 6.6）。
+
+            🔴 **夹具里也必须接上真实的触发器。** 漏掉它，场景测试里的
+            反馈就不会自动跑学习链路，于是"三次纠正自动出提案"这条
+            能力在夹具里**永远不成立**——而测试是绿的，因为它压根没测
+            那条路。这正是容器那边"参数不给默认值"要防的东西，
+            在夹具里靠**照着容器写**来防。
+            """
+            run = await learning_service.review(actor_id="feedback_service")
+            return LearningTriggerOutcome(
+                status=LearningTriggerStatus.SUCCEEDED,
+                created_proposal_ids=tuple(item.proposal.id for item in run.created),
+            )
+
+        feedback_service = FeedbackService(uow_factory, memory_service, _trigger_learning)
         return Harness(
             runtime=runtime,
             provider=provider,

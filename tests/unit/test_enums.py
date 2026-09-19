@@ -222,9 +222,16 @@ class TestEventType:
           而**人类做出的那个批准决定本身**必须可追溯——不变量 11）；
         * ``experience.evaluated``（ADR-0020 / 阶段 6.5 §二：经验不可变，
           而评价会变。缺了它，生产里能产出的经验永远停在 ``SUSPECTED``，
-          "三次**被支持**的同类错误"这条验收条件就不可能成立）。
+          "三次**被支持**的同类错误"这条验收条件就不可能成立）；
+        * ``experience.attributed``（ADR-0023 / 阶段 6.6：**经验写完之后
+          才拿到错误类别**。经验在回合收尾时构建，而用户纠正在那之后才到，
+          因此抽取时刻的 ``error_type`` 往往是 ``None``——模式发现会把它们
+          全部过滤掉，"三次同类错误"在生产配置下不可能发生。
+          ⚠️ 它与 ``experience.evaluated`` 是**两个事件**：评价回答
+          "该不该计权"，归因回答"是哪一类错"，而"用户确认了但指不出
+          错在哪"这个真实状态需要一个地方安放）。
         """
-        assert len(EventType) == 37
+        assert len(EventType) == 38
 
     def test_values_are_dotted_namespaced(self) -> None:
         for event_type in EventType:

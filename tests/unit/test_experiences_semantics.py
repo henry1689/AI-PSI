@@ -26,6 +26,7 @@ from pydantic import ValidationError
 
 from ai_psi.domain.enums import (
     ConfidenceBand,
+    CorrectedArtifactKind,
     ErrorType,
     ExperienceEvaluation,
     ExperienceEvaluator,
@@ -36,12 +37,14 @@ from ai_psi.domain.experiences import (
     EXTRACTOR_VERSION,
     Experience,
     ExperienceAssessment,
+    ExperienceAttributionRecord,
     ExperienceEvaluationRecord,
     assert_evaluator_may_produce,
     assess_experiences,
     canonical_key_for,
     evaluation_target_for_judgment,
 )
+from ai_psi.learning.error_classifier import CLASSIFIER_VERSION
 
 pytestmark = pytest.mark.unit
 
@@ -644,3 +647,121 @@ class TestVerificationStatusIsIndependentOfEvaluation:
         )
         assert experience.verification_status is VerificationStatus.UNVERIFIED
         assert experience.evaluation is ExperienceEvaluation.CONFIRMED
+
+
+def _attribution(experience: Experience, error_type: ErrorType, **overrides: Any) -> Any:
+    """构造一条归因记录。默认指向该经验所在回合的一条假设。"""
+    payload: dict[str, Any] = {
+        "created_by": "test",
+        "experience_id": experience.id,
+        "experience_canonical_key": experience.canonical_key,
+        "cognitive_round_id": experience.cognitive_round_id,
+        "judgment_id": experience.judgment_id,
+        "related_artifact_id": uuid4(),
+        "artifact_kind": CorrectedArtifactKind.HYPOTHESIS,
+        "error_type": error_type,
+        "reasons": [f"判据：{error_type.value}"],
+        "classifier_version": CLASSIFIER_VERSION,
+        "evidence_refs": [uuid4()],
+    }
+    payload.update(overrides)
+    return ExperienceAttributionRecord(**payload)
+
+
+class TestTheEffectiveAttribution:
+    """🔴 阶段 6.6：**有效错误类别**由全部归因视图共同决定。
+
+    经验自己那一份（抽取时刻的元认知归因）也算一个视图——
+    它在默认配置下恒为 ``None``，因此用户纠正带来的那份就是唯一的。
+    """
+
+    def test_an_attribution_fills_in_what_the_experience_could_not_say(
+        self, make_experience
+    ) -> None:
+        """最要紧的一条：抽取时刻说不出类别，用户纠正补上了它。"""
+        experience = make_experience(error_type=None)
+        (assessment,) = assess_experiences(
+            [experience], (), [_attribution(experience, ErrorType.EVIDENCE_ERROR)]
+        )
+        assert assessment.effective_error_type is ErrorType.EVIDENCE_ERROR
+        assert assessment.effective_attribution_confidence is ConfidenceBand.MODERATE
+        assert assessment.attribution_conflict is False
+
+    def test_without_any_attribution_it_stays_unattributable(self, make_experience) -> None:
+        """反向：没有归因时有效类别仍是 ``None``——不能凭空冒出来。"""
+        experience = make_experience(error_type=None)
+        (assessment,) = assess_experiences([experience])
+        assert assessment.effective_error_type is None
+        assert assessment.attribution_conflict is False
+
+    def test_the_experiences_own_category_is_kept_when_nothing_disagrees(
+        self, make_experience
+    ) -> None:
+        """经验自己已经归过因、且没有外部归因时，沿用它的。"""
+        experience = make_experience(
+            error_type=ErrorType.REASONING_ERROR, attribution_confidence=ConfidenceBand.MODERATE
+        )
+        (assessment,) = assess_experiences([experience])
+        assert assessment.effective_error_type is ErrorType.REASONING_ERROR
+        assert assessment.effective_attribution_confidence is ConfidenceBand.MODERATE
+
+    def test_two_extremes_disagreeing_is_a_conflict(self, make_experience) -> None:
+        """🔴 **两条互相矛盾的归因 → 退回"不可归因"，绝不挑一个。**
+
+        两条矛盾的归因里**至少有一条是错的**，而那件事本身必须可见。
+        "最后一条说了算"也能让代码跑通，代价是把矛盾藏起来。
+        """
+        experience = make_experience(error_type=None)
+        (assessment,) = assess_experiences(
+            [experience],
+            (),
+            [
+                _attribution(experience, ErrorType.EVIDENCE_ERROR),
+                _attribution(experience, ErrorType.REASONING_ERROR),
+            ],
+        )
+        assert assessment.attribution_conflict is True
+        assert assessment.effective_error_type is None
+        assert len(assessment.attributions) == 2, "两条都要留着"
+
+    def test_the_same_pair_from_both_sides_also_counts_as_a_conflict(self, make_experience) -> None:
+        """⚠️ 口径**比"只看外部之间"更紧一档**，这是有意的。
+
+        经验自带的类别与外部归因不一致，同样是"两个不同的类别视图"，
+        同样**不得静默决定**。紧的那一档更容易说清楚，也更难被绕开。
+        """
+        experience = make_experience(error_type=ErrorType.SCOPE_ERROR)
+        (assessment,) = assess_experiences(
+            [experience], (), [_attribution(experience, ErrorType.EVIDENCE_ERROR)]
+        )
+        assert assessment.attribution_conflict is True
+        assert assessment.effective_error_type is None
+
+    def test_agreeing_views_are_not_a_conflict(self, make_experience) -> None:
+        """反向：两边**说的是一回事**时不冲突——否则纠正永远补不上类别。"""
+        experience = make_experience(error_type=ErrorType.EVIDENCE_ERROR)
+        (assessment,) = assess_experiences(
+            [experience], (), [_attribution(experience, ErrorType.EVIDENCE_ERROR)]
+        )
+        assert assessment.attribution_conflict is False
+        assert assessment.effective_error_type is ErrorType.EVIDENCE_ERROR
+
+    def test_duplicate_records_collapse(self, make_experience) -> None:
+        """同一件事被记了两遍（重放）不是两条归因，更不是冲突。"""
+        experience = make_experience(error_type=None)
+        artifact_id = uuid4()
+        same = [
+            _attribution(experience, ErrorType.EVIDENCE_ERROR, related_artifact_id=artifact_id)
+            for _ in range(3)
+        ]
+        (assessment,) = assess_experiences([experience], (), same)
+        assert assessment.attribution_conflict is False
+        assert assessment.effective_error_type is ErrorType.EVIDENCE_ERROR
+
+    def test_attributions_for_another_experience_are_ignored(self, make_experience) -> None:
+        """指向别的经验的归因不该影响本条的判定。"""
+        mine = make_experience(error_type=None)
+        other = make_experience(error_type=None)
+        (assessment,) = assess_experiences([mine], (), [_attribution(other, ErrorType.SCOPE_ERROR)])
+        assert assessment.effective_error_type is None
+        assert assessment.attributions == ()

@@ -55,6 +55,7 @@ from pydantic import Field, model_validator
 from ai_psi.domain.common import EntityMetadata, UtcDatetime
 from ai_psi.domain.enums import (
     ConfidenceBand,
+    CorrectedArtifactKind,
     ErrorType,
     ExperienceEvaluation,
     ExperienceEvaluator,
@@ -67,6 +68,7 @@ __all__ = [
     "EXTRACTOR_VERSION",
     "Experience",
     "ExperienceAssessment",
+    "ExperienceAttributionRecord",
     "ExperienceEvaluationRecord",
     "assert_evaluator_may_produce",
     "assess_experiences",
@@ -519,9 +521,69 @@ class ExperienceEvaluationRecord(EntityMetadata):
         return self
 
 
+class ExperienceAttributionRecord(EntityMetadata):
+    """对一条经验的**外部错误归因**（阶段 6.6，ADR-0023）。
+
+    🔴 **为什么不是改 ``Experience.error_type``：**
+
+    经验在**回合收尾**时构建，那一刻除了系统自己没有任何评估者，
+    因此 ``error_type`` 往往是 ``None``；而用户纠正在那之后才到。
+    要表达"这条经验其实属于某一类错"，只有两条路：
+    改写经验（违反不可变与审计链），或者追加一条归因（本对象）。
+
+    🔴 **它与 :class:`ExperienceEvaluationRecord` 是两件事，不能合并。**
+
+    * 评价回答"这条经验**该不该计权**"（``SUPPORTED`` / ``CONFIRMED``）；
+    * 归因回答"它**到底是哪一类错**"（``error_type``）。
+
+    "用户确认了，但他指不出错在哪"是一个**真实且常见**的状态——
+    上面的规则表里"没给指针"就落在那里。把两者合成一个事件，
+    这个状态就无处安放，只能被硬塞进某一档。
+
+    Attributes:
+        experience_id: 被归因的经验。
+        experience_canonical_key: 冗余存一份，理由与评价记录相同
+            （经验只活在事件流里，归因可能被单独读取）。
+        cognitive_round_id: **关联回合**。
+        judgment_id: **关联的原判断**。
+        related_artifact_id: 用户指出的那个产物。
+        artifact_kind: 它的类别（**服务端解析**，不由客户端声明）。
+        error_type: **分类结果**。
+        confidence: 归因置信度。⚠️ 语义见下——它**不是**"两个独立来源
+            互相印证"。
+        reasons: **分类依据**，逐条可读。
+        classifier_version: **分类器版本**。
+        evidence_refs: 支撑这次归因的证据引用（反馈事件 id——
+            **纠正内容**就在那条事件里）。
+    """
+
+    experience_id: UUID = Field(description="被归因的经验")
+    experience_canonical_key: str = Field(min_length=1, description="被归因经验的规范标识")
+    cognitive_round_id: UUID = Field(description="关联回合")
+    judgment_id: UUID = Field(description="关联的原判断")
+    related_artifact_id: UUID = Field(description="用户指出的、被纠正的那个产物")
+    artifact_kind: CorrectedArtifactKind = Field(description="被指产物的类别（服务端解析）")
+    error_type: ErrorType = Field(description="分类结果")
+    confidence: ConfidenceBand = Field(
+        default=ConfidenceBand.MODERATE,
+        description=(
+            "🔴 **策略性归因的置信度，不是「两个独立来源共同确认」。**"
+            "它来自「用户明确纠正」+「V0.1 结构映射规则」两条**非独立**的东西："
+            "后者是本系统的约定，不是对错误本质的独立测量。"
+            "把它说成互相印证，是把一条策略抬高成一次验证（ADR-0023 §置信度）"
+        ),
+    )
+    reasons: list[str] = Field(default_factory=list, description="分类依据，逐条可读")
+    classifier_version: str = Field(min_length=1, description="分类器/规则版本")
+    evidence_refs: list[UUID] = Field(
+        default_factory=list,
+        description="支撑这次归因的证据引用（反馈事件 id——纠正内容在那条事件里）",
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ExperienceAssessment:
-    """一条经验与它的**有效**评价（阶段 6.5 §二.3）。
+    """一条经验与它的**有效**评价与**有效**归因（阶段 6.5 §二.3、6.6）。
 
     🔴 **"有效"不等于 ``experience.evaluation``。**
 
@@ -539,19 +601,37 @@ class ExperienceAssessment:
             保留全部而不是只留最高分那个：``CONFIRMED`` 来自用户
             与来自独立评测，对下游是不同的信息。
         evidence_refs: 全部支撑证据引用（去重、有序）。
+        effective_error_type: **有效错误类别**（阶段 6.6）。``None`` 表示
+            "无法可靠归因"——**门槛必须按它判断**，而不是按
+            ``experience.error_type``（后者只是抽取时刻的快照，
+            默认配置下恒为 ``None``）。
+        effective_attribution_confidence: 与上面配套的置信度。
+        attribution_conflict: 该经验出现了**互相矛盾**的归因。
+            🔴 此时 ``effective_error_type`` 是 ``None``，
+            **绝不挑一个**——两条矛盾的归因里至少有一条是错的，
+            而那件事本身必须可见。
+        attribution_basis: 归因依据（去重、有序），供审计与响应回传。
+        attributions: 参与本条的**全部**归因记录（去重、有序）。
     """
 
     experience: Experience
     evaluation: ExperienceEvaluation
     evaluator_types: tuple[ExperienceEvaluator, ...] = ()
     evidence_refs: tuple[UUID, ...] = ()
+    effective_error_type: ErrorType | None = None
+    effective_attribution_confidence: ConfidenceBand = ConfidenceBand.VERY_LOW
+    attribution_conflict: bool = False
+    attribution_basis: tuple[str, ...] = ()
+    attributions: tuple[ExperienceAttributionRecord, ...] = ()
 
 
 def assess_experiences(
     experiences: Sequence[Experience],
     records: Sequence[ExperienceEvaluationRecord] = (),
+    attributions: Sequence[ExperienceAttributionRecord] = (),
 ) -> tuple[ExperienceAssessment, ...]:
-    """把经验与它们的追加评价合并成有效评价（阶段 6.5 §二.3）。
+    """把经验与它们的追加评价、追加归因合并成**有效**视图
+    （阶段 6.5 §二.3、阶段 6.6）。
 
     🔴 **合并规则是"取最高一档"，不是"取最后一条"。**
 
@@ -568,9 +648,27 @@ def assess_experiences(
     而事件流可能因为保留策略被裁剪；一条孤立的评价记录不该让
     整次读取失败，但它也不会凭空造出一条经验。
 
+    ## 归因的合并规则（阶段 6.6）：**冲突就退回"不可归因"**
+
+    有效类别由该经验的**全部归因视图**共同决定，而所谓全部包括
+    ``experience.error_type`` 自己那一份：
+
+    * 去重之后**只有一个** → 就是它；
+    * 去重之后**多于一个** → ``attribution_conflict=True``，
+      ``effective_error_type=None``。
+
+    🔴 **绝不"挑一个"**，无论挑的规则是"自带优先"还是"最后一条覆盖"。
+    两条互相矛盾的归因里**至少有一条是错的**，而"有一条是错的"
+    这件事本身必须可见——静默挑一个，等于把它藏起来。
+
+    ⚠️ 这个口径比"只看外部归因之间是否矛盾"**更紧一档**：自带与外部
+    不一致同样算冲突。理由是同一条——两种口径下"静默决定"的害处一样，
+    而紧的那一档更容易说清楚、也更难被绕开。
+
     Args:
         experiences: 经验集合。
         records: 评价记录集合（顺序无关）。
+        attributions: 归因记录集合（顺序无关）。
 
     Returns:
         与 ``experiences`` 同序的评估结果。
@@ -578,6 +676,10 @@ def assess_experiences(
     by_experience: dict[UUID, list[ExperienceEvaluationRecord]] = {}
     for record in records:
         by_experience.setdefault(record.experience_id, []).append(record)
+
+    by_attribution: dict[UUID, list[ExperienceAttributionRecord]] = {}
+    for attribution in attributions:
+        by_attribution.setdefault(attribution.experience_id, []).append(attribution)
 
     assessments: list[ExperienceAssessment] = []
     for experience in experiences:
@@ -592,15 +694,86 @@ def assess_experiences(
                 evaluation = record.evaluation
             evaluators.append(record.evaluator_type)
             refs.extend(record.evidence_refs)
+
+        mine = _attributions_for(experience, by_attribution.get(experience.id, []))
+        effective_type, effective_confidence, conflict = _effective_attribution(experience, mine)
+        basis = tuple(
+            sorted(
+                {
+                    reason
+                    for item in mine
+                    for reason in item.reasons
+                    if item.error_type is effective_type
+                }
+            )
+        )
         assessments.append(
             ExperienceAssessment(
                 experience=experience,
                 evaluation=evaluation,
                 evaluator_types=tuple(sorted(set(evaluators), key=lambda item: item.value)),
                 evidence_refs=tuple(sorted(set(refs), key=str)),
+                effective_error_type=effective_type,
+                effective_attribution_confidence=effective_confidence,
+                attribution_conflict=conflict,
+                attribution_basis=basis,
+                attributions=mine,
             )
         )
     return tuple(assessments)
+
+
+def _effective_attribution(
+    experience: Experience,
+    records: tuple[ExperienceAttributionRecord, ...],
+) -> tuple[ErrorType | None, ConfidenceBand, bool]:
+    """由该经验的全部归因视图算出**有效类别**。
+
+    🔴 返回值里的 ``conflict`` 为 ``True`` 时，类别一定是 ``None``。
+    这不是"暂时没有"，是"系统**拒绝**在没有解决矛盾之前拿它计数"。
+
+    Returns:
+        ``(有效类别, 置信度, 是否冲突)``。
+    """
+    kinds = {item.error_type for item in records}
+    if experience.error_type is not None:
+        kinds.add(experience.error_type)
+
+    if not kinds:
+        return None, ConfidenceBand.VERY_LOW, False
+    if len(kinds) > 1:
+        return None, ConfidenceBand.VERY_LOW, True
+
+    (only,) = kinds
+    if experience.error_type is only:
+        return only, experience.attribution_confidence, False
+    matching = [item for item in records if item.error_type is only]
+    if not matching:  # pragma: no cover - only 来自 kinds，必有一条记录或经验自带
+        return only, experience.attribution_confidence, False
+    # 取**最低**的置信度：同类别的多条归因里只要有一条没那么有把握，
+    # 整体就不该比它更有把握。取最高会把"三条里一条笃定"说成"都很笃定"。
+    lowest = min(matching, key=lambda item: item.confidence.rank)
+    return only, lowest.confidence, False
+
+
+def _attributions_for(
+    experience: Experience,
+    records: Sequence[ExperienceAttributionRecord],
+) -> tuple[ExperienceAttributionRecord, ...]:
+    """取该经验的全部归因记录（去重、按类别与依据排序，**顺序确定**）。"""
+    unique = {
+        (item.error_type, item.artifact_kind, item.related_artifact_id): item for item in records
+    }
+    return tuple(
+        sorted(
+            unique.values(),
+            key=lambda item: (
+                item.error_type.value,
+                item.artifact_kind.value,
+                str(item.related_artifact_id),
+            ),
+        )
+    )
 
 
 def assert_evaluator_may_produce(

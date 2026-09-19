@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 from typing import Any
+from uuid import UUID
 
 from ai_psi.api.schemas import (
     JudgmentView,
@@ -84,6 +85,11 @@ def judgment_view(payload: dict[str, Any] | None) -> JudgmentView | None:
     内部假设 id 对客户端没有意义，暴露它只会让"客户端依赖了内部标识"
     成为日后重构的阻力。
 
+    ⚠️ **但判断自己的 id 必须外发**（阶段 6.6）。它不是"内部标识"，
+    而是**被引用的锚点**：用户纠正一条判断时要把它填进
+    `FeedbackRequest.related_artifact_id`。少了它，服务端就无从知道
+    用户指的到底是哪一条产物——而归因规则的前提正是"指得出对象"。
+
     Args:
         payload: 事件负载中的 ``judgment`` 字段。
 
@@ -93,6 +99,9 @@ def judgment_view(payload: dict[str, Any] | None) -> JudgmentView | None:
     if not payload:
         return None
     return JudgmentView(
+        # 🔴 `id` 缺失时**不猜**：一个编出来的 id 会让用户纠正指向
+        # 一个不存在的产物，而症状是"归因静默地不发生"。
+        judgment_id=UUID(str(payload["id"])),
         conclusion=str(payload["conclusion"]),
         rationale_summary=[str(item) for item in payload.get("rationale_summary", [])],
         strongest_counterarguments=[

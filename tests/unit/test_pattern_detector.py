@@ -28,8 +28,20 @@ from uuid import uuid4
 
 import pytest
 
-from ai_psi.domain.enums import ConfidenceBand, ErrorType, ExperienceEvaluation
-from ai_psi.domain.experiences import Experience, ExperienceAssessment
+from ai_psi.domain.enums import (
+    ConfidenceBand,
+    CorrectedArtifactKind,
+    ErrorType,
+    ExperienceEvaluation,
+    ExperienceEvaluator,
+)
+from ai_psi.domain.experiences import (
+    Experience,
+    ExperienceAssessment,
+    ExperienceAttributionRecord,
+    ExperienceEvaluationRecord,
+    assess_experiences,
+)
 from ai_psi.learning.evaluation_weighting import DEFAULT_WEIGHTING, EvaluationWeighting
 from ai_psi.learning.pattern_detector import (
     ErrorPattern,
@@ -60,6 +72,7 @@ def _assessed(
     experiences: Sequence[Experience],
     *,
     evaluation: ExperienceEvaluation | None = ExperienceEvaluation.CONFIRMED,
+    attributions: Sequence[ExperienceAttributionRecord] = (),
 ) -> list[ExperienceAssessment]:
     """把经验包成"已被外部证据确认过"的评估结果。
 
@@ -68,14 +81,31 @@ def _assessed(
 
     ``evaluation=None`` 时保留经验自带的（抽取时刻的）评价，
     用于测权重策略本身。
+
+    🔴 **走 `assess_experiences`，不手搓 `ExperienceAssessment`。**
+    阶段 6.6 起"有效错误类别"由那个函数算出来（它还要处理归因冲突），
+    而手搓的对象会让 ``effective_error_type`` 永远停在默认的 ``None``——
+    症状是"所有经验都被算成不可归因"，看起来却像是模式发现坏了。
+    测试夹具与生产走同一条合并路径，是这条能力唯一可被信任的前提。
     """
-    return [
-        ExperienceAssessment(
-            experience=item,
-            evaluation=item.evaluation if evaluation is None else evaluation,
-        )
-        for item in experiences
-    ]
+    records = (
+        []
+        if evaluation is None
+        else [
+            ExperienceEvaluationRecord(
+                created_by="test",
+                experience_id=item.id,
+                experience_canonical_key=item.canonical_key,
+                evaluation=evaluation,
+                evaluator_type=ExperienceEvaluator.USER_CORRECTION,
+                evaluator_version="test/1",
+                evidence_refs=[uuid4()],
+                evaluated_at=datetime.fromisoformat("2026-09-19T00:00:00+00:00"),
+            )
+            for item in experiences
+        ]
+    )
+    return list(assess_experiences(experiences, records, attributions))
 
 
 def _repeated(
@@ -644,3 +674,69 @@ class TestTheConstructorTakesKeywords:
     def test_one_below_the_boundary_is_still_refused(self) -> None:
         with pytest.raises(ValueError, match="不变量 10"):
             PatternDetector(threshold=0)
+
+
+class TestConflictingAttributionsAreNotCounted:
+    """🔴 阶段 6.6：归因互相矛盾的经验**不计入任何门槛**。
+
+    "指不出是哪一类错"与"有两套说法且互相矛盾"需要完全不同的下一步
+    动作——后者要人去裁决，前者只是信息不足。因此它们**分开计数**。
+    """
+
+    def _conflicted(self, make_experience: Factory) -> list[ExperienceAssessment]:
+        """三条**本身没有类别**的经验，每条带两条互相矛盾的归因。"""
+        bare = [_experience(make_experience, error_type=None) for _ in range(3)]
+        conflicting = [
+            ExperienceAttributionRecord(
+                created_by="test",
+                experience_id=item.id,
+                experience_canonical_key=item.canonical_key,
+                cognitive_round_id=item.cognitive_round_id,
+                judgment_id=item.judgment_id,
+                related_artifact_id=uuid4(),
+                artifact_kind=CorrectedArtifactKind.HYPOTHESIS,
+                error_type=error_type,
+                reasons=["判据"],
+                classifier_version="test/1",
+                evidence_refs=[uuid4()],
+            )
+            for item in bare
+            for error_type in (ErrorType.EVIDENCE_ERROR, ErrorType.REASONING_ERROR)
+        ]
+        return _assessed(bare, attributions=conflicting)
+
+    def test_a_conflict_blocks_the_pattern(self, detector, make_experience) -> None:
+        scan = detector.detect(self._conflicted(make_experience))
+        assert scan.patterns == ()
+        assert scan.conflicting_attributions == 3
+        # 🔴 **与"指不出来"分开计数**：合并成一个数会让两种完全不同的
+        # 下一步动作在运维眼里长得一样。
+        assert scan.unattributable_count == 0
+
+    def test_a_single_view_is_not_a_conflict(self, detector, make_experience) -> None:
+        """反向：**只有一条**归因时不该被算成冲突。
+
+        少了这一条，一个"看到归因就报冲突"的实现也能让上一条全绿——
+        而那会让整条链路永远不产出提案。
+        """
+        bare = [_experience(make_experience, error_type=None) for _ in range(3)]
+        one_each = [
+            ExperienceAttributionRecord(
+                created_by="test",
+                experience_id=item.id,
+                experience_canonical_key=item.canonical_key,
+                cognitive_round_id=item.cognitive_round_id,
+                judgment_id=item.judgment_id,
+                related_artifact_id=uuid4(),
+                artifact_kind=CorrectedArtifactKind.HYPOTHESIS,
+                error_type=ErrorType.EVIDENCE_ERROR,
+                reasons=["判据"],
+                classifier_version="test/1",
+                evidence_refs=[uuid4()],
+            )
+            for item in bare
+        ]
+        scan = detector.detect(_assessed(bare, attributions=one_each))
+        assert scan.conflicting_attributions == 0
+        assert len(scan.patterns) == 1
+        assert scan.patterns[0].error_type is ErrorType.EVIDENCE_ERROR

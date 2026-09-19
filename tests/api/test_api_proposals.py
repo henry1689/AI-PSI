@@ -19,6 +19,7 @@ from ai_psi.api.app import API_PREFIX, create_app
 from ai_psi.config import Environment, Settings
 from ai_psi.container import build_container
 from ai_psi.domain.enums import ErrorType
+from ai_psi.domain.improvement_proposals import ImprovementProposal
 from tests.helpers import seed_learning_evidence
 
 pytestmark = pytest.mark.unit
@@ -79,9 +80,17 @@ async def _seed(
         error_type=error_class,
         situation_signature=f"{error_class.value}|d2|multi_source",
     )
-    run = await container.learning_service.review()
-    assert len(run.created) == 1, run.summary()
-    return UUID(str(run.created[0].proposal.id))
+    # 🔴 **阶段 6.6 起提案是"自己出现"的**：最后一次纠正会在反馈提交之后
+    # 触发一次学习运行，本函数返回时它已经在库里了。
+    # 这里因此**不能**再断言"这次 review 生成了提案"——那会看到"已覆盖"。
+    rerun = await container.learning_service.review()
+    assert rerun.created == (), "重复运行不该再造一条提案"
+
+    matches: list[ImprovementProposal] = await container.proposal_service.list_all(
+        error_class=error_class
+    )
+    assert len(matches) == 1, f"期望恰好一条 {error_class.value} 提案，实际 {len(matches)} 条"
+    return UUID(str(matches[0].id))
 
 
 async def _evaluate(client: httpx.AsyncClient, proposal_id: UUID, **body: Any) -> httpx.Response:

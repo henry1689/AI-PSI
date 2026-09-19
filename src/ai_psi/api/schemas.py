@@ -21,11 +21,13 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ai_psi.application.feedback_service import MemoryEffect
+from ai_psi.application.ports import LearningTriggerOutcome, LearningTriggerStatus
 from ai_psi.domain.common import is_blank, unstorable_in
 from ai_psi.domain.enums import (
     ApprovalLevel,
     CognitiveDepth,
     ConfidenceBand,
+    CorrectedArtifactKind,
     EpistemicAction,
     ErrorType,
     EvaluationVerdict,
@@ -38,10 +40,12 @@ from ai_psi.domain.enums import (
     SensitivityLevel,
     VerificationStatus,
 )
+from ai_psi.domain.experiences import ExperienceAttributionRecord
 
 __all__ = [
     "IDEMPOTENCY_KEY_MAX",
     "ApproveProposalRequest",
+    "AttributionView",
     "ConversationCreatedResponse",
     "CorrectMemoryRequest",
     "CorrectMemoryResponse",
@@ -52,6 +56,7 @@ __all__ = [
     "FeedbackResponse",
     "HealthResponse",
     "JudgmentView",
+    "LearningTriggerView",
     "MemoryListResponse",
     "MemoryView",
     "ModelInvocationView",
@@ -307,6 +312,14 @@ class JudgmentView(BaseModel):
 
     model_config = _STRICT
 
+    judgment_id: UUID = Field(
+        description=(
+            "判断自身的 id（阶段 6.6）。"
+            "🔴 **它存在的理由是被引用**：用户纠正一条判断时要把它填进 "
+            "`FeedbackRequest.related_artifact_id`，而那要求客户端先能拿到它。"
+            "没有这个字段，'用户指得出被纠正的是哪一条'就只能靠猜"
+        )
+    )
     conclusion: str
     rationale_summary: list[str]
     strongest_counterarguments: list[str] = Field(default_factory=list)
@@ -600,7 +613,20 @@ class FeedbackRequest(_BoundaryRequestModel):
     related_claim: str | None = Field(
         default=None,
         max_length=_NOTE_MAX,
-        description="用户指出的、被纠正的具体说法",
+        description="用户指出的、被纠正的具体说法（**自由文本，给人看**）",
+    )
+    related_artifact_id: UUID | None = Field(
+        default=None,
+        description=(
+            "用户指出的那个**认知产物**的 id（阶段 6.6）。"
+            "🔴 **它是机器可解析的指针**，与 `related_claim` 各司其职："
+            "后者是给人看的描述，前者是服务端用来做错误归因的锚点。\n\n"
+            "它必须指向**本回合**的产物——回合摘要里的判断 id 或假设 id。"
+            "指向别的回合、别的用户、或一个随机 UUID 都**不会产生归因**"
+            "（但反馈本身照常记下）。\n\n"
+            "⚠️ 只给 id，**不给类别**：由哪一类产物推出哪一类错，"
+            "是服务端按结构映射规则决定的，调用方说不了这个话"
+        ),
     )
     allow_memory_update: bool = Field(
         default=False,
@@ -616,6 +642,77 @@ class FeedbackRequest(_BoundaryRequestModel):
     def _content_must_say_something(cls, value: str) -> str:
         """🔴 只由不可见字符组成的反馈，是一条**看起来存在的**记录。"""
         return _reject_if_blank(value)
+
+
+class AttributionView(BaseModel):
+    """一条纠正形成的**错误归因**（阶段 6.6）。
+
+    🔴 **置信度是 `moderate`，但它的语义要说准**：这是「用户明确纠正」
+    + 「V0.1 结构映射规则」两条**非独立**的依据形成的**策略性归因**，
+    不是两个独立来源共同确认了客观错误类别。``classifier_version``
+    就是用来在事后复核"这条归因是按哪一套规则给出来的"。
+    """
+
+    model_config = _STRICT
+
+    experience_id: UUID
+    cognitive_round_id: UUID = Field(description="关联回合")
+    judgment_id: UUID = Field(description="关联的原判断")
+    related_artifact_id: UUID = Field(description="用户指出的那个产物")
+    artifact_kind: CorrectedArtifactKind = Field(
+        description="它的类别——🔴 **由服务端从回合事件流里解析**，不由客户端声明"
+    )
+    error_type: ErrorType = Field(description="分类结果")
+    confidence: ConfidenceBand
+    classifier_version: str = Field(description="分类器/规则版本")
+    basis: list[str] = Field(default_factory=list, description="分类依据，逐条可读")
+
+    @classmethod
+    def from_record(cls, record: ExperienceAttributionRecord) -> AttributionView:
+        """从领域记录构造视图。"""
+        return cls(
+            experience_id=record.experience_id,
+            cognitive_round_id=record.cognitive_round_id,
+            judgment_id=record.judgment_id,
+            related_artifact_id=record.related_artifact_id,
+            artifact_kind=record.artifact_kind,
+            error_type=record.error_type,
+            confidence=record.confidence,
+            classifier_version=record.classifier_version,
+            basis=list(record.reasons),
+        )
+
+
+class LearningTriggerView(BaseModel):
+    """提交之后那次学习运行的结果（阶段 6.6）。
+
+    🔴 **失败时只给稳定错误码与 ``trace_id``，不给异常原文。**
+    异常消息里可能带 SQL、文件路径、连接串片段与堆栈——那些是服务端的
+    排障材料。完整异常进日志，用 ``trace_id`` 去对。
+    """
+
+    model_config = _STRICT
+
+    status: LearningTriggerStatus = Field(
+        description=("not_triggered（本次反馈没有形成有效归因，因此没触发） / succeeded / failed")
+    )
+    created_proposal_ids: list[UUID] = Field(
+        default_factory=list, description="本次运行**新建**的提案 id"
+    )
+    error_code: str | None = Field(
+        default=None, description="失败时的稳定错误码；成功或未触发时为 null"
+    )
+    trace_id: str | None = Field(default=None, description="失败时与服务端日志条目对应的标识")
+
+    @classmethod
+    def from_outcome(cls, outcome: LearningTriggerOutcome) -> LearningTriggerView:
+        """从应用层结果构造视图。"""
+        return cls(
+            status=outcome.status,
+            created_proposal_ids=list(outcome.created_proposal_ids),
+            error_code=outcome.error_code,
+            trace_id=outcome.trace_id,
+        )
 
 
 class FeedbackResponse(BaseModel):
@@ -641,7 +738,28 @@ class FeedbackResponse(BaseModel):
     )
     memory_id: UUID | None = Field(default=None, description="写入的记忆 id（若有）")
     memory_written: bool = Field(description="是否真的产生了新记忆")
-    reasons: list[str] = Field(default_factory=list, description="包括「为什么没有写记忆」")
+    attribution: AttributionView | None = Field(
+        default=None,
+        description=(
+            "本次纠正形成的**错误归因**（阶段 6.6）。"
+            "🔴 `null` 表示**没有形成归因**——用户没给指针、指针解析不到、"
+            "或者类型不是否定性的反馈。理由在 ``reasons`` 里逐条说明。"
+            "它与「记下了但没归因」是同一件事的两面，不是失败"
+        ),
+    )
+    learning: LearningTriggerView = Field(
+        description=(
+            "提交之后那次学习运行的结果（阶段 6.6）。"
+            "🔴 它**没有默认值**：这个字段的存在本身就是要求"
+            "「必须把触发结果说出来」。忘了接触发器的症状是"
+            "`status` 恒为 `not_triggered`，而那与「还没攒够三次」"
+            "在响应里长得一模一样"
+        )
+    )
+    reasons: list[str] = Field(
+        default_factory=list,
+        description="包括「为什么没有写记忆」「为什么没有归因」",
+    )
 
 
 # ---------------------------------------------------------------------------

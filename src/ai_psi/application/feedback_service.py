@@ -52,35 +52,57 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Final
+from typing import Any, Final
 from uuid import UUID, uuid4
 
 from ai_psi.application.experience_reader import (
+    attribution_from_event,
     evaluation_from_event,
     experience_from_event,
 )
 from ai_psi.application.memory_service import MemoryService
-from ai_psi.application.ports import UnitOfWork, UnitOfWorkFactory
+from ai_psi.application.ports import (
+    LEARNING_TRIGGER_FAILED,
+    LearningTrigger,
+    LearningTriggerOutcome,
+    LearningTriggerStatus,
+    UnitOfWork,
+    UnitOfWorkFactory,
+)
 from ai_psi.domain.common import utc_now
 from ai_psi.domain.enums import (
+    CORRECTABLE_KINDS,
     ActorType,
+    CorrectedArtifactKind,
+    ErrorType,
     EventType,
     ExperienceEvaluation,
     ExperienceEvaluator,
     FeedbackType,
     MemoryType,
+    RoundState,
     SensitivityLevel,
+    UncertaintyType,
 )
 from ai_psi.domain.events import Event
 from ai_psi.domain.exceptions import NotFoundError
 from ai_psi.domain.experiences import (
     Experience,
+    ExperienceAttributionRecord,
     ExperienceEvaluationRecord,
     assess_experiences,
 )
 from ai_psi.domain.memories import Memory
+from ai_psi.infrastructure.logging import get_logger
+from ai_psi.learning.error_classifier import (
+    CLASSIFIER_VERSION,
+    CorrectionTarget,
+    ErrorClassifier,
+    ErrorSignals,
+)
 from ai_psi.memory.write_policy import MemoryWriteProposal
 
 __all__ = [
@@ -89,8 +111,22 @@ __all__ = [
     "MEMORY_UPDATING_FEEDBACK_TYPES",
     "FeedbackOutcome",
     "FeedbackService",
+    "LearningTriggerOutcome",
+    "LearningTriggerStatus",
     "MemoryEffect",
 ]
+
+#: 本模块的日志器。
+#:
+#: ⚠️ 走 :func:`~ai_psi.infrastructure.logging.get_logger` 而不是
+#: 自己调 ``structlog.get_logger``：脱敏处理器挂在那个统一入口上，
+#: 自行获取可能绕过它，而绕过脱敏泄的是密钥或用户正文。
+#:
+#: 📌 **分层说明**：架构规则 2 禁止 `cognition/`、`memory/`、`learning/`
+#: import `infrastructure/`，**未涵盖 `application/`**；
+#: `api/app.py` 也已在模块级做同样的导入。这里只取一个日志器，
+#: 不碰任何存储实现。
+_logger = get_logger(__name__)
 
 #: 反馈类型 → 它能把经验抬到的最高评价档位（阶段 6.5 §二.5）。
 #:
@@ -178,7 +214,15 @@ class FeedbackOutcome:
             空元组表示这次反馈没有改变任何经验的评价——可能是反馈类型
             本就不携带"这里错了"的信息，也可能是对应经验的档位已经更高。
             两者的区别在 ``reasons`` 里。
-        reasons: 逐条可读的说明——**包括"为什么没写记忆"**。
+        attributions: 本次反馈对经验归因的**实际改动**（阶段 6.6）。
+            它回答"这条纠正在系统里变成了哪一类错"——空元组表示
+            这次纠正没有形成归因（没给指针、指针解析不到、
+            或该经验已经归过同一类因）。
+        learning: 提交之后那次学习运行的结果。
+            🔴 ``None`` 与 ``status=NOT_TRIGGERED`` 都表示"没触发"，
+            但前者是"根本没走到那一步"，后者是"走过去了、条件不满足"。
+        reasons: 逐条可读的说明——**包括"为什么没写记忆"、
+            "为什么没有归因"**。
     """
 
     round_id: UUID
@@ -187,6 +231,8 @@ class FeedbackOutcome:
     memory_effect: MemoryEffect = MemoryEffect.NONE
     memory: Memory | None = None
     evaluations: tuple[ExperienceEvaluationRecord, ...] = ()
+    attributions: tuple[ExperienceAttributionRecord, ...] = ()
+    learning: LearningTriggerOutcome | None = None
     reasons: tuple[str, ...] = ()
 
     @property
@@ -200,6 +246,133 @@ class FeedbackOutcome:
         return bool(self.evaluations)
 
 
+@dataclass(frozen=True, slots=True)
+class _TriggerStep:
+    """提交之后那一步的结果 + 要追加到 ``FeedbackOutcome.reasons`` 的话。
+
+    ⚠️ 单独一个类型而不是直接返回元组：元组在这个位置会被读成
+    ``(结果, 理由)`` 还是 ``(理由, 结果)`` 全靠记，而它们两个
+    都是"看起来合理"的——正是那种改一次就悄悄反过来的签名。
+    """
+
+    outcome: LearningTriggerOutcome
+    reasons: tuple[str, ...] = ()
+
+
+def _existing_attributions(
+    events: Sequence[Event],
+) -> set[tuple[UUID, ErrorType, UUID]]:
+    """本回合**已经记过**的归因三元组 ``(经验, 类别, 被指产物)``。
+
+    🔴 用它而不是"数条数"：重复纠正要挡的是**同一件事说两遍**，
+    而不是"这个回合的归因条数超了"。两件事说两遍是正常的，
+    同一件事说两遍不是。
+    """
+    seen: set[tuple[UUID, ErrorType, UUID]] = set()
+    for event in events:
+        if event.event_type is not EventType.EXPERIENCE_ATTRIBUTED:
+            continue
+        payload = event.payload.get("attribution")
+        if not isinstance(payload, dict):  # pragma: no cover - 负载恒为字典
+            continue
+        try:
+            seen.add(
+                (
+                    UUID(str(payload["experience_id"])),
+                    ErrorType(payload["error_type"]),
+                    UUID(str(payload["related_artifact_id"])),
+                )
+            )
+        except (KeyError, ValueError):  # pragma: no cover - 坏负载不该让反馈失败
+            continue
+    return seen
+
+
+def _resolve_correction_target(
+    events: Sequence[Event], artifact_id: UUID
+) -> tuple[CorrectionTarget | None, str]:
+    """在**本回合**的事件流里把 id 反查成"哪一类产物"。
+
+    🔴 **绑定是解析方式本身带来的，不是一句注释。**
+
+    候选集合只有"这条回合的事件流"，因此：
+    别的回合的产物、别的用户/租户的记忆，**根本不在这张表里**——
+    不需要额外的过滤条件，也就不会因为忘写一个 `WHERE user_id` 而漏。
+
+    ⚠️ 返回的第二种情况（"找到了但不接受纠正"）与第一种（"找不到"）
+    是**两件事**，理由必须分开说：前者是调用方指对了但这类东西
+    不该走这条路，后者是调用方指错了。
+
+    Returns:
+        ``(纠正目标, 失败理由)``。成功时理由为空串。
+    """
+    for event in events:
+        for key, kind in _PAYLOAD_KINDS.items():
+            if event.event_type is not kind[0]:
+                continue
+            body = event.payload.get(key)
+            if not isinstance(body, dict):
+                continue
+            if str(body.get("id")) != str(artifact_id):
+                continue
+            artifact_kind = kind[1]
+            if artifact_kind not in CORRECTABLE_KINDS:
+                return None, (
+                    f"被指到的是一条**{_REJECTED_KIND_LABEL[artifact_kind]}**，"
+                    "这类产物不接受纠正——因此不归因（但你的反馈已经记下了）"
+                )
+            return (
+                CorrectionTarget(
+                    artifact_kind=artifact_kind,
+                    has_supporting_evidence=bool(body.get("supporting_evidence_ids")),
+                    uncertainty_type=_uncertainty_of(body),
+                ),
+                "",
+            )
+
+    return None, (
+        f"related_artifact_id={artifact_id} **在本回合的产物里解析不到**——"
+        "它可能是别的回合的产物、别的用户的数据，或者只是一个随机 UUID。"
+        "🔴 解析不到就不归因：为了让它「有归因」而接受一个来历不明的 id，"
+        "等于把归因规则交给调用方决定"
+    )
+
+
+def _uncertainty_of(judgment_payload: dict[str, Any]) -> UncertaintyType | None:
+    """从判断负载里取 ``uncertainty_type``；取不到或不是成员时返回 ``None``。
+
+    ⚠️ **不做字符串到枚举的"尽力转换"**：负载里的值不是成员时，
+    说明它的形状与 ``Judgment`` 对不上，那时**当作没有这个信号**
+    比猜一个成员安全——猜错会让一条价值判断被归成推理错误。
+    """
+    raw = judgment_payload.get("uncertainty_type")
+    if isinstance(raw, UncertaintyType):
+        return raw
+    if not isinstance(raw, str):  # pragma: no cover - 恒为字符串或缺失
+        return None
+    try:
+        return UncertaintyType(raw)
+    except ValueError:  # pragma: no cover - 负载形状异常
+        return None
+
+
+#: 事件负载里的键 → ``(事件类型, 产物类别)``。
+#:
+#: 🔴 **只认这张表里的键。** 认不出来的 id 一律"解析不到"——
+#: 白名单，因为"允许纠正什么"必须是一次有意的决定。
+_PAYLOAD_KINDS: Final[dict[str, tuple[EventType, CorrectedArtifactKind]]] = {
+    "hypothesis": (EventType.HYPOTHESIS_CREATED, CorrectedArtifactKind.HYPOTHESIS),
+    "judgment": (EventType.JUDGMENT_CREATED, CorrectedArtifactKind.JUDGMENT),
+    "inquiry": (EventType.INQUIRY_CREATED, CorrectedArtifactKind.INQUIRY),
+}
+
+#: 不可纠正类别在理由里的说法（给人看的那句话）。
+_REJECTED_KIND_LABEL: Final[dict[CorrectedArtifactKind, str]] = {
+    CorrectedArtifactKind.MEMORY: "记忆",
+    CorrectedArtifactKind.INQUIRY: "问题（inquiry）",
+}
+
+
 class FeedbackService:
     """反馈的落地入口。"""
 
@@ -207,6 +380,8 @@ class FeedbackService:
         self,
         uow_factory: UnitOfWorkFactory,
         memory_service: MemoryService,
+        learning_trigger: LearningTrigger,
+        classifier: ErrorClassifier | None = None,
     ) -> None:
         """初始化。
 
@@ -215,9 +390,23 @@ class FeedbackService:
             memory_service: 记忆服务。**必须是同一个实例**——
                 另造一个会让反馈路径与其余路径各持一份写入策略，
                 策略一旦被局部替换就会分家。
+            learning_trigger: 提交之后触发一次学习运行的入口
+                （阶段 6.6，见 :class:`~ai_psi.application.ports.LearningTrigger`）。
+                🔴 **刻意没有默认值**：给一个 ``None`` 默认值意味着
+                "忘了接"的症状是**静默地不再触发学习**——而那个症状
+                与"还没有攒够三次"在外部看来一模一样。
+            classifier: 错误分类器；``None`` 时用默认实现。
+
+        Note:
+            🔴 **本服务在提交之后会调用一次学习链路。**
+            反馈事件、经验评价、经验归因、记忆更新仍然在**一个**事务里；
+            学习运行在**那之后**、用自己的事务读已提交的数据。
+            顺序不能反：在提交之前调它，它会读不到刚才那条归因。
         """
         self._uow_factory = uow_factory
         self._memory_service = memory_service
+        self._learning_trigger = learning_trigger
+        self._classifier = classifier if classifier is not None else ErrorClassifier()
 
     @property
     def memory_service(self) -> MemoryService:
@@ -231,6 +420,7 @@ class FeedbackService:
         feedback_type: FeedbackType,
         content: str,
         related_claim: str | None = None,
+        related_artifact_id: UUID | None = None,
         allow_memory_update: bool = False,
         actor_id: str = "user",
     ) -> FeedbackOutcome:
@@ -240,7 +430,11 @@ class FeedbackService:
             round_id: 被反馈的认知回合。
             feedback_type: 反馈类型。
             content: 反馈正文。
-            related_claim: 用户指出的、被纠正的具体说法。
+            related_claim: 用户指出的、被纠正的具体说法（自由文本，给人看）。
+            related_artifact_id: 用户指出的、被纠正的那个产物的 id
+                （阶段 6.6）。🔴 **它是机器可解析的指针**，服务端拿本回合的
+                事件流把它反查成"哪一类产物"——客户端说不了谎。
+                解析不到就不归因，但**反馈照常成功**。
             allow_memory_update: 是否允许本次反馈更新长期记忆。
                 🔴 这是"允许提给写入流程"，不是"允许写入"。
             actor_id: 发起者标识。
@@ -294,6 +488,20 @@ class FeedbackService:
                 feedback_event_id=event.id,
             )
 
+            # 🔴 反馈对**经验归因**的影响（阶段 6.6），同样与它同事务。
+            # 评价说"该不该计权"，归因说"是哪一类错"——两件事，两个事件，
+            # 但必须和这次反馈同生共死。
+            attributions, attribution_reasons = await self._attribute_experiences(
+                uow=uow,
+                round_id=round_id,
+                round_state=round_.state,
+                feedback_type=feedback_type,
+                related_artifact_id=related_artifact_id,
+                correlation_id=correlation,
+                actor_id=actor_id,
+                feedback_event_id=event.id,
+            )
+
             effect, memory, memory_reasons = await self._memory_step(
                 uow=uow,
                 round_id=round_id,
@@ -309,6 +517,20 @@ class FeedbackService:
 
             await uow.commit()
 
+        # 🔴 **提交之后**才触发学习：学习链路开自己的事务读事件流，
+        # 在提交之前调它，它看不到刚才那条归因——而症状是
+        # "第三次纠正到了、库里也有归因，但提案不出现"（阶段 6.5 的
+        # C6.7 就是这个形态）。见 `ports.LearningTrigger`。
+        #
+        # ⚠️ **这一行是承重的，实证过**：把它挪到 `commit()` 之前、
+        # 或直接删掉，黑盒场景 A 立刻变红（提案列表为空）。
+        # 单元测试**发现不了**这种改法——内存夹具里的事务边界更松，
+        # 只有在真实 PostgreSQL 的开事务语义下才暴露。
+        learning = await self._run_learning_after_commit(
+            round_id=round_id,
+            reasons=attribution_reasons,
+        )
+
         return FeedbackOutcome(
             round_id=round_id,
             feedback_type=feedback_type,
@@ -316,7 +538,9 @@ class FeedbackService:
             memory_effect=effect,
             memory=memory,
             evaluations=evaluations,
-            reasons=(*evaluation_reasons, *memory_reasons),
+            attributions=attributions,
+            learning=learning.outcome,
+            reasons=(*evaluation_reasons, *attribution_reasons, *memory_reasons, *learning.reasons),
         )
 
     async def _memory_step(
@@ -524,6 +748,231 @@ class FeedbackService:
         if skipped:
             reasons.append(f"{skipped} 条经验的评价已不低于 {target.value}，未重复记")
         return tuple(written), tuple(reasons)
+
+    async def _run_learning_after_commit(
+        self,
+        *,
+        round_id: UUID,
+        reasons: tuple[str, ...],
+    ) -> _TriggerStep:
+        """🔴 **提交之后**决定"要不要跑学习"，并把它跑掉（阶段 6.6）。
+
+        ## 为什么必须在这里、必须在这个时刻
+
+        学习链路（``LearningService.review``）通过 ``ExperienceReader``
+        开**自己的**事务读事件流。在反馈的事务里调它，那条新连接
+        **看不到尚未提交的归因**——症状是"第三次纠正到了、库里也有归因，
+        但提案不出现"，而库里一切正常。这正是阶段 6.5 记下的
+        C6.7 那种失败形态，所以本方法只在 ``uow.commit()` 之后被调用。
+
+        ## 触发条件
+
+        **本次反馈之后，该回合存在有效归因**（不论是不是本次新写的）。
+
+        用"之后存在"而不是"本次新写了"，是为了对**重试**幂等：
+        重复的纠正不会写第二条归因（去重在那里），但仍然会触发一次运行。
+        于是"学习链路偶发失败 + 客户端重试"不会把这条链路**永久卡死**
+        ——那比多跑一次糟得多。
+
+        ⚠️ **"重试不得重复创建 Proposal" 不由这里保证**，由提案层保证：
+        ``LearningService._covered_keys`` 让已存在的
+        ``(error_class, signature)`` 不再生成。触发器**不自己记
+        "跑过了"**——那会是第二份真相来源，而两份真相迟早会分家。
+
+        Args:
+            round_id: 刚被反馈的回合。
+            reasons: 归因那一步给的理由，追加到结果里。
+
+        Returns:
+            ``(触发结果, 补充理由)``。
+        """
+        if not await self._round_has_effective_attribution(round_id):
+            return _TriggerStep(
+                outcome=LearningTriggerOutcome(status=LearningTriggerStatus.NOT_TRIGGERED),
+                reasons=reasons,
+            )
+
+        try:
+            outcome = await self._learning_trigger()
+        except Exception as error:
+            # 🔴 **捕获一切，这是刻意的。**
+            # 反馈与归因**已经提交**；把异常放出去会把一个已经成功的
+            # 反馈报成 500，客户端于是重试，而重试会走到同一条死路。
+            # 代价是这里吞掉了异常类型——补偿是：完整异常进服务端日志，
+            # 对外给一个**稳定错误码 + trace_id**，两者能对上。
+            trace_id = uuid4().hex
+            _logger.error(
+                "learning_trigger_failed",
+                trace_id=trace_id,
+                round_id=str(round_id),
+                error_type=type(error).__name__,
+                error=str(error),
+                exc_info=True,
+            )
+            return _TriggerStep(
+                outcome=LearningTriggerOutcome(
+                    status=LearningTriggerStatus.FAILED,
+                    error_code=LEARNING_TRIGGER_FAILED,
+                    trace_id=trace_id,
+                ),
+                reasons=(
+                    *reasons,
+                    f"学习链路在提交之后运行失败（{LEARNING_TRIGGER_FAILED}，"
+                    f"trace_id={trace_id}）。🔴 反馈与归因**已经提交**，不受影响；"
+                    "完整异常只写在服务端日志里——API 不回异常原文",
+                ),
+            )
+
+        return _TriggerStep(
+            outcome=outcome,
+            reasons=(
+                *reasons,
+                (
+                    f"提交之后触发了一次学习链路；本次新建提案 "
+                    f"{len(outcome.created_proposal_ids)} 条"
+                ),
+            ),
+        )
+
+    async def _round_has_effective_attribution(self, round_id: UUID) -> bool:
+        """该回合现在有没有**可用**的归因（阶段 6.6）。
+
+        ⚠️ 用 ``assess_experiences`` 而不是"数一下有没有
+        ``experience.attributed`` 事件"：一条归因可能与经验自带的类别
+        冲突，那时它是**不可用**的。数事件会把它算成"有归因"，
+        于是触发一次注定什么也发现不了的学习运行。
+        """
+        async with self._uow_factory() as uow:
+            events = await uow.events.read_stream(cognitive_round_id=round_id)
+        created = [item for item in events if item.event_type is EventType.EXPERIENCE_CREATED]
+        experiences = [
+            item for item in (experience_from_event(event) for event in created) if item is not None
+        ]
+        attributions = [
+            item for item in (attribution_from_event(event) for event in events) if item is not None
+        ]
+        assessments = assess_experiences(experiences, (), attributions)
+        return any(item.effective_error_type is not None for item in assessments)
+
+    async def _attribute_experiences(
+        self,
+        *,
+        uow: UnitOfWork,
+        round_id: UUID,
+        round_state: RoundState,
+        feedback_type: FeedbackType,
+        related_artifact_id: UUID | None,
+        correlation_id: UUID,
+        actor_id: str,
+        feedback_event_id: UUID,
+    ) -> tuple[tuple[ExperienceAttributionRecord, ...], tuple[str, ...]]:
+        """把这次纠正变成对某条经验的**错误归因**（阶段 6.6，ADR-0023）。
+
+        🔴 **两个条件缺一不可**：反馈类型是否定性的（``CORRECTION`` /
+        ``DISAGREEMENT``），**并且**它指得出被纠正的是哪一条产物。
+        任一条不满足 → 不归因（``error_type`` 保持 ``None``）。
+
+        这比"用户说了不对就归一个类"诚实得多：只说得出"有错"、
+        说不出"错在哪一条"，不足以支撑一个错误类别，而**归错类
+        比不归因糟得多**——它会让模式发现把互不相干的错误聚成一类。
+
+        ⚠️ **不归因不是失败**：反馈事件、评价、记忆都照常落库，
+        理由逐条回给调用方（"为什么这次纠正没有形成归因"）。
+
+        Returns:
+            ``(写入的归因记录, 理由)``。
+        """
+        corrections = {FeedbackType.CORRECTION, FeedbackType.DISAGREEMENT}
+        if feedback_type not in corrections:
+            # 赞同 / 澄清 / 评分说的是别的事，它们不构成"这里错了"。
+            return (), ()
+
+        events = await uow.events.read_stream(cognitive_round_id=round_id)
+        created = [item for item in events if item.event_type is EventType.EXPERIENCE_CREATED]
+        if not created:
+            return (
+                (),
+                ("本回合没有产出经验，这次纠正没有被归到任何经验上",),
+            )
+
+        if related_artifact_id is None:
+            return (
+                (),
+                (
+                    "这次纠正**没有指出被纠正的是哪一条产物**"
+                    "（未提供 related_artifact_id）——"
+                    "只说得出「有错」、说不出「错在哪一条」，因此不归因",
+                ),
+            )
+
+        target, why = _resolve_correction_target(events, related_artifact_id)
+        if target is None:
+            return (), (why,)
+
+        # 🔴 分类器走**整条链条**，不是只跑 `_from_user_correction`。
+        # 前面那些结构性判据（失败 / 预算耗尽 / 元认知信号）优先于用户纠正——
+        # 用户说"错了"，而元认知说"错在哪一层"，后者更有分辨力。
+        # 走到用户纠正那一条，恰恰是"抽取时刻没有任何结构信号"的情形，
+        # 也就是本阶段要补上的那个缺口。
+        attribution = self._classifier.classify(
+            ErrorSignals(
+                round_state=round_state,
+                feedback_types=(feedback_type,),
+                correction=target,
+            )
+        )
+        if attribution.error_type is None:
+            return (), attribution.reasons
+
+        experiences = [
+            item for item in (experience_from_event(event) for event in created) if item is not None
+        ]
+        already = _existing_attributions(events)
+
+        written: list[ExperienceAttributionRecord] = []
+        for experience in experiences:
+            # 🔴 **重复纠正不写第二条**：同一个 feedback 事件重放、
+            # 或用户在同一个回合上点了两次同样的纠正，都落在这一条上。
+            # 少了它，重复反馈会让归因条数涨上去——而门槛数的是
+            # `independence_group`，涨条数本身不抬门槛，却会让审计视图骗人。
+            if (experience.id, attribution.error_type, related_artifact_id) in already:
+                continue
+            record = ExperienceAttributionRecord(
+                created_by=actor_id,
+                experience_id=experience.id,
+                experience_canonical_key=experience.canonical_key,
+                cognitive_round_id=round_id,
+                judgment_id=experience.judgment_id,
+                related_artifact_id=related_artifact_id,
+                artifact_kind=target.artifact_kind,
+                error_type=attribution.error_type,
+                confidence=attribution.confidence,
+                reasons=list(attribution.reasons),
+                classifier_version=CLASSIFIER_VERSION,
+                evidence_refs=[feedback_event_id],
+            )
+            await uow.events.append(
+                Event(
+                    event_type=EventType.EXPERIENCE_ATTRIBUTED,
+                    occurred_at=utc_now(),
+                    actor_type=ActorType.USER,
+                    actor_id=actor_id,
+                    correlation_id=correlation_id,
+                    cognitive_round_id=round_id,
+                    payload={"attribution": record.model_dump(mode="json")},
+                )
+            )
+            written.append(record)
+
+        if not written:
+            return (
+                (),
+                (
+                    "这次纠正指向的产物与类别**已经记过一次**，不重复记——"
+                    "重复的纠正不是「更确认」，只是同一件事说了两遍",
+                ),
+            )
+        return tuple(written), ()
 
     async def _current_evaluations(
         self,

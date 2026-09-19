@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Final
 
 # 按字母序排列（ruff RUF022）。文件正文按语义分组，此处以可检索优先。
 __all__ = [
@@ -642,6 +643,50 @@ class ExperienceKind(StrEnum):
     """一次认知回合的结果复盘。"""
 
 
+class CorrectedArtifactKind(StrEnum):
+    """用户纠正**指向的**认知产物类别（阶段 6.6，ADR-0023）。
+
+    🔴 **类别由服务端解析，不由客户端声明。**
+
+    客户端只给一个 id（``FeedbackRequest.related_artifact_id``），
+    服务端拿回合的事件流把它反查成这里的某一类。让客户端直接报
+    "我纠正的是一条假设"就等于让调用方决定归因规则吃哪一条分支——
+    而归因规则决定系统之后学什么。
+
+    ⚠️ **只有白名单里的类别可以纠正。** 不在名单里的 id 一律
+    **不归因**（见 ``CORRECTABLE_KINDS``），且理由要说清楚：
+    "不接受这类产物"与"没找到这个 id"是两件不同的事。
+    """
+
+    EVIDENCE = "evidence"
+    HYPOTHESIS = "hypothesis"
+    JUDGMENT = "judgment"
+    RESPONSE = "response"
+    MEMORY = "memory"
+    """⚠️ **不可纠正**：记忆有它自己的入口
+    （``POST /memories/{id}/correct``）。让纠正从学习链路走，
+    会让"用户改了记忆"与"系统学到了什么"混成一条路径。"""
+
+    INQUIRY = "inquiry"
+    """⚠️ **不可纠正**：问题是**用户自己提的**。
+    让用户"纠正自己的问题"没有意义——它不会指向系统犯的错。"""
+
+
+#: 可以被用户纠正的产物类别。
+#:
+#: 🔴 **白名单而不是黑名单**：将来新增一种产物时，它默认**不可纠正**，
+#: 要进这张表必须是一次有意的改动。用黑名单的话，
+#: 新产物会默认被接受，而"它到底该映射到哪一类错"从来没被想过。
+CORRECTABLE_KINDS: Final[frozenset[CorrectedArtifactKind]] = frozenset(
+    {
+        CorrectedArtifactKind.EVIDENCE,
+        CorrectedArtifactKind.HYPOTHESIS,
+        CorrectedArtifactKind.JUDGMENT,
+        CorrectedArtifactKind.RESPONSE,
+    }
+)
+
+
 class ApprovalLevel(StrEnum):
     """提案所需的审批级别。"""
 
@@ -875,6 +920,17 @@ class EventType(StrEnum):
     #: 🔴 缺了它，"三次被支持的同类错误"这条验收条件就无法成立——
     #: 生产里能产出的经验永远停在 ``SUSPECTED``。
     EXPERIENCE_EVALUATED = "experience.evaluated"
+    #: 阶段 6.6 新增（ADR-0023）。**经验写完之后才拿到错误类别。**
+    #:
+    #: 经验在**回合收尾**时构建，而用户纠正在那之后才到。抽取那一刻
+    #: 除了系统自己没有任何评估者，因此 `error_type` 往往是 `None`——
+    #: 于是模式发现把它们全部过滤掉，"三次同类错误生成提案"这条
+    #: 验收条件在生产配置下**不可能发生**（阶段 6.5 完成报告的 C6.7 降级）。
+    #:
+    #: 🔴 归因与评价是**两件事**，因此是两个事件：
+    #: 评价说"这条经验该不该计权"，归因说"它到底是哪一类错"。
+    #: 合并成一个事件会让"用户确认了但指不出错在哪"这种状态无处安放。
+    EXPERIENCE_ATTRIBUTED = "experience.attributed"
     IMPROVEMENT_PROPOSAL_CREATED = "improvement_proposal.created"
     IMPROVEMENT_PROPOSAL_EVALUATED = "improvement_proposal.evaluated"
     #: 任务书 §5.2 清单中缺失（ADR-0018）。

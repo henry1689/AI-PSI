@@ -23,7 +23,12 @@ from ai_psi.domain.enums import (
     RoundState,
     VerificationStatus,
 )
-from ai_psi.learning.error_classifier import ErrorAttribution, ErrorClassifier, ErrorSignals
+from ai_psi.learning.error_classifier import (
+    CorrectionTarget,
+    ErrorAttribution,
+    ErrorClassifier,
+    ErrorSignals,
+)
 from ai_psi.learning.experience_builder import ExperienceBuilder, RoundRecord
 
 pytestmark = pytest.mark.unit
@@ -233,6 +238,10 @@ class TestNoFreeTextEntersTheLearningChain:
             "uncertainty_type",
             "epistemic_action",
             "feedback_types",
+            # 阶段 6.6：用户纠正**指到的那个产物**。
+            # ⚠️ 它装的是类别与几个布尔/枚举信号，**不是文本**——
+            # 见下面的 `test_the_correction_target_carries_no_free_text`。
+            "correction",
         }
     )
 
@@ -241,6 +250,21 @@ class TestNoFreeTextEntersTheLearningChain:
 
     def test_error_signals_carry_no_free_text(self) -> None:
         assert {item.name for item in dataclasses.fields(ErrorSignals)} == self._ERROR_SIGNAL_FIELDS
+
+    def test_the_correction_target_carries_no_free_text(self) -> None:
+        """🔴 阶段 6.6 新增的 `correction` 也是结构化信号，不是一段文字。
+
+        ⚠️ **这条不是形式**：把用户那句纠正原话塞进 ``CorrectionTarget``
+        是本次改动最容易走偏的一步——它就在归因层，看起来"顺手带上原文
+        方便判断"，而后果是用户隐私随经验永久留档。
+        字段集合检查只挡得住"新增一个字段"，挡不住"往已有字段里填原文"，
+        因此这里直接断言**每个字段的类型**。
+        """
+        fields = {item.name: str(item.type) for item in dataclasses.fields(CorrectionTarget)}
+        assert set(fields) == {"artifact_kind", "has_supporting_evidence", "uncertainty_type"}
+        # ⚠️ PEP 563 让 `item.type` 是**注解字符串**，因此这里比的是文本：
+        # 任何一个字段带上 `str` 都会被这一条抓住。
+        assert not [name for name, annotation in fields.items() if "str" in annotation]
 
     def test_records_are_immutable(self) -> None:
         """冻结对象：经验一旦构建就不该被就地改写。"""

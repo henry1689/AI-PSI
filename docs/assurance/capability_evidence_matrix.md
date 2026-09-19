@@ -139,12 +139,12 @@
 | # | 能力声明 | 入口 | 调用链 | 副作用 | 单测 | PG 集成 | 黑盒 | 反例 | 等级 | 残余风险 |
 |---|---|---|---|---|---|---|---|---|---|---|
 | **C6.1** | 反馈接收 → 事件落库 → 条件性记忆更新（**单事务** + 记忆失败降级） | `POST /cognitive-rounds/{id}/feedback` | `feedback.py:35` → `FeedbackService.record()`（三步同一 uow，唯一 `commit` 在最后） | `user_feedback_received` + 可能的 `experience.evaluated` + 可能的 `memories` 行 | `test_feedback_service.py`、`test_api_feedback.py` | ✅ `test_input_contract.py`、`test_black_box_acceptance.py`（真实 PG） | 部分：`TestAtomicityAndConcurrency` 只覆盖**事务开始前**失败（404） | 部分 | **E2** | §三 已改为**单事务**（评审 C 用数据库触发器实测：记忆写入故障 → 整体回滚零残留；评价事件故障 → 反馈事件也被回滚）。⚠️ §八 评审 C 指出两点：① 黑盒的 §七.13 用例只覆盖"事务开始前失败"，**中途失败没有黑盒用例**；② 事务内仍有一次 embedding provider 调用与一次**无 limit** 的全表扫（R57 同类） |
-| **C6.2** | 经验构建 + **确定性**错误归因 | 无独立入口（回合收尾隐式触发） | `cognitive_runtime.py:1140` → `ExperienceBuilder.build()` → `ErrorClassifier` | `experience_created` 事件 | `test_experience_builder.py`、`test_error_classifier.py` | ❌ | ❌ | ✅（不可归因返回 `None`，不猜） | **E2** | 🔴 8 条归因判据中**4 条在生产上不可达**：`_from_failure`（失败回合不构经验）、`_from_budget`（刻意不喂）、`_from_memory_rejection`（无生产者）、`_from_user_feedback`（反馈在回合后到达，无回流路径）——**漏报率可能很高**，阶段 7 应量化 |
+| **C6.2** | 经验构建 + **确定性**错误归因（含**用户纠正**那条路径） | 回合收尾隐式触发 + `POST /cognitive-rounds/{id}/feedback`（带指针） | `cognitive_runtime._close_round` → `ExperienceBuilder` → `ErrorClassifier`；纠正路径 `feedback_service._attribute_experiences` → 同一分类器 | `experience.created` + `experience.attributed` 事件 | `test_experience_builder.py`、`test_error_classifier.py`、`test_correction_attribution.py` | 部分 | ✅ 黑盒 A–H + `TestTheCorrectionClosesTheAttributionLoop` | ✅（指不出对象 → `None`，不猜；类别冲突 → `None`，不挑） | **E3** | ⚠️ 归因判据里**仍有 3 条在生产上不可达**（`_from_failure` / `_from_budget` / `_from_memory_rejection`，R58）。🔴 用户纠正那条**已接通**（阶段 6.6）：实测的四个值组合（有/无指针 × 有/无否定反馈）全部按预期分流。⚠️ 类别映射是**约定不是测量**（R71），且纠正是**策略性归因**——置信度 `MODERATE` 的语义写在 ADR-0023 §3 |
 | **C6.3** | 模式发现：按**独立性分组**计数同类错误 | CLI `python -m ai_psi.main learn` + `POST /learning/runs` | `learning_service.py:264 review` → `_detector.detect` | 无（只读事件流） | `test_pattern_detector.py` + `tests/scenarios/test_learning_chain.py` | 部分 | 部分：端点可达性已验，**模式的真实形成未在黑盒层验过** | ✅（2 回合不够、不可归因永不达门槛） | **E2** | 计量单位是 `Experience.independence_group`，§八 评审 B 实测它此前**可被随手填**（1 回合 + 1 纠正 → 门槛 3）。已加逐字一致性校验（ADR-0020 §2）。⚠️ 黑盒层仍**无法**造出"三次同类错误"——默认 Mock 下每条经验的 `error_type` 都是 `None` |
 | **C6.4** | 门槛裁决（`PromotionPolicy`）：`None` ≠ `False` | 同上 | `learning_service.py` → `_gate.review` → `_policy.decide` | 无 | `test_promotion_policy.py` | 部分 | 部分 | ✅ | **E2** | 同上：可达 ≠ 会跑。默认 Mock 下 `decide` **一次都不会被调用** |
 | **C6.5** | 提案生成（`ProposalGenerator`） | 同上 | `learning_service.py:371` → `_generator.generate` | `improvement_proposals` 行（经 `ProposalGate` 授权） | `test_proposal_generator.py` | 部分 | ✅ **脚本化 Mock + 真实 HTTP + 真实 PG 下真的落库了 DRAFT**（评审 A 实测） | ✅（伪造裁决被拒） | **E2** | 黑盒用默认 Mock 时同样不会被调用；评审 A 的实测用了一次**脚本化 Mock**——那仍是对被测系统的黑盒，但那条路径**没有固化成用例** |
 | **C6.6** | 提案状态机：登记 → 评估 →（批准 \| 驳回） | `GET/POST /improvement-proposals*`（5 个端点） | `proposals.py` → `ProposalService` | `improvement_proposals` 行 + 审批事件 | `test_proposal_service.py` | ✅ `test_contract_postgres.py`（同一组断言两实现） | ❌ | 部分 | **E2** | ① 契约测试覆盖的是**仓储**，不是**经 API 的状态机**；② 评估/批准/驳回的**事务性**（状态变更 + 审计事件同事务）没有 PG 级验证 |
-| **C6.7** | **学习链路端到端：三次同类错误 → DRAFT 提案** | CLI + `POST /learning/runs` | `learning_service.review` → 检测 → 门禁 → 生成 → 落库 | `improvement_proposals` + 事件 | ✅ `tests/scenarios/test_learning_chain.py`（**内存 + 脚本化 Provider**） | 部分 | 🔴 **无**（黑盒层造不出"三次可归因错误"） | ✅（2 回合不够、内部怀疑权重为 0） | **E2** | 🔴🔴 **这是阶段 6 最重要的一条验收条件，也是证据最弱的一条。** 入口在 §四/§七 接通了（CLI + HTTP + `ProposalGate`），但 §八 评审 A 实测：**默认 Mock 下 `error_type` 恒为 `None`**——链路是通的，`decide` / `generate` **一次都不会被调用**。也就是说这条能力在**跑默认配置的系统里不会自己发生**。"可达"不等于"会跑"，两者不要混。**C6.7 至今没有任何黑盒证据**，其端到端证明仍在内存 Harness 里 |
+| **C6.7** | **学习链路端到端：三次同类错误 → DRAFT 提案** | 🔴 **自动**（第三次纠正提交后触发）+ CLI + `POST /learning/runs` | `feedback_service._run_learning_after_commit` → `learning_service.review` → 检测 → 门禁 → 生成 → 落库 | `improvement_proposals` + 事件 | ✅ `tests/scenarios/test_learning_chain.py` | 部分 | ✅ `test_black_box_acceptance.py::TestTheCorrectionClosesTheAttributionLoop`（**A–H 八个场景**） | ✅（2 回合不够、内部怀疑权重为 0、类别冲突不计入） | **E3** | 🔴 **这一条在阶段 6.5 被降级过，阶段 6.6 把它补上了。** 降级的原因不是做错了，而是**默认配置下不成立**——那时每条经验的 `error_type` 都是 `None`，`decide`/`generate` 一次都不会被调用。现在：**A 场景一次都不调 `/learning/runs`**，三个真实回合 + 三次有依据的同类纠正之后 DRAFT 提案自己出现。⚠️ **两个前提**：纠正必须**指得出被纠正的产物**（`related_artifact_id`，从回合摘要接口取），且回合要走到 **D2 以上**（D0 不做假设，没有可指的对象） |
 | **C6.8** | 认知宪法不被学习模块修改 | 无独立入口（测试层强制） | `tests/unit/test_learning_constitution_boundary.py`（AST 扫描 + 运行时指纹比对） | 无 | ✅ | 不适用 | ❌ | ✅（AST 而非字符串搜索） | **E1** | 它是**测试**而非**运行期强制**：宪法在运行时被学习模块改写不会被拦截，只会在测试里变红。V0.1 可接受，但应明确记录 |
 | **C6.9** | 离线评测（`OfflineEvaluator`） | CLI + `POST /learning/runs` | `learning_service.py:338 _evaluate_offline` → `evaluator.compare` | 无（只读） | `test_offline_evaluator.py` | 部分 | ✅ **`offline_regression` 的方向判定已在真实 HTTP + 真实 PG 上断言** | ✅（对照干净时报 `false`、单侧数据报 `null`） | **E3** | §一 记的"**完全的死代码**、零调用者"已在 §四 修掉。§八 评审 A 复查时指出**两个真实阻断点**（评审结论已实证）：① `regressed()` 只在 `for pattern in scan.patterns` 内部被调用，**没有模式就一次都不调**；② `LearningRunResponse` 里**没有这个结论的出口**。两条都已修——退化判定现在算一次、门禁与运行结果共用，并作为**必填三态**字段回传 |
 
@@ -152,11 +152,13 @@
 
 ## 四、按等级汇总（阶段 6.5 结束时的状态）
 
+> 🔄 **下表已含阶段 6.6 的更新**（C6.2、C6.7 升到 E3）。
+
 | 等级 | 数量 | 能力 |
 |---|---|---|
 | **E4 抗对抗** | **0** | — |
-| **E3 黑盒验过** | **3** | C0.2、C2.3、C6.9 |
-| **E2 生产可达** | **18** | C0.1、C1.1、C1.2、C2.1、C2.2、C3.1、C4.1、C4.2、C5.1、C5.2、C5.3、C6.1、C6.2、C6.3、C6.4、C6.5、C6.6、C6.7 |
+| **E3 黑盒验过** | **5** | C0.2、C2.3、C6.2、C6.7、C6.9 |
+| **E2 生产可达** | **16** | C0.1、C1.1、C1.2、C2.1、C2.2、C3.1、C4.1、C4.2、C5.1、C5.2、C5.3、C6.1、C6.3、C6.4、C6.5、C6.6 |
 | **E1 仅测试** | **2** | C3.2、C6.8 |
 | **E0 无** | 0 | — |
 | **合计** | **23** | 阶段 0（2）+ 阶段 1（2）+ 阶段 2（3）+ 阶段 3（2）+ 阶段 4（2）+ 阶段 5（3）+ 阶段 6（9） |

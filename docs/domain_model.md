@@ -394,6 +394,38 @@ cognitive_round.completed    cognitive_round.suspended   cognitive_round.failed
 新分组。要让它塌缩只能靠比较消息正文，而那是语义判断
 （ADR-0018 §1）。这条写在 risks R53，不是遗漏。
 
+#### 4.2.2 `ExperienceAttributionRecord`（阶段 6.6，ADR-0023）
+
+**对一条经验的追加错误归因。** 与 §4.2.1 的评价记录同构、同生命周期
+（只追加、不可变、单独的事件类型 `experience.attributed`）。
+
+🔴 **它不是"评价"的另一个名字。**
+
+* **评价**（`ExperienceEvaluationRecord`）回答"这条经验**该不该计权**"；
+* **归因**（本对象）回答"它**到底是哪一类错**"。
+
+"用户确认了但他指不出错在哪"是一个真实且常见的状态——
+合并成一个事件会让它无处安放。
+
+| 字段 | 说明 |
+|---|---|
+| `experience_id` / `experience_canonical_key` | 被归因的经验 |
+| `cognitive_round_id` / `judgment_id` | **关联回合**与**关联原判断** |
+| `related_artifact_id` / `artifact_kind` | 用户指出的那个产物，及其类别（**服务端解析**） |
+| `error_type` / `confidence` | 分类结果与置信度 |
+| `reasons` / `classifier_version` | **分类依据**与**分类器版本** |
+| `evidence_refs` | 纠正内容所在的那条反馈事件 |
+
+> 🔴 **`confidence` 的语义要说准**：它是「用户明确纠正」+
+> 「结构映射规则」两条**非独立**依据形成的**策略性归因**，
+> **不是两个独立来源共同确认了客观错误类别**（ADR-0023 §3）。
+
+**合并规则**（`assess_experiences(..., attributions=...)`）：
+一条经验的**全部**归因视图（含 `Experience.error_type` 自己那份）去重后
+多于一个类别时 → `attribution_conflict = True`、`effective_error_type = None`。
+**绝不挑一个。** 门槛按 `effective_error_type` 计数，不按
+`Experience.error_type`（后者是抽取时刻的快照，默认配置下恒为 `None`）。
+
 ### 4.3 `ImprovementProposal`（`domain/improvement_proposals.py`）
 
 `target_component` / `observed_problem` / `error_class` /

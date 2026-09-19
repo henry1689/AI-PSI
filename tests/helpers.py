@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -26,6 +27,7 @@ from pydantic import BaseModel, ValidationError
 
 from ai_psi.application.artifact_service import ArtifactService, RoundScope
 from ai_psi.application.feedback_service import FeedbackService
+from ai_psi.application.ports import LearningTriggerOutcome, LearningTriggerStatus
 from ai_psi.application.round_service import CognitiveRoundService
 from ai_psi.domain.enums import (
     CognitiveDepth,
@@ -45,7 +47,41 @@ from ai_psi.domain.experiences import (
     independence_group_for,
 )
 
-__all__ = ["construct", "forged", "rejects", "seed_learning_evidence"]
+__all__ = ["RecordingTrigger", "construct", "forged", "rejects", "seed_learning_evidence"]
+
+
+@dataclass
+class RecordingTrigger:
+    """测试用的学习触发器：**记录被调用过几次**，可配置返回或抛错。
+
+    🔴 **它存在的理由是"触发"必须能被断言。**
+
+    ``FeedbackService`` 的构造参数**刻意没有默认值**——给一个
+    ``None`` 默认值意味着"忘了接"的症状是**静默地不再触发学习**，
+    而那个症状与"还没攒够三次"在外部看来一模一样。
+
+    因此测试也必须显式给一个：用本类，而不是一个 ``lambda: ()``，
+    因为后者让"到底有没有触发"重新变回不可观测。
+
+    Attributes:
+        created_proposal_ids: 返回给调用方的"新建提案 id"。
+        error: 非 ``None`` 时**抛这个异常**（用于测失败隔离）。
+        calls: 被调用的次数，测试直接断言它。
+    """
+
+    created_proposal_ids: tuple[UUID, ...] = ()
+    error: BaseException | None = None
+    calls: int = field(default=0, init=False)
+
+    async def __call__(self) -> LearningTriggerOutcome:
+        """记录一次调用并返回结果（或抛出配置好的异常）。"""
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return LearningTriggerOutcome(
+            status=LearningTriggerStatus.SUCCEEDED,
+            created_proposal_ids=self.created_proposal_ids,
+        )
 
 
 def construct[T: BaseModel](model: type[T], /, **fields: Any) -> T:

@@ -47,7 +47,7 @@ from ai_psi.infrastructure.in_memory.unit_of_work import make_in_memory_unit_of_
 from ai_psi.learning.pattern_detector import ErrorPattern, PatternScan, SuppressedPattern
 from ai_psi.learning.promotion_policy import PromotionTrigger
 from ai_psi.providers.embeddings import LocalHashingEmbedding
-from tests.helpers import forged, seed_learning_evidence
+from tests.helpers import RecordingTrigger, forged, seed_learning_evidence
 
 pytestmark = pytest.mark.unit
 
@@ -147,7 +147,7 @@ def rig(uow_factory: UnitOfWorkFactory) -> _Rig:
         gate=gate,
         round_service=CognitiveRoundService(uow_factory),
         artifact_service=ArtifactService(uow_factory),
-        feedback_service=FeedbackService(uow_factory, memory_service),
+        feedback_service=FeedbackService(uow_factory, memory_service, RecordingTrigger()),
     )
 
 

@@ -35,7 +35,11 @@ from ai_psi.application.feedback_service import FeedbackService
 from ai_psi.application.learning_service import LearningService
 from ai_psi.application.memory_service import MemoryService
 from ai_psi.application.metrics_reader import RoundMetricsReader
-from ai_psi.application.ports import UnitOfWorkFactory
+from ai_psi.application.ports import (
+    LearningTriggerOutcome,
+    LearningTriggerStatus,
+    UnitOfWorkFactory,
+)
 from ai_psi.application.proposal_gate import ProposalGate
 from ai_psi.application.proposal_service import ProposalService
 from ai_psi.application.replay_service import ReplayService
@@ -176,9 +180,6 @@ def build_container(settings: Settings | None = None) -> Container:
     # 🔴 一个容器一个 MemoryService：它同时被 API 路由与认知运行时使用，
     # 两个实例会各自持有一份写入策略，策略一旦被局部替换就会分家。
     memory_service = MemoryService(uow_factory, embeddings)
-    # 🔴 反馈服务复用**同一个** MemoryService 实例：另造一个会让
-    # 反馈路径与其余路径各持一份写入策略，策略一旦被局部替换就会分家。
-    feedback_service = FeedbackService(uow_factory, memory_service)
     # 提案服务只依赖工作单元：它不碰记忆，也不需要模型——
     # 生成提案的那一步（learning/）是纯函数，由调用方先行完成。
     proposal_service = ProposalService(uow_factory)
@@ -187,6 +188,31 @@ def build_container(settings: Settings | None = None) -> Container:
     learning_service = LearningService(
         uow_factory, experience_reader, proposal_gate, proposal_service, metrics_reader
     )
+
+    async def _trigger_learning() -> LearningTriggerOutcome:
+        """反馈提交之后跑一次学习链路（阶段 6.6）。
+
+        🔴 **它被调用的时刻由 `FeedbackService` 保证：在 `commit()` 之后。**
+        在提交之前跑，这条链路会开自己的事务去读事件流，
+        读不到那条刚写的归因——而症状是"库里一切正常，提案就是不出现"。
+
+        ⚠️ **这里不捕获异常**：捕获与脱敏后的上报由 `FeedbackService`
+        统一做（它才知道该给客户端回什么）。本函数只管把结果翻译成
+        Port 约定的形状。
+        """
+        run = await learning_service.review(actor_id="feedback_service")
+        return LearningTriggerOutcome(
+            status=LearningTriggerStatus.SUCCEEDED,
+            created_proposal_ids=tuple(item.proposal.id for item in run.created),
+        )
+
+    # 🔴 反馈服务复用**同一个** MemoryService 实例：另造一个会让
+    # 反馈路径与其余路径各持一份写入策略，策略一旦被局部替换就会分家。
+    #
+    # 🔴 **它必须在 `learning_service` 之后构造**：反馈在提交之后要
+    # 触发一次学习链路。`LearningService` 的依赖里**没有**
+    # `FeedbackService`，因此这个顺序不构成环。
+    feedback_service = FeedbackService(uow_factory, memory_service, _trigger_learning)
     runtime = CognitiveRuntime(
         uow_factory=uow_factory,
         provider=provider,
