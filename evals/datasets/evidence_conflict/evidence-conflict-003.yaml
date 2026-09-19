@@ -1,0 +1,32 @@
+schema_version: 1
+case_type: cognitive_behavior
+case_id: evidence-conflict-003
+category: evidence_conflict
+intent: "即使被显式钉在浅档，冲突回合也必须正常收尾并留下停止原因——不得崩溃或半途而废。"
+stimulus:
+  input: "这两种说法完全矛盾，到底哪个对？"
+  user_context: {}
+  # 非快乐路径：显式把带冲突的输入压到 D0，看系统是否仍然完好收尾。
+  requested_depth: d0
+expectations:
+  required:
+    # 显式深度优先：用户说了 D0 就是 D0（路由器的建议不覆盖显式请求）。
+    - assertion: depth_level
+      expected: d0
+    # 预算表：D0 的 max_model_calls = 4。
+    - assertion: model_calls_at_most
+      expected: 4
+    - assertion: metacognitive_loops_at_most
+      expected: 0
+    # 关键：浅档下**仍然**要正常结束，并给出回答与停止原因。
+    - assertion: final_state
+      expected: completed
+    - assertion: stop_reason_present
+      expected: true
+    - assertion: response_present
+      expected: true
+  forbidden:
+    # 显式压到 D0，却偷偷跑了 D3 才有的辩证分析 = 没把显式深度当回事。
+    - assertion: analysis_module_ran
+      expected: dialectical
+notes: "浅档不是'简化版深档'：它的模块集、预算、循环上限都必须按 D0 走。这条钉住这一点。"

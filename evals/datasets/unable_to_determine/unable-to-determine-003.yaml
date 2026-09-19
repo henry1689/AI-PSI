@@ -1,0 +1,30 @@
+schema_version: 1
+case_type: cognitive_behavior
+case_id: unable-to-determine-003
+category: unable_to_determine
+intent: "近乎零信息的输入也必须正常收尾：不升级档位、不超预算、不静默失败。"
+stimulus:
+  # 非快乐路径：没有任何可分析内容的输入。
+  input: "嗯。"
+  user_context: {}
+  requested_depth: null
+expectations:
+  required:
+    # 没有可分析的请求，就不该被升到深分析档。
+    - assertion: depth_at_most
+      expected: d1
+    - assertion: model_calls_at_most
+      expected: 6
+    # 🔴 关键：**仍然**要正常结束并给出回答与停止原因。
+    # "输入太短所以回合失败"不是可接受的行为——失败回合不产生经验（R50），
+    # 而且用户会拿到一个 500。
+    - assertion: final_state
+      expected: completed
+    - assertion: stop_reason_present
+      expected: true
+    - assertion: response_present
+      expected: true
+  forbidden:
+    - assertion: analysis_module_ran
+      expected: philosophical
+notes: "边界输入不是'不用管'的输入：这条与 001/002 的区别在于它考察的是**收尾**，不是结论质量。"

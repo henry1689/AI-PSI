@@ -1,0 +1,29 @@
+schema_version: 1
+case_type: cognitive_behavior
+case_id: simple-fact-002
+category: simple_fact
+intent: "D0 不做假设分析：简单事实问题不得产出任何假设对象。"
+stimulus:
+  input: "法国首都是哪里？"
+  user_context: {}
+  requested_depth: null
+expectations:
+  required:
+    - assertion: depth_level
+      expected: d0
+    # D0 的模块矩阵（cognition/orchestrator.py::MODULE_MATRIX）里
+    # **没有** _HYPOTHESES 步骤——假设分析从 D2 起才有。
+    - assertion: hypothesis_count_at_most
+      expected: 0
+    # D0 仍然要给判断与回答，只是不做深分析。
+    - assertion: judgment_present
+      expected: true
+    - assertion: response_present
+      expected: true
+    - assertion: final_state
+      expected: completed
+  forbidden:
+    # 因果分析同样从 D2 起才有。
+    - assertion: analysis_module_ran
+      expected: causal
+notes: "这一条钉的是'不该有的东西真的没有'：路由对了但偷偷跑了假设分析，一样是过度分析。"

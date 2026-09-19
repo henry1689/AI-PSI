@@ -1,0 +1,30 @@
+schema_version: 1
+case_type: cognitive_behavior
+case_id: simple-fact-004
+category: simple_fact
+intent: "显式把简单事实钉在 D1 时，系统不得擅自升级到更深的档位。"
+stimulus:
+  input: "HTTP 404 是什么含义？"
+  user_context: {}
+  # 非快乐路径：显式指定浅档。升档与降档**都不该**发生。
+  requested_depth: d1
+expectations:
+  required:
+    - assertion: depth_level
+      expected: d1
+    # 预算表：D1 的 max_model_calls = 6。
+    - assertion: model_calls_at_most
+      expected: 6
+    # D1 的矩阵里有基础逻辑分析。
+    - assertion: analysis_module_ran
+      expected: logical
+    - assertion: final_state
+      expected: completed
+  forbidden:
+    # 哲理分析属于 D4；显式 D1 却跑了它，说明"显式深度"没有被真正遵守。
+    - assertion: analysis_module_ran
+      expected: philosophical
+    # 辩证分析属于 D3。
+    - assertion: analysis_module_ran
+      expected: dialectical
+notes: "与 simple-fact-003 成对：一条钉'用户要更深就得给更深'，一条钉'用户要浅就不许偷偷加码'。"

@@ -1,0 +1,34 @@
+schema_version: 1
+case_type: cognitive_behavior
+case_id: simple-fact-003
+category: simple_fact
+intent: "用户显式要求深挖简单事实时，系统必须尊重显式深度，且仍然不超预算。"
+stimulus:
+  input: "1 加 1 等于几？"
+  user_context: {}
+  # 🔴 非快乐路径：默认路由会判 D0，这里由用户显式要求 D4。
+  requested_depth: d4
+expectations:
+  required:
+    # 显式 requested_depth 必须被尊重——不得静默降回路由器认为合适的档位。
+    - assertion: depth_level
+      expected: d4
+    # 预算表：D4 的 max_model_calls = 13。
+    # 尊重显式深度的前提是**不超预算**：两者一起断言才说明"展开"是受控的。
+    - assertion: model_calls_at_most
+      expected: 13
+    - assertion: metacognitive_loops_at_most
+      expected: 2
+    # D4 的矩阵里有哲理分析——路由到 D4 却没跑哲理模块，说明深度只是个标签。
+    - assertion: analysis_module_ran
+      expected: philosophical
+    - assertion: final_state
+      expected: completed
+    - assertion: stop_reason_present
+      expected: true
+  forbidden:
+    # D4 是全量展开，不存在"跑不动就少跑几个"，但**语义上**这里禁的是
+    # 失败收场：一个简单问题被显式要求深挖，不该以失败告终。
+    - assertion: response_present
+      expected: false
+notes: "「深度是个标签」是这类系统最典型的失败模式：报了 D4、预算按 D0 花。这条把两者钉在一起。"

@@ -1,0 +1,30 @@
+schema_version: 1
+case_type: cognitive_behavior
+case_id: unable-to-determine-002
+category: unable_to_determine
+intent: "信息不足的原因追问走基础分析档：做逻辑分析，但不得用哲理框架消化掉事实缺失。"
+stimulus:
+  input: "他为什么突然不回消息了？"
+  user_context: {}
+  requested_depth: null
+expectations:
+  required:
+    # 路由规则：需要解释 → D1（不是"简单事实且证据充分"，也不是"存在冲突"）。
+    - assertion: depth_level
+      expected: d1
+    # 预算表：D1 的 max_model_calls = 6。
+    - assertion: model_calls_at_most
+      expected: 6
+    # D1 的矩阵里有基础逻辑分析。
+    - assertion: analysis_module_ran
+      expected: logical
+    - assertion: final_state
+      expected: completed
+    - assertion: stop_reason_present
+      expected: true
+  forbidden:
+    # 🔴 不变量 9：事实层未知必须留下痕迹，不能被抽象语言消化掉。
+    # 哲理框架分析属于 D4；在 D1 上跑它，典型症状就是"用深刻掩盖信息不足"。
+    - assertion: analysis_module_ran
+      expected: philosophical
+notes: "抽象逃逸（§9.9）的可断言形态之一：该说'信息不够'的地方跑起了框架分析。"

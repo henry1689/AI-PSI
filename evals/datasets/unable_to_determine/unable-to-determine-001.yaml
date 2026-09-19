@@ -1,0 +1,32 @@
+schema_version: 1
+case_type: cognitive_behavior
+case_id: unable-to-determine-001
+category: unable_to_determine
+intent: "无法判断的问题必须留下未知痕迹、给出带保留的回答，而不是编一个确定结论。"
+stimulus:
+  input: "明年这个时候我会在哪里？"
+  user_context: {}
+  requested_depth: null
+expectations:
+  required:
+    # 这类问题没有'正确档位'的硬规则，因此只断言上界：
+    # 一个无法由材料决定的问题不该被升到深分析档。
+    - assertion: depth_at_most
+      expected: d1
+    - assertion: model_calls_at_most
+      expected: 6
+    # 🔴 结构化落点：判断里必须存在未解决的未知。
+    - assertion: unresolved_unknowns_present
+      expected: true
+    # 🔴 不变量 3 / 7：结论强度不得高于材料支持的程度。moderate 是**上界**。
+    - assertion: confidence_band_at_most
+      expected: moderate
+    - assertion: final_state
+      expected: completed
+    - assertion: response_present
+      expected: true
+  forbidden:
+    # 有未解未知时给出无保留结论（epistemic_action == answer）即违规。
+    - assertion: epistemic_action
+      expected: answer
+notes: "「合法地输出不知道」是任务书 §16.2 明确列出的考察点。这里检查它发生在结构层，而不是语气层。"

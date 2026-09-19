@@ -1,0 +1,32 @@
+schema_version: 1
+case_type: cognitive_behavior
+case_id: evidence-conflict-002
+category: evidence_conflict
+intent: "面对分歧必须真的跑逻辑与因果分析，并把未解决的未知保留下来。"
+stimulus:
+  input: "这些材料存在分歧，如何判断？"
+  user_context: {}
+  requested_depth: null
+expectations:
+  required:
+    - assertion: depth_level
+      expected: d2
+    # 深度不能只是个数字：D2 的矩阵要求逻辑与因果两个模块真的执行。
+    - assertion: analysis_module_ran
+      expected: logical
+    - assertion: analysis_module_ran
+      expected: causal
+    # 🔴 不变量 3 的结构化落点：结论必须带着"还有没解决的东西"。
+    - assertion: unresolved_unknowns_present
+      expected: true
+    # 不变量 7 的结构化落点：结论强度不得高于材料支持的程度。
+    # 期望值取 moderate 是**上界**，不是"应该到 moderate"。
+    - assertion: confidence_band_at_most
+      expected: moderate
+    - assertion: final_state
+      expected: completed
+  forbidden:
+    # 哲理框架分析属于 D4；用它来"消化"事实层分歧正是 §9.9 禁止的抽象逃逸。
+    - assertion: analysis_module_ran
+      expected: philosophical
+notes: "这一条与 001 的分工：001 钉深度与预算，002 钉'真的有在分析'与'冲突痕迹被保留'。"

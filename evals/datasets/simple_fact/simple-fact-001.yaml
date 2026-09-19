@@ -1,0 +1,30 @@
+schema_version: 1
+case_type: cognitive_behavior
+case_id: simple-fact-001
+category: simple_fact
+intent: "简单事实问题走 D0 直接回答：不得展开任何分析模块，也不得超预算。"
+stimulus:
+  input: "水在标准大气压下通常多少摄氏度沸腾？"
+  user_context: {}
+  requested_depth: null
+expectations:
+  required:
+    # 路由规则：简单事实问题且证据充分 → D0（cognition/depth_router.py::_rule_route）
+    - assertion: depth_level
+      expected: d0
+    # 预算表：D0 的 max_model_calls = 4（domain/cognitive_rounds.py::_BUDGET_BY_DEPTH）
+    - assertion: model_calls_at_most
+      expected: 4
+    # 预算表：D0 的 max_metacognitive_loops = 0 —— D0 不做元认知循环
+    - assertion: metacognitive_loops_at_most
+      expected: 0
+    # 宪法：完成回合都必须有停止原因
+    - assertion: final_state
+      expected: completed
+    - assertion: stop_reason_present
+      expected: true
+  forbidden:
+    # D0 的模块矩阵里没有哲理分析（cognition/orchestrator.py::MODULE_MATRIX）
+    - assertion: analysis_module_ran
+      expected: philosophical
+notes: "这一条同时钉住路由（D0）与预算（4 次调用、0 轮元认知循环）——'不过度分析'是可断言的结构属性，不是语气判断。"

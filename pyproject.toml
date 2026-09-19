@@ -126,6 +126,21 @@ disallow_untyped_decorators = false
 disallow_untyped_defs = false
 disallow_incomplete_defs = false
 
+[[tool.mypy.overrides]]
+# 🔴 **只对 PyYAML 这一个模块**关掉「缺少类型标注」检查，理由是可核对的：
+#
+# * PyYAML **没有** `py.typed`，typeshed 里也没有它的 stub；
+# * 官方 stub 包 `types-PyYAML` 是一个**新的第三方依赖**——
+#   阶段 7·S1a 明确禁止新增依赖，因此不能靠装 stub 解决；
+# * 它本身不是我们引入的：`uvicorn[standard]`（本项目的运行时依赖）
+#   依赖 pyyaml，所以它在任何一次 `uv sync --all-groups` 之后都存在。
+#
+# ⚠️ 未类型化的边界被**收在一个函数里**（`evaluation/loader.py::_parse_yaml`），
+# 它的返回值是 `object`，调用方必须交给 pydantic 校验才能真正使用。
+# 这不是"给 evals 开一个类型盲区"——`evaluation/` 下其余代码与 `src/` 同等严格。
+module = ["yaml"]
+ignore_missing_imports = true
+
 [tool.pydantic-mypy]
 init_forbid_extra = true
 init_typed = true

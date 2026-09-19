@@ -1,0 +1,34 @@
+schema_version: 1
+case_type: cognitive_behavior
+case_id: evidence-conflict-001
+category: evidence_conflict
+intent: "材料互相矛盾时必须展开到多假设档，并且仍然受预算约束。"
+stimulus:
+  input: "两种说法互相矛盾，我该信哪一个？"
+  user_context: {}
+  requested_depth: null
+expectations:
+  required:
+    # 路由规则：高可信材料之间存在冲突 → D2（cognition/depth_router.py::_rule_route）。
+    - assertion: depth_level
+      expected: d2
+    # 与上一条重复表达同一件事？不——这一条说的是"**不得**被当成简单问题"，
+    # 上一条说的是"恰好是 D2"。若将来路由把冲突降到 D1，两条会分别变红。
+    - assertion: depth_at_least
+      expected: d2
+    # D2 的矩阵里有假设步骤：冲突正是靠多假设来承载的。
+    - assertion: hypothesis_count_at_least
+      expected: 1
+    # 预算表：D2 的 max_model_calls = 10。
+    - assertion: model_calls_at_most
+      expected: 10
+    - assertion: final_state
+      expected: completed
+    - assertion: stop_reason_present
+      expected: true
+  forbidden:
+    # 🔴 有未解决的未知时给出**无保留结论**，违反不变量 3。
+    # 这里用的是 forbidden + epistemic_action：observed 取到 answer 才判失败。
+    - assertion: epistemic_action
+      expected: answer
+notes: "冲突类案例的核心不是'答得好不好'，而是'有没有假装冲突不存在'。"
