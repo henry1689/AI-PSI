@@ -55,6 +55,7 @@ from ai_psi.evaluation.manifest import (
     ReproducibilityManifest,
     prompt_versions_from_invocations,
 )
+from ai_psi.evaluation.metrics import EvaluationMetrics
 from ai_psi.evaluation.models import GoldenCase
 
 __all__ = [
@@ -253,6 +254,20 @@ class CaseResult(BaseModel):
     observation: CaseObservation | None = None
     assertions: tuple[AssertionResult, ...] = ()
     passed: bool
+    #: 🔴 **失败的种类**（阶段 7 · S4）：``execution_error`` 或
+    #: ``assertion_failure``；通过时为 ``None``。
+    #:
+    #: 两种失败的对策完全不同：
+    #:
+    #: * ``execution_error`` —— **这次没跑起来**（应用异常、HTTP 错误、
+    #:   Provider 错误、存储错误）。观测不到任何东西；
+    #: * ``assertion_failure`` —— **跑起来了，但结果不符合期望**。
+    #:   观测是真的，只是对不上。
+    #:
+    #: ⚠️ S4 之前只能看 ``failure_reason`` 的文本前缀来区分这两者——
+    #: 那是字符串包含判定，换一个措辞就会静默失效。本字段把它变成
+    #: 结构化的、由构造点决定的事实。
+    failure_kind: str | None = Field(default=None, pattern="^(execution_error|assertion_failure)$")
     #: **稳定**的失败摘要：只用断言名与异常类型名，不含路径、时间、内存地址。
     failure_reason: str | None = None
     #: 可能不稳定的失败细节（异常原文等）。**只出现在原始输出里。**
@@ -281,6 +296,11 @@ class RunResult(BaseModel):
     #: 🔴 原始报告带**完整**清单；canonical 只带其中的稳定身份子集
     #: （见 :meth:`~ai_psi.evaluation.manifest.ReproducibilityManifest.canonical_identity`）。
     manifest: ReproducibilityManifest | None = None
+    #: 指标层结果（阶段 7 · S4）。
+    #:
+    #: ⚠️ 由调用方在跑完后回填：``total_cases`` 需要**数据集**的案例总数
+    #: （含未执行的），而 runner 只看得到执行过的那些。
+    metrics: EvaluationMetrics | None = None
 
 
 def observation_of(
@@ -311,6 +331,7 @@ def observation_of(
         state=outcome.state.value,
         depth=outcome.depth.value,
         stop_reason_present=outcome.stop_reason is not None,
+        stop_reason=outcome.stop_reason,
         response_present=outcome.response_text is not None,
         response_text=outcome.response_text,
         judgment_present=judgment is not None,
@@ -347,6 +368,7 @@ def _unevaluated(
         expected=expected,
         observed=None,
         passed=False,
+        observation_status="unobservable",
         detail=f"[不可观测] {reason}",
     )
 
@@ -414,6 +436,7 @@ class GoldenRunner:
                         for mode, expectation in expectations
                     ),
                     passed=False,
+                    failure_kind="execution_error",
                     failure_reason=reason,
                     failure_detail=f"{type(exc).__name__}: {exc}",
                 ),
@@ -435,6 +458,9 @@ class GoldenRunner:
                         for mode, expectation in expectations
                     ),
                     passed=False,
+                    # "跑完了但没观测到"仍是**执行侧**的问题：拿不到观测值，
+                    # 就无从判断结果对不对。
+                    failure_kind="execution_error",
                     failure_reason=reason,
                 ),
                 execution.prompt_versions,
@@ -453,6 +479,9 @@ class GoldenRunner:
                 observation=observation,
                 assertions=assertions,
                 passed=not failed,
+                # 🔴 与 ``execution_error`` **互斥**：案例真的跑起来了
+                # （拿到了观测），只是结果对不上期望。
+                failure_kind=None if not failed else "assertion_failure",
                 failure_reason=None if not failed else f"未通过的断言：{'、'.join(failed)}",
             ),
             execution.prompt_versions,

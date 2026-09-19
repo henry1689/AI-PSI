@@ -101,6 +101,14 @@ class CaseObservation(BaseModel):
     depth: str
     #: 来源：``RoundOutcome.stop_reason`` 是否为 None。
     stop_reason_present: bool
+    #: 来源：``RoundOutcome.stop_reason`` 的**实际值**。
+    #:
+    #: 🔴 它与 ``stop_reason_present`` 并存**不是冗余**：布尔回答"停没停"，
+    #: 值回答"因为什么停"。S4 的 ``stop_reason_distribution`` 要的是后者，
+    #: 而布尔推不出分布。
+    #:
+    #: ⚠️ 它来自回合结果里的**结构化字段**，不是从回答文本里抽取的。
+    stop_reason: str | None = None
     #: 来源：``RoundOutcome.response_text`` 是否为 None。
     response_present: bool
     #: 来源：``RoundOutcome.response_text``（原文）。
@@ -619,6 +627,22 @@ class AssertionResult(BaseModel):
     #: ``None`` 表示**不可观测**（与"观测到空"不同）。
     observed: str | int | bool | list[str] | None
     passed: bool
+    #: 🔴 **观测是否成立**：``observed`` 或 ``unobservable``（阶段 7 · S4）。
+    #:
+    #: 两种失败必须分得开：
+    #:
+    #: * ``observation_status == "observed"`` 且 ``passed == False``
+    #:   —— 比较过了，**确实是那样**（如终态是 failed 而不是 completed）；
+    #: * ``observation_status == "unobservable"`` 且 ``passed == False``
+    #:   —— 压根没读到，**不知道是什么**。
+    #:
+    #: 它们对案例判定的后果相同（都不通过），但对**诊断**的含义完全不同：
+    #: 前者说明系统跑出来是这个样子，后者说明这次没观测到。
+    #: S4 的 ``observation_coverage`` 正是建立在这个字段上。
+    #:
+    #: ⚠️ 以前只能靠 ``observed is None`` 反推。那不是文本猜测，但它是
+    #: **隐式**契约——加一个字段就把它变成了显式的、可被 schema 校验的东西。
+    observation_status: str = Field(default="observed", pattern="^(observed|unobservable)$")
     #: 人话判定说明（仅出现在原始输出里，canonical 不含它）。
     detail: str = ""
 
@@ -668,9 +692,11 @@ def evaluate(
     if outcome.satisfied is None:
         passed = False
         detail = f"[不可观测] {outcome.detail}"
+        observation_status = "unobservable"
     else:
         passed = outcome.satisfied if mode == "required" else not outcome.satisfied
         detail = outcome.detail
+        observation_status = "observed"
 
     return AssertionResult(
         name=name,
@@ -678,6 +704,7 @@ def evaluate(
         expected=expected,
         observed=outcome.observed,
         passed=passed,
+        observation_status=observation_status,
         detail=detail,
     )
 

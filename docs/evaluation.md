@@ -243,5 +243,131 @@ Candidate : 候选策略
 
 ### 尚未实现（属后续切片）
 
-Baseline/Candidate 对比、指标层、Markdown 报告、发布阈值、真实 Provider 评测。
+Baseline/Candidate 对比、Markdown 报告、发布阈值、真实 Provider 评测。
 本文件 §5 与 §7 描述的是**目标形态**，不是当前实现状态。
+
+---
+
+## 9. 指标层（阶段 7 · S4，**已实现**）
+
+> ⚠️ 本节说的指标与 §2 的**不是同一回事**。§2 列的是**系统质量指标**
+> （`cognitive_round_success_rate`、`conflict_preservation_rate` …），
+> 那是任务书 §16.1 的目标形态，**尚未实现**。本节讲的是**单次运行
+> 产生了什么可解释的聚合结果**——它只保证统计是对的，不评价系统好不好。
+
+实现位置：`src/ai_psi/evaluation/metrics.py`。
+
+### 契约身份
+
+| 项 | 值 |
+|---|---|
+| `metrics_schema_version` | `1` |
+| `metrics_definition_digest` | SHA-256，覆盖下方全部定义 |
+| 比率精度 | **固定 6 位小数** |
+| 舍入 | **`ROUND_HALF_UP`**（用标准库 `Decimal`，不用二进制浮点） |
+| 分母为 0 | `value` 为 **`null`**，**绝不写成 `0.000000`** |
+
+🔴 改任何一个分母口径或精度，都必须让摘要变——否则等于宣称两份按不同
+规则算出来的数字可以放在一起看。摘要覆盖：schema 版本、精度、舍入、
+四个比率的各自分母、不可观测分类规则、部分运行规则。
+
+### 核心计数
+
+| 计数 | 定义 |
+|---|---|
+| `total_cases` | **加载成功**的数据集案例总数（含未执行的） |
+| `executed_cases` | 真的进入执行并产出了结果的案例数 |
+| `passed_cases` / `failed_cases` | 执行过的案例里通过 / 未通过的 |
+| `not_executed_cases` | `total_cases - executed_cases`。🔴 **不是失败案例** |
+| `execution_error_cases` | 失败中"**没跑起来**"的（应用异常 / HTTP 错误 / 存储错误 / 无观测） |
+| `assertion_failed_cases` | 失败中"**跑起来了但断言没过**"的 |
+
+不变量（构造时强制，违反即报错）：
+
+```
+passed_cases + failed_cases              == executed_cases
+executed_cases + not_executed_cases      == total_cases
+execution_error_cases + assertion_failed_cases == failed_cases   # 互斥且完备
+```
+
+### 比率的分子与分母
+
+| 比率 | 分子 | 分母 |
+|---|---|---|
+| `case_pass_rate` | `passed_cases` | **`executed_cases`** |
+| `execution_coverage` | `executed_cases` | `total_cases` |
+| `assertion_pass_rate` | `passed` | **`evaluated`**（不是 `total`） |
+| `observation_coverage` | `evaluated` | `total` |
+
+🔴 **不用 `passed_cases / total_cases` 当唯一通过率**：那会把"失败"与
+"压根没跑"混成同一个数字——前者说明结果不对，后者说明这次没覆盖到。
+
+### 断言统计
+
+每条断言按三个分类计数，**只看结构化字段**：
+
+| 分类 | 判据 |
+|---|---|
+| `evaluated` | `observation_status == "observed"` |
+| `unobservable` | `observation_status == "unobservable"` |
+| `passed` / `failed` | 在 `evaluated` 之内再按 `passed` 分 |
+
+要求：
+
+* `passed + failed == evaluated`；
+* `evaluated + unobservable == total`；
+* **不可观测与"比较后失败"分开统计**——"没读到"与"读到了但对不上"
+  是两回事，混在一起会让"系统在这个断言上表现如何"无从判断。
+
+⚠️ **案例判定语义没有因此放宽**：不可观测的断言**仍然**让案例不通过。
+分开的是**统计口径**，不是**判定规则**。
+
+### 按类别与按断言名
+
+* 类别只输出**数据集中实际出现**的（本切片 3 类），按类别名排序。
+  不输出"全部 12 个合法类别"的空壳——那会让报告里出现 9 行全 0，
+  读者分不清"这个类别没案例"与"这个类别全没过"。
+* 断言名只输出**实际出现过**的（本切片 15 个），按名字排序。
+  同一个名字同时以 `required` 与 `forbidden` 出现时分开记。
+* 类别之和、断言名之和必须与总体逐项相等（构造时校验）。
+
+### 分布
+
+`final_state_distribution` / `depth_distribution` / `stop_reason_distribution`。
+
+* **只统计已执行的案例**——没跑起来的没有终态；
+* 枚举按**正式枚举顺序**（`d0` 在 `d1` 前），其余按字典序；
+* 空值用明确键 `__none__`；
+* 未知但真实出现的值**不丢弃**；
+* 值取自 `CaseObservation` 的结构化字段，**不从 `response_text` 抽取**，
+  **不从 `failure_reason` 推断**。
+
+### 失败索引
+
+`failed_case_ids` / `execution_error_case_ids` / `assertion_failure_case_ids` /
+`unobservable_case_ids` / `failed_assertions_by_case`。
+
+只放 **ID 与稳定分类**，不放 `response_text`、异常堆栈、数据库 URL 或
+任何 secret。用途是"去哪查"，不是"把报告再抄一遍"。
+
+### 部分运行与全局失败
+
+| 情形 | 处理 |
+|---|---|
+| **A. 数据集加载失败** | **不产生指标**。CLI 返回退出码 2，一条案例都不跑 |
+| **B. 部分案例执行失败** | 生成指标；`execution_error_cases` 正确计数；CLI 返回非零；已执行结果保留 |
+| **C. 运行级中止** | `total_cases` 保持加载后的总数；`executed_cases` 为实际数量；差额进 `not_executed_cases` |
+
+### 指标不是什么
+
+🔴 **它不是发布阈值，也不是质量结论，更不是版本比较。**
+
+* 不比较两次运行；不判断回归或改进；
+* 不设任何门禁；
+* 不计算 attribution 漏报率（R46/R58）；
+* 输出的是 `case_pass_rate` 与 `assertion_pass_rate` 这类**描述性**名称；
+  **不使用** `accuracy` —— 本切片没有带标签的样本，那个词会暗示一种
+  这里并不存在的"正确率"。
+
+**10 个案例全过不等于系统质量达标。** 那需要 50+ 个案例、真实 Provider、
+以及有标签的评测集。本层只保证：这些数字的算法是可复算的、分母是透明的。

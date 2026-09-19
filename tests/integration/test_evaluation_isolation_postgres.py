@@ -883,3 +883,97 @@ class TestReproducibilityManifestOnPostgres:
         assert "working_tree_clean" not in identity
         assert identity["storage_backend"] == "postgresql"
         assert platform.python_version() not in json.dumps(identity)
+
+
+class TestMetricsOnPostgres:
+    """S4：PostgreSQL 模式下的指标层。"""
+
+    @staticmethod
+    def _argv(prepared: IsolationPlan, tmp_path: Path) -> tuple[list[str], Path, Path]:
+        raw = tmp_path / "s4.json"
+        metrics = tmp_path / "s4-metrics.json"
+        return (
+            [
+                "--mode",
+                "postgres-http",
+                "--dataset",
+                str(_DATASET),
+                "--evaluation-database-url",
+                prepared.evaluation.normalized_url,
+                "--reference-database-url",
+                prepared.reference.normalized_url,
+                "--output",
+                str(raw),
+                "--canonical-output",
+                str(tmp_path / "s4-canonical.json"),
+                "--metrics-output",
+                str(metrics),
+                "--keep-databases",
+            ],
+            raw,
+            metrics,
+        )
+
+    async def test_the_postgres_run_reports_metrics(
+        self,
+        prepared_databases: IsolationPlan,
+        seeded_reference: None,
+        tmp_path: Path,
+    ) -> None:
+        """指标在两条执行路径上**同口径**——走 HTTP 也得到 10/10。"""
+        import json
+
+        argv, raw, metrics_path = self._argv(prepared_databases, tmp_path)
+        assert await asyncio.to_thread(main, argv) == EXIT_OK
+
+        payload = json.loads(raw.read_text(encoding="utf-8"))
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        # 报告里的那一份与独立文件是同一个
+        assert payload["metrics"] == metrics
+        assert metrics["metrics_schema_version"] == 1
+        assert metrics["cases"]["total_cases"] == 10
+        assert metrics["cases"]["executed_cases"] == 10
+        assert metrics["cases"]["passed_cases"] == 10
+        assert metrics["cases"]["case_pass_rate"]["value"] == "1.000000"
+        assert metrics["cases"]["execution_error_cases"] == 0
+        assert metrics["assertions"]["overall"]["total"] > 0
+
+    async def test_the_metrics_carry_no_database_identity(
+        self,
+        prepared_databases: IsolationPlan,
+        seeded_reference: None,
+        tmp_path: Path,
+    ) -> None:
+        """🔴 指标里不得出现库名、URL 或凭据——它会被写进可以公开的报告。"""
+
+        argv, _, metrics_path = self._argv(prepared_databases, tmp_path)
+        assert await asyncio.to_thread(main, argv) == EXIT_OK
+
+        produced = metrics_path.read_text(encoding="utf-8")
+        username = prepared_databases.evaluation.username
+        password = prepared_databases.evaluation.password
+        for forbidden in (
+            prepared_databases.evaluation.database,
+            prepared_databases.reference.database,
+            password,
+            f"{username}:{password}",
+            "postgresql+psycopg://",
+        ):
+            assert forbidden not in produced, f"指标里出现了 {forbidden!r}"
+
+    async def test_the_canonical_carries_the_same_metrics(
+        self,
+        prepared_databases: IsolationPlan,
+        seeded_reference: None,
+        tmp_path: Path,
+    ) -> None:
+        """canonical 与原始报告用**同一份**指标（模型里没有易变字段）。"""
+        import json
+
+        argv, raw, metrics_path = self._argv(prepared_databases, tmp_path)
+        canonical = tmp_path / "s4-canonical.json"
+        assert await asyncio.to_thread(main, argv) == EXIT_OK
+
+        expected = json.loads(metrics_path.read_text(encoding="utf-8"))
+        assert json.loads(raw.read_text(encoding="utf-8"))["metrics"] == expected
+        assert json.loads(canonical.read_text(encoding="utf-8"))["metrics"] == expected

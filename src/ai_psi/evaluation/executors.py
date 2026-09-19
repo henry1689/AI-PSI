@@ -309,6 +309,7 @@ def _observation_from(
         state=accepted.status.value,
         depth=accepted.depth.value,
         stop_reason_present=accepted.stop_reason is not None,
+        stop_reason=accepted.stop_reason,
         response_present=accepted.response is not None,
         response_text=accepted.response,
         judgment_present=judgment is not None,

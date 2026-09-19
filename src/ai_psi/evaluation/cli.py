@@ -44,7 +44,7 @@ import asyncio
 import sys
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 from ai_psi.config import Settings, get_settings
 from ai_psi.evaluation.executors import open_http_evaluation_executor
@@ -63,6 +63,7 @@ from ai_psi.evaluation.manifest import (
     collect_code_identity,
     storage_identity,
 )
+from ai_psi.evaluation.metrics import compute_metrics
 from ai_psi.evaluation.postgres import (
     create_engine_for,
     drop_database,
@@ -186,6 +187,15 @@ def build_parser() -> argparse.ArgumentParser:
             "⚠️ 不提供任何绕过它的开关"
         ),
     )
+    # ---- 指标（阶段 7 · S4）----
+    parser.add_argument(
+        "--metrics-output",
+        default=None,
+        help=(
+            "把指标层结果单独写到这个路径（UTF-8、键排序、结尾恰好一个换行）。"
+            "⚠️ 指标**总是**写进原始报告与 canonical；这个参数只是额外给一份独立文件"
+        ),
+    )
     return parser
 
 
@@ -245,14 +255,14 @@ def _require_reproducible_identity() -> None:
         raise ReproducibilityError(msg)
 
 
-def _write_manifest(path: Path, manifest: ReproducibilityManifest) -> None:
-    """把清单单独写一份。
+def _write_stable_json(path: Path, payload: dict[str, Any]) -> None:
+    """把一份产物单独写出去。
 
     用与报告相同的 :func:`~ai_psi.evaluation.serialization.dumps`：
     UTF-8、键排序、缩进固定、结尾恰好一个换行。
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(dumps(manifest.model_dump(mode="json")), encoding="utf-8", newline="\n")
+    path.write_text(dumps(payload), encoding="utf-8", newline="\n")
 
 
 def _report(result: RunResult, dataset: GoldenDataset, raw: Path, canonical: Path) -> None:
@@ -498,6 +508,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         return EXIT_NOT_REPRODUCIBLE
 
+    # ---- 指标层（阶段 7 · S4）----
+    #
+    # 🔴 在这里算而不是在 runner 里：``total_cases`` 要的是**数据集**的
+    # 案例总数（含未执行的），而 runner 只看得见执行过的那些。
+    # 走得到这一步就说明数据集加载成功了（否则上面早已返回 2），
+    # 因此不存在"加载失败却输出伪指标"的路径。
+    result = result.model_copy(update={"metrics": compute_metrics(dataset, result)})
+
     raw_path = Path(arguments.output)
     canonical_path = Path(arguments.canonical_output)
     try:
@@ -506,13 +524,20 @@ def main(argv: list[str] | None = None) -> int:
             if manifest is None:
                 msg = "本次运行没有采集到可复现性清单"
                 raise ReproducibilityError(msg)
-            _write_manifest(Path(arguments.manifest_output), manifest)
+            _write_stable_json(Path(arguments.manifest_output), manifest.model_dump(mode="json"))
+        if arguments.metrics_output:
+            if result.metrics is None:  # pragma: no cover - 上面刚填过
+                msg = "本次运行没有算出指标"
+                raise ReproducibilityError(msg)
+            _write_stable_json(
+                Path(arguments.metrics_output), result.metrics.model_dump(mode="json")
+            )
     except OSError as exc:
         # 写盘失败必须非零：一次"看起来跑完了却没产物"的运行是最坏的结果。
         print(f"报告写盘失败：{type(exc).__name__}", file=sys.stderr)
         return EXIT_OUTPUT_ERROR
     except ReproducibilityError as exc:
-        print(f"清单不可用：{exc}", file=sys.stderr)
+        print(f"产物不可用：{exc}", file=sys.stderr)
         return EXIT_NOT_REPRODUCIBLE
 
     _report(result, dataset, raw_path, canonical_path)

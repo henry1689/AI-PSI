@@ -145,6 +145,22 @@ def _manifest_payload(result: RunResult, *, canonical: bool) -> dict[str, Any] |
     return manifest.model_dump(mode="json")
 
 
+def _metrics_payload(result: RunResult) -> dict[str, Any] | None:
+    """指标层结果（阶段 7 · S4）。
+
+    🔴 **原始与 canonical 用的是同一份**：指标模型里**没有**易变字段——
+    计数是整数，比率是固定精度的字符串，分布是排好序的映射，
+    失败索引只有 ID 与稳定分类。因此不需要像清单那样做子集投影。
+
+    ⚠️ 这**不是**放松要求：如果将来往指标里加了时间戳或耗时，
+    就必须在这里重新划一次边界，而不是让它顺手进 canonical。
+    """
+    metrics = result.metrics
+    if metrics is None:
+        return None
+    return metrics.model_dump(mode="json")
+
+
 def canonical_payload(result: RunResult) -> dict[str, Any]:
     """构造 canonical（可比较）结果。"""
     return {
@@ -154,6 +170,7 @@ def canonical_payload(result: RunResult) -> dict[str, Any]:
         "execution_mode": result.execution_mode,
         "storage_isolation": _isolation_payload(result, canonical=True),
         "manifest": _manifest_payload(result, canonical=True),
+        "metrics": _metrics_payload(result),
         "summary": {
             "total": result.total,
             "passed": result.passed,
@@ -173,6 +190,7 @@ def raw_payload(result: RunResult) -> dict[str, Any]:
         "execution_mode": result.execution_mode,
         "storage_isolation": _isolation_payload(result, canonical=False),
         "manifest": _manifest_payload(result, canonical=False),
+        "metrics": _metrics_payload(result),
         "summary": {
             "total": result.total,
             "passed": result.passed,
