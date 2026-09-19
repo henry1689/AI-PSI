@@ -144,9 +144,10 @@
 | **C6.4** | 门槛裁决（`PromotionPolicy`）：`None` ≠ `False` | 同上 | `learning_service.py` → `_gate.review` → `_policy.decide` | 无 | `test_promotion_policy.py` | 部分 | 部分 | ✅ | **E2** | 同上：可达 ≠ 会跑。默认 Mock 下 `decide` **一次都不会被调用** |
 | **C6.5** | 提案生成（`ProposalGenerator`） | 同上 | `learning_service.py:371` → `_generator.generate` | `improvement_proposals` 行（经 `ProposalGate` 授权） | `test_proposal_generator.py` | 部分 | ✅ **脚本化 Mock + 真实 HTTP + 真实 PG 下真的落库了 DRAFT**（评审 A 实测） | ✅（伪造裁决被拒） | **E2** | 黑盒用默认 Mock 时同样不会被调用；评审 A 的实测用了一次**脚本化 Mock**——那仍是对被测系统的黑盒，但那条路径**没有固化成用例** |
 | **C6.6** | 提案状态机：登记 → 评估 →（批准 \| 驳回） | `GET/POST /improvement-proposals*`（5 个端点） | `proposals.py` → `ProposalService` | `improvement_proposals` 行 + 审批事件 | `test_proposal_service.py` | ✅ `test_contract_postgres.py`（同一组断言两实现） | ❌ | 部分 | **E2** | ① 契约测试覆盖的是**仓储**，不是**经 API 的状态机**；② 评估/批准/驳回的**事务性**（状态变更 + 审计事件同事务）没有 PG 级验证 |
-| **C6.7** | **学习链路端到端：三次同类错误 → DRAFT 提案** | 🔴 **自动**（第三次纠正提交后触发）+ CLI + `POST /learning/runs` | `feedback_service._run_learning_after_commit` → `learning_service.review` → 检测 → 门禁 → 生成 → 落库 | `improvement_proposals` + 事件 | ✅ `tests/scenarios/test_learning_chain.py` | 部分 | ✅ `test_black_box_acceptance.py::TestTheCorrectionClosesTheAttributionLoop`（**A–H 八个场景**） | ✅（2 回合不够、内部怀疑权重为 0、类别冲突不计入） | **E3** | 🔴 **这一条在阶段 6.5 被降级过，阶段 6.6 把它补上了。** 降级的原因不是做错了，而是**默认配置下不成立**——那时每条经验的 `error_type` 都是 `None`，`decide`/`generate` 一次都不会被调用。现在：**A 场景一次都不调 `/learning/runs`**，三个真实回合 + 三次有依据的同类纠正之后 DRAFT 提案自己出现。⚠️ **两个前提**：纠正必须**指得出被纠正的产物**（`related_artifact_id`，从回合摘要接口取），且回合要走到 **D2 以上**（D0 不做假设，没有可指的对象）。🔴 **"不重复创建提案"这一半的成色要按顺序读**（阶段 6.6 独立评审 §F1，实测 3/3 复现）：**顺序**重试不重复（黑盒场景 D 钉住），**并发**不保证——间隔 < ~50ms 的两个纠正会各生成一条内容相同的 DRAFT。见 **R72**；修它属于提案层，未在本阶段做 |
+| **C6.7** | **学习链路端到端：三次同类错误 → DRAFT 提案** | 🔴 **自动**（第三次纠正提交后触发）+ CLI + `POST /learning/runs` | `feedback_service._run_learning_after_commit` → `learning_service.review` → 检测 → 门禁 → 生成 → 落库 | `improvement_proposals` + 事件 | ✅ `tests/scenarios/test_learning_chain.py` | 部分 | ✅ `test_black_box_acceptance.py::TestTheCorrectionClosesTheAttributionLoop`（**A–H 八个场景**） | ✅（2 回合不够、内部怀疑权重为 0、类别冲突不计入） | **E3** | 🔴 **这一条在阶段 6.5 被降级过，阶段 6.6 把它补上了。** 降级的原因不是做错了，而是**默认配置下不成立**——那时每条经验的 `error_type` 都是 `None`，`decide`/`generate` 一次都不会被调用。现在：**A 场景一次都不调 `/learning/runs`**，三个真实回合 + 三次有依据的同类纠正之后 DRAFT 提案自己出现。⚠️ **两个前提**：纠正必须**指得出被纠正的产物**（`related_artifact_id`，从回合摘要接口取），且回合要走到 **D2 以上**（D0 不做假设，没有可指的对象）。🔄 **"不重复创建提案"这一半已在阶段 7 第一项补齐**：阶段 6.6 的独立评审实测出**并发**下会各生成一条内容相同的 DRAFT（R72），现在由部分唯一索引 `uq_improvement_proposals_active_pattern` 裁决（ADR-0024），**顺序**重试仍由黑盒场景 D 钉住。证据见下表的 C6.10 |
 | **C6.8** | 认知宪法不被学习模块修改 | 无独立入口（测试层强制） | `tests/unit/test_learning_constitution_boundary.py`（AST 扫描 + 运行时指纹比对） | 无 | ✅ | 不适用 | ❌ | ✅（AST 而非字符串搜索） | **E1** | 它是**测试**而非**运行期强制**：宪法在运行时被学习模块改写不会被拦截，只会在测试里变红。V0.1 可接受，但应明确记录 |
 | **C6.9** | 离线评测（`OfflineEvaluator`） | CLI + `POST /learning/runs` | `learning_service.py:338 _evaluate_offline` → `evaluator.compare` | 无（只读） | `test_offline_evaluator.py` | 部分 | ✅ **`offline_regression` 的方向判定已在真实 HTTP + 真实 PG 上断言** | ✅（对照干净时报 `false`、单侧数据报 `null`） | **E3** | §一 记的"**完全的死代码**、零调用者"已在 §四 修掉。§八 评审 A 复查时指出**两个真实阻断点**（评审结论已实证）：① `regressed()` 只在 `for pattern in scan.patterns` 内部被调用，**没有模式就一次都不调**；② `LearningRunResponse` 里**没有这个结论的出口**。两条都已修——退化判定现在算一次、门禁与运行结果共用，并作为**必填三态**字段回传 |
+| **C6.10** | **同一业务模式至多一条活跃提案（并发安全）** | 所有提案写入路径（自动触发 / `POST /learning/runs`） | `SqlAlchemyProposalRepository.add` → 部分唯一索引 `uq_improvement_proposals_active_pattern`；冲突 → `LearningService.review` 用**新事务**读回胜出者 → 记入 `already_covered` | `improvement_proposals` 的活跃行（并发下至多一条） | `test_in_memory_pattern_uniqueness.py`（13 项，含两工作单元交错提交） | ✅ `ProposalRepositoryContract`（两后端 27 项同断言） | ✅ **真实 HTTP × 真实 PostgreSQL × barrier × 20 轮**（`test_proposal_pattern_concurrency.py`）；另有迁移 7 项（空库 / 有数据 / 有重复 / downgrade） | ✅ 绕过应用层直接 `INSERT` 两条同键活跃行 → 数据库拒绝；索引名分流依据单独钉住 | **E3** | 🔴 **关掉它就是红的**：`DROP INDEX` 后跑并发用例真的写出 2 条提案、用例变红，恢复索引后变绿（ADR-0024 §6）。⚠️ 降级会**静默**重新打开 R72，见 R76；`find_active_for_pattern` 的多行守卫不可达，见 R77 |
 
 ---
 
@@ -157,7 +158,7 @@
 | 等级 | 数量 | 能力 |
 |---|---|---|
 | **E4 抗对抗** | **0** | — |
-| **E3 黑盒验过** | **5** | C0.2、C2.3、C6.2、C6.7、C6.9 |
+| **E3 黑盒验过** | **6** | C0.2、C2.3、C6.2、C6.7、C6.9、**C6.10**（阶段 7 第一项新增） |
 | **E2 生产可达** | **16** | C0.1、C1.1、C1.2、C2.1、C2.2、C3.1、C4.1、C4.2、C5.1、C5.2、C5.3、C6.1、C6.3、C6.4、C6.5、C6.6 |
 | **E1 仅测试** | **2** | C3.2、C6.8 |
 | **E0 无** | 0 | — |
@@ -171,6 +172,7 @@
 | C2.3 | E2 | **E3** | `ReplayService` 接通；出口 `differs_from_projection` 有了 HTTP 用例 |
 | C6.9 | E1 | **E3** | 从死代码接通到 CLI + HTTP，且**退化方向判定**已在黑盒层断言 |
 | C6.3 / C6.4 / C6.5 / C6.7 | E1 | **E2** | 有了生产入口（CLI + `POST /learning/runs`），但**没有黑盒证据**——见下 |
+| C6.10 | （无） | **E3** | 阶段 7 第一项新增。它不是"新功能"，是**把既有承诺补成可兑现的**：ADR-0023 §6 曾把"重试不重复创建提案"推给提案层，那句话在并发下是空的（R72）。现在由数据库裁决，且**反向验证过**（DROP INDEX → 用例变红） |
 | C3.2 / C6.8 | E1 | E1 | 未变（前者按设计只能由测试触达；后者是测试层强制，不是运行期强制） |
 
 > ⚠️ **"E2"这一档必须带着它的限定读。** §一 的 E2 定义是"有生产入口、

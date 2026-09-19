@@ -28,6 +28,7 @@ __all__ = [
     "InvariantViolationError",
     "NotFoundError",
     "OptimisticLockError",
+    "ProposalPatternConflictError",
     "ProviderError",
     "ProviderRateLimitError",
     "ProviderTimeoutError",
@@ -265,6 +266,31 @@ class ConflictError(ApplicationError):
     """幂等键冲突或其他业务冲突（任务书 §13.4）。"""
 
     default_code = "conflict"
+
+
+class ProposalPatternConflictError(ConflictError):
+    """同一个**业务模式**已经有一条活跃提案（阶段 7 · R72）。
+
+    🔴 **它与"主键已存在"是两件事，必须分开。**
+
+    ``ImprovementProposal.id`` 是 ``uuid4``，主键冲突在正常路径上
+    不可能发生——真发生了就是编程错误，应当大声失败。
+    而这里说的是**业务键** ``(error_class, applicability[0])`` 撞车：
+    两个并发的学习运行读到同一份"还没有提案"的旧快照，各自走完门禁
+    与生成，然后在**写入**时才分胜负。
+
+    这是**预期内的并发结果**，不是缺陷：调用方（``LearningService.review``）
+    应当把它翻译成"这个模式已被覆盖"，而不是报错。
+
+    继承 :class:`ConflictError` 是为了让既有的、更粗粒度的调用方
+    仍然拦得住它；需要区分的调用方用本类型接。
+
+    Attributes:
+        context: 含 ``error_class`` 与 ``situation_signature`` 两个键,
+            让日志能直接说出是哪个模式撞了。
+    """
+
+    default_code = "proposal_pattern_conflict"
 
 
 # ---------------------------------------------------------------------------

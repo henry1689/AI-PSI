@@ -29,7 +29,7 @@ from ai_psi.application.ports import (
 )
 from ai_psi.domain.cognitive_rounds import CognitiveRound
 from ai_psi.domain.events import Event
-from ai_psi.domain.improvement_proposals import ImprovementProposal
+from ai_psi.domain.improvement_proposals import ImprovementProposal, active_pattern_key
 from ai_psi.domain.memories import Memory
 from ai_psi.infrastructure.in_memory.event_store import InMemoryEventStore
 from ai_psi.infrastructure.in_memory.memory_store import InMemoryMemoryRepository
@@ -259,6 +259,28 @@ class InMemoryUnitOfWork:
         merged = dict(self._store.proposals)
         merged.update(self._staged_proposals)
         return list(merged.values())
+
+    def active_pattern_owner(
+        self, key: tuple[str, str], *, excluding: UUID | None = None
+    ) -> UUID | None:
+        """持有该业务模式活跃提案的提案 id；没有则 ``None``（阶段 7 · R72）。
+
+        业务键的定义在 :func:`~ai_psi.domain.improvement_proposals.active_pattern_key`
+        ——两个后端都从那里取，不各写一遍。
+
+        Args:
+            key: ``(error_class, situation_signature)``。
+            excluding: 忽略这个 id（用于"更新自己"的判定）。
+
+        Returns:
+            占用者的 id；没有活跃占用者时返回 ``None``。
+        """
+        for item in self.visible_proposals():
+            if item.id == excluding or item.status.is_terminal:
+                continue
+            if active_pattern_key(item) == key:
+                return item.id
+        return None
 
     def visible_memories(self) -> list[Memory]:
         """返回"已提交 + 本事务暂存"的全部记忆。"""

@@ -543,13 +543,54 @@ class ProposalRepository(Protocol):
     async def add(self, proposal: ImprovementProposal) -> None:
         """写入一条新提案。
 
+        🔴 **同一个业务模式至多一条活跃提案，由持久化层裁决**（阶段 7 · R72）。
+
+        业务键是 ``(error_class, applicability[0])``
+        （:func:`~ai_psi.domain.improvement_proposals.active_pattern_key`）。
+        应用层的 ``LearningService._covered_keys()`` 只是在门禁之前
+        做一次廉价预筛，**它不是并发防线**——它读完之后到写入之前，
+        另一个运行完全可能已经写了同一条。
+
+        实现必须在**写入时**判定，而不是"读一遍看看有没有"：
+
+        * PostgreSQL：``uq_improvement_proposals_active_pattern``
+          部分唯一索引，由数据库原子裁决；
+        * 内存：提交时在锁内按最终状态复核
+          （``InMemoryStore.apply`` / ``_assert_pattern_uniqueness_holds``）。
+
         Raises:
-            ConflictError: 主键已存在。
+            ProposalPatternConflictError: 同一业务模式下已有一条**活跃**提案。
+                这是**并发下的预期结果**，不是故障——调用方应当读回
+                胜出的那条并把它当作"该模式已被覆盖"。
+            ConflictError: 主键已存在（``uuid4`` 相撞，正常路径不可能）。
         """
         ...
 
     async def get(self, proposal_id: UUID) -> ImprovementProposal | None:
         """按 id 读取；不存在返回 ``None``。"""
+        ...
+
+    async def find_active_for_pattern(
+        self, *, error_class: ErrorType, situation_signature: str
+    ) -> ImprovementProposal | None:
+        """取该业务模式下**唯一**那条活跃提案；没有则 ``None``。
+
+        🔴 存在的理由是 :meth:`add` 抛 ``ProposalPatternConflictError``
+        之后，调用方要能**读回**胜出的那条。不提供这个方法的话，
+        调用方只能从 ``list_all()`` 里自己筛——那是把业务键的定义
+        散到调用方去，第二个筛的人就会筛得不一样。
+
+        ⚠️ 实现必须**收齐候选再判断数量**，多于一条时抛
+        :class:`~ai_psi.domain.exceptions.ConstitutionViolationError`
+        ——那意味着唯一性已经失效，此时"挑一条返回"会让缺陷永远不被发现。
+
+        Args:
+            error_class: 错误类别。
+            situation_signature: 情境签名（``applicability[0]``）。
+
+        Returns:
+            该模式的活跃提案；没有则 ``None``。终态提案**不算**命中。
+        """
         ...
 
     async def save(self, proposal: ImprovementProposal, *, expected_version: int) -> None:

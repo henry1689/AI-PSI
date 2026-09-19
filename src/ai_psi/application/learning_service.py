@@ -47,6 +47,7 @@ from ai_psi.application.proposal_gate import GateEvidence, ProposalGate
 from ai_psi.application.proposal_service import ProposalService
 from ai_psi.domain.enums import EventType, FeedbackType
 from ai_psi.domain.events import Event
+from ai_psi.domain.exceptions import ProposalPatternConflictError
 from ai_psi.domain.improvement_proposals import ImprovementProposal
 from ai_psi.learning.offline_evaluator import EvaluationComparison, OfflineEvaluator
 from ai_psi.learning.pattern_detector import ErrorPattern, PatternDetector
@@ -274,6 +275,16 @@ class LearningService:
         already: list[ErrorPattern] = []
         rejected: list[tuple[ErrorPattern | None, tuple[str, ...]]] = []
 
+        # 🔴 **本方法没有"整轮一个事务"这种东西。**
+        #
+        # 读路径各自开短事务；写路径是下面循环里的 `self._proposals.create(...)`，
+        # **每个模式各开一个事务，并且各自独立提交**。
+        #
+        # 读代码的人很容易以为"一次 run 是一个事务"，进而以为某个模式
+        # 写失败会掀掉整轮结果——不会。某个模式撞上并发唯一冲突时，
+        # 它自己那个事务回滚（提案与事件都没写），而**前面已经提交的
+        # 提案不受任何影响**，后面的模式也照常继续。
+        # 因此不需要补偿逻辑，也不存在"部分失败"这种中间态。
         for pattern in scan.patterns:
             verdict = await self._gate.review(
                 error_type=pattern.error_type,
@@ -320,9 +331,31 @@ class LearningService:
                 rejected.append((pattern, ("生成器判定证据不足以构造提案",)))
                 continue
 
-            stored = await self._proposals.create(
-                proposal, verdict=verdict, actor_id=actor_id, correlation_id=correlation
-            )
+            try:
+                stored = await self._proposals.create(
+                    proposal, verdict=verdict, actor_id=actor_id, correlation_id=correlation
+                )
+            except ProposalPatternConflictError:
+                # 🔴 **并发下"另一个运行先写了同一条"——这是预期结果，不是故障。**
+                #
+                # 上面那次 `_covered_keys()` 读的是**过去的**快照，而它到
+                # 这里之间隔着门禁复核与生成。两个运行同时走到这里时，
+                # 唯一索引会放一个进来、把另一个挡在门外
+                # （PostgreSQL 的部分唯一索引 / 内存的提交时复核）。
+                #
+                # ⚠️ **此刻事务已经回滚并关闭**：冲突在仓储的 `flush()` 抛出，
+                # 异常穿出 `ProposalService.create` 的 `async with`，
+                # 那个工作单元已经 rollback + close。因此下面**必须**
+                # 用一个新的工作单元去读——不能在旧事务上再发任何语句，
+                # PostgreSQL 早已把它置为 aborted。
+                winner = await self._read_pattern_owner(pattern)
+                if winner is None:
+                    # 冲突报了，却读不回占用者——说明撞的不是模式索引，
+                    # 或者索引/数据不自洽。把它原样抛出去，
+                    # **绝不**记成"已被覆盖"（那会静默吞掉一个真缺陷）。
+                    raise
+                already.append(pattern)
+                continue
             created.append(
                 CreatedProposal(
                     proposal=stored,
@@ -448,6 +481,18 @@ class LearningService:
         因此这是"少打扰评审"与"漏掉新证据"之间的取舍。
         引入重新开启（例如"驳回 N 天后、或新增 M 次发生时可再审"）
         属于阶段 7 的评测范围，那时改的是这个方法的一行。
+
+        🔴 **它不是并发防线**（阶段 7 · R72）。本方法读的是一份快照，
+        读完之后到真正写入之间，另一个学习运行完全可能已经写了同一条。
+        **并发防线在持久化层**：PostgreSQL 的
+        ``uq_improvement_proposals_active_pattern`` 部分唯一索引
+        （内存后端则在提交时于锁内复核）。本方法唯一的职责是
+        **省掉重复的门禁复核与提案生成**——它挡住的每一次，都是白省的一次。
+
+        ⚠️ 顺带说明它与数据库那条规则的**范围差别**：这里**含终态**
+        （R55：被驳回过的模式不再提议），而数据库只保证"至多一条**活跃**"。
+        终态那条是**策略**，不是不变量，因此不进数据库；
+        详见 ``docs/adr/0024`` 的取舍一节。
         """
         proposals = await self._proposals.list_all()
         return {
@@ -455,6 +500,40 @@ class LearningService:
             for proposal in proposals
             if proposal.applicability
         }
+
+    async def _read_pattern_owner(self, pattern: ErrorPattern) -> ImprovementProposal | None:
+        """读回**胜出**的那条提案，并复核它确实就是这次撞车的对象。
+
+        🔴 **必须复核，不能拿"读到了东西"就当成功。**
+        唯一冲突只告诉我们"某个唯一索引被违反了"，而调用方要据此
+        把这条模式判成"已被覆盖"。若读回来的是**另一条模式**的提案
+        （键对不上）或一条已经终结的提案，那么"已被覆盖"这个结论是错的
+        ——它会静默吞掉一次本该发生的提案生成。
+
+        所以这里逐项核对**完整业务键**与**活跃状态**，
+        任一不成立就返回 ``None``，由调用方把原冲突重新抛出。
+
+        ⚠️ 读操作走**新开的工作单元**：调用方此刻的旧事务已经被
+        PostgreSQL 置为 aborted（冲突在 ``flush()`` 抛出），
+        在它上面发任何语句都会以 ``InFailedSqlTransaction`` 失败。
+
+        Returns:
+            该模式的活跃提案；键对不上或已终结时返回 ``None``。
+        """
+        async with self._uow_factory() as uow:
+            winner = await uow.proposals.find_active_for_pattern(
+                error_class=pattern.error_type,
+                situation_signature=pattern.situation_signature,
+            )
+        if winner is None:
+            return None
+        if winner.error_class is not pattern.error_type:
+            return None
+        if not winner.applicability or winner.applicability[0] != pattern.situation_signature:
+            return None
+        if winner.status.is_terminal:
+            return None
+        return winner
 
 
 def _is_negative_feedback(event: Event) -> bool:

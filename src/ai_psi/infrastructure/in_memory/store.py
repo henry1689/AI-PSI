@@ -17,8 +17,8 @@ from uuid import UUID
 
 from ai_psi.domain.cognitive_rounds import CognitiveRound
 from ai_psi.domain.events import Event
-from ai_psi.domain.exceptions import OptimisticLockError
-from ai_psi.domain.improvement_proposals import ImprovementProposal
+from ai_psi.domain.exceptions import OptimisticLockError, ProposalPatternConflictError
+from ai_psi.domain.improvement_proposals import ImprovementProposal, active_pattern_key
 from ai_psi.domain.memories import Memory
 
 __all__ = [
@@ -167,6 +167,7 @@ class InMemoryStore:
         """
         with self._lock:
             self._assert_versions_still_hold(expected_versions or {})
+            self._assert_pattern_uniqueness_holds(proposals)
             self.events.extend(events)
             self.rounds.update(rounds)
             self.idempotency.update(reservations)
@@ -177,6 +178,67 @@ class InMemoryStore:
                 else:
                     self.index[memory_id] = entry
             self.proposals.update(proposals)
+
+    def _assert_pattern_uniqueness_holds(self, proposals: dict[UUID, ImprovementProposal]) -> None:
+        """🔴 提交前复核：同一业务模式至多一条**活跃**提案（阶段 7 · R72）。
+
+        这是内存侧的并发防线，对应 PostgreSQL 的
+        ``uq_improvement_proposals_active_pattern`` 部分唯一索引。
+        位置与理由同 :meth:`_assert_versions_still_hold`：**在锁内、
+        在任何写入之前**完成，失败时什么都没改——与 SQL 侧
+        "语句失败、整个事务回滚"的结果一致。
+
+        🔴 **复核的是提交后的最终状态**（已提交 ∪ 本事务暂存），
+        不是只看已提交数据。两者在下面两种情形下给出不同答案：
+
+        * **旧提案在本事务里转终态、同时创建同键新提案**：
+          只看已提交数据会把那条已经不在活跃集里的旧提案算成占用者，
+          **误报冲突**；看最终状态才放行。
+        * **本事务暂存了两条相同的新提案**：只看已提交数据看不到它们，
+          **漏报**；看最终状态才拦得住。
+
+        ⚠️ **与 SQL 侧的分工（这条差异是"在哪一层原子化"，不是语义差异）：**
+
+        两种情形都在共享契约里有断言
+        （``ProposalRepositoryContract::test_a_terminal_proposal_releases_the_pattern``
+        与 ``test_a_second_active_proposal_for_the_same_pattern_is_refused``），
+        **实测两个后端同答案**：
+
+        * PostgreSQL 侧，``save()`` 的那条 UPDATE 是立即执行的，
+          ``add()`` 的 INSERT 在 ``flush()`` 时送出——顺序天然正确；
+        * 内存侧，"更新"与"新增"都只是暂存，**唯一能原子化的地方
+          就是下面这次锁内复核**。
+
+        换句话说：内存侧这一问之所以必须看**最终状态**，是因为它没有
+        "UPDATE 立即生效"这个中间态可用；而不是因为两边对"应该发生什么"
+        有分歧。真正**只在内存侧**用一条用例单独断言的，是"两个事务
+        交错提交"那一半（``tests/unit/test_in_memory_pattern_uniqueness.py``）
+        ——那里 PG 的冲突在 ``add()`` 那一刻就报出来了，两边抛出的
+        调用点天然不同，塞进同一组断言只会得到一个对某一侧过松的测试。
+
+        Raises:
+            ProposalPatternConflictError: 最终状态里同一个业务模式
+                出现了多于一条活跃提案。
+        """
+        merged = {**self.proposals, **proposals}
+        owners: dict[tuple[str, str], UUID] = {}
+        for item in merged.values():
+            if item.status.is_terminal:
+                continue
+            key = active_pattern_key(item)
+            if key is None:
+                continue
+            if key in owners:
+                error_class, signature = key
+                msg = (
+                    f"该模式已有一条活跃提案：{error_class} / {signature}"
+                    f"（提交时复核，占用者是 {owners[key]}）"
+                )
+                raise ProposalPatternConflictError(
+                    msg,
+                    context={"error_class": error_class, "situation_signature": signature},
+                )
+            owners[key] = item.id
 
     def _assert_versions_still_hold(self, expected_versions: ExpectedVersions) -> None:
         """提交前的乐观锁复核。**调用方必须已经持有锁。**

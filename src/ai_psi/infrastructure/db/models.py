@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Final
 from uuid import UUID
 
 from pgvector.sqlalchemy import Vector
@@ -29,6 +29,7 @@ from sqlalchemy import (
     String,
     Text,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
@@ -401,6 +402,43 @@ class MemoryEmbeddingRow(Base):
     )
 
 
+# ---------------------------------------------------------------------------
+# R72：同一业务模式至多一条**活跃**提案（阶段 7）
+# ---------------------------------------------------------------------------
+#
+# 背景：``LearningService._covered_keys()`` 是"先读已存在的提案、再生成"，
+# 读与写之间没有锁、表上也没有对应的唯一约束。两个并发的学习运行会各自
+# 读到"还没有提案"的旧快照，各走完门禁与生成，然后在写入时才分胜负——
+# 结果是两条内容完全相同的 DRAFT（评审 6.6 §F1 实测 3/3 复现）。
+#
+# 🔴 **业务键是 `(error_class, applicability[0])`，不是整数组。**
+# ``_covered_keys()`` 取的是 ``applicability[0]``，而 ``applicability``
+# 是 ``text[]``：整数组唯一会把 ``[]`` 与 ``['a','b']`` 判成与应用层
+# **不同**的键（前者被应用层视为"不覆盖任何东西"，后者被应用层视为
+# 与 ``['a']`` 同键）。索引表达式因此逐字对齐应用层。
+#
+# ⚠️ **PostgreSQL 的数组下标从 1 起**，所以 SQL 里的 ``applicability[1]``
+# 就是 Python 里的 ``applicability[0]``。两个后端的 ``find_active_for_pattern``
+# 各按自己语言的约定写，靠契约测试对齐。
+ACTIVE_PATTERN_INDEX_NAME: Final[str] = "uq_improvement_proposals_active_pattern"
+
+#: 索引里的第二列：业务签名。见上方"数组下标从 1 起"的说明。
+_ACTIVE_PATTERN_INDEX_EXPRESSION: Final[str] = "(applicability[1])"
+
+#: 部分谓词。两半各有理由：
+#:
+#: * ``cardinality(applicability) > 0``——空数组下标越界得到 NULL，
+#:   而 PostgreSQL 的唯一索引**允许多个 NULL**。不排除它们就会留下一个
+#:   "看起来唯一、实际对这类行毫无约束"的约束。排除之后，
+#:   索引里根本不存在 NULL，而不是靠 NULL 互不相等侥幸不冲突。
+#:   方向与应用层一致：``_covered_keys()`` 同样跳过空 applicability。
+#: * ``status NOT IN (终态)``——数据库裁决的是"至多一条**活跃**提案"。
+#:   "终态也不再提议"（R55）仍由应用层承担，它是策略不是不变量。
+_ACTIVE_PATTERN_INDEX_PREDICATE: Final[str] = (
+    "cardinality(applicability) > 0 AND status NOT IN ('rejected', 'approved_for_manual_trial')"
+)
+
+
 class ImprovementProposalRow(Base):
     """改进提案（任务书 §5.12、§11）。
 
@@ -472,4 +510,15 @@ class ImprovementProposalRow(Base):
         Index("ix_improvement_proposals_status_created", "status", "created_at"),
         Index("ix_improvement_proposals_error_class", "error_class"),
         Index("ix_improvement_proposals_component", "target_component"),
+        # 🔴 **R72 的并发防线**（阶段 7）。见模块级常量上的说明。
+        Index(
+            ACTIVE_PATTERN_INDEX_NAME,
+            "error_class",
+            # ⚠️ 必须包 `text()`。裸字符串会被 SQLAlchemy 当成**列名**去解析，
+            # 而这是一个表达式——解析失败时抛
+            # `ConstraintColumnNotFoundError: no column named '(applicability[1])'`。
+            text(_ACTIVE_PATTERN_INDEX_EXPRESSION),
+            unique=True,
+            postgresql_where=text(_ACTIVE_PATTERN_INDEX_PREDICATE),
+        ),
     )

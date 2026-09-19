@@ -20,7 +20,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 
 import psycopg
 import pytest
@@ -163,15 +163,36 @@ def engine(_test_database: str, test_settings: Settings) -> Iterator[AsyncEngine
     yield create_async_engine(test_settings.database_url, poolclass=NullPool)
 
 
+async def truncate_all_tables(engine: AsyncEngine) -> None:
+    """清空全部数据表。
+
+    🔴 **抽成模块级函数，是为了让用例内部也能反复调用**
+    （阶段 7 · R72 的 20 轮并发用例：每轮都要回到一个空世界，
+    否则第二轮起业务键已被占用，用例会"通过"但什么都没验）。
+    清场不等于造数据——它用的是套件自身一直在用的那套隔离手段。
+    """
+    async with engine.begin() as conn:
+        await conn.execute(text(f"TRUNCATE {', '.join(_TABLES)} RESTART IDENTITY CASCADE"))
+
+
 @pytest.fixture
 async def clean_tables(engine: AsyncEngine) -> AsyncIterator[None]:
     """清空数据表，保证用例之间互不影响。
 
     在**每个用例开始前**执行——这样失败用例留下的数据仍可用于排查。
     """
-    async with engine.begin() as conn:
-        await conn.execute(text(f"TRUNCATE {', '.join(_TABLES)} RESTART IDENTITY CASCADE"))
+    await truncate_all_tables(engine)
     yield
+
+
+@pytest.fixture
+def truncate(engine: AsyncEngine) -> Callable[[], Awaitable[None]]:
+    """返回一个可反复调用的清库操作（用例内部用）。"""
+
+    async def _truncate() -> None:
+        await truncate_all_tables(engine)
+
+    return _truncate
 
 
 @pytest.fixture

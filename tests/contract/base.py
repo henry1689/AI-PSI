@@ -30,6 +30,7 @@ from ai_psi.domain.exceptions import (
     ConstitutionViolationError,
     NotFoundError,
     OptimisticLockError,
+    ProposalPatternConflictError,
 )
 from ai_psi.domain.improvement_proposals import ImprovementProposal
 from ai_psi.domain.memories import Memory
@@ -507,6 +508,14 @@ def _forged_proposal_payload(status: str) -> dict[str, object]:
 #: 会在"时间戳相同"这个分支上分道扬镳，而契约测试正是用来发现这种事的。
 _T0 = datetime(2026, 3, 1, 12, 0, 0, tzinfo=UTC)
 
+#: 业务模式测试用的情境签名。
+#:
+#: ⚠️ 形状刻意与 ``_situation_signature()`` 的真实输出一致
+#: （``f"{depth}|{evidence_bucket}|h{n}"``），因为它是
+#: ``applicability[0]`` 的取值——用"sig-1"这种占位符会掩盖
+#: "索引表达式到底比的是哪一段、下标从几起"这类错误。
+_SIGNATURE = "d2|no_evidence|h2"
+
 
 class ProposalRepositoryContract:
     """改进提案仓储的语义契约（任务书 §5.12、§12.4）。
@@ -530,6 +539,108 @@ class ProposalRepositoryContract:
         await proposal_repository.add(proposal)
         with pytest.raises(ConflictError):
             await proposal_repository.add(proposal)
+
+    # ------------------------------------------------------------------
+    # 阶段 7 · R72：同一个业务模式至多一条**活跃**提案
+    # ------------------------------------------------------------------
+
+    async def test_a_second_active_proposal_for_the_same_pattern_is_refused(
+        self, proposal_repository
+    ) -> None:
+        """🔴 **这是 R72 的核心断言。**
+
+        两个并发的学习运行会各自读到"还没有提案"的旧快照，各走完门禁与
+        生成，然后在写入时才分胜负。持久化层必须放一个进来、把另一个
+        挡在门外——不是"通常会挡住"，而是**只能进来一个**。
+
+        这里用同一个事务里的两次 `add` 模拟"两个运行都读完了才写"：
+        第二次必须抛 :class:`ProposalPatternConflictError`。
+        """
+        await proposal_repository.add(_proposal(applicability=[_SIGNATURE]))
+        with pytest.raises(ProposalPatternConflictError) as caught:
+            await proposal_repository.add(_proposal(applicability=[_SIGNATURE]))
+        assert caught.value.context["situation_signature"] == _SIGNATURE
+
+    async def test_the_conflict_is_also_a_plain_conflict(self, proposal_repository) -> None:
+        """它继承 :class:`ConflictError`——更粗粒度的调用方仍然拦得住。"""
+        await proposal_repository.add(_proposal(applicability=[_SIGNATURE]))
+        with pytest.raises(ConflictError):
+            await proposal_repository.add(_proposal(applicability=[_SIGNATURE]))
+
+    async def test_a_terminal_proposal_releases_the_pattern(self, proposal_repository) -> None:
+        """🔴 **钉住"只对活跃状态唯一"这个选择。**
+
+        数据库裁决的是"至多一条**活跃**提案"。前一条进了终态之后，
+        同一个模式可以再建——这正是"驳回后可重开"能成为一条策略变更
+        而不是一次迁移的原因（见迁移模块文档第 3 点）。
+
+        ⚠️ 注意它与应用层的关系：``LearningService._covered_keys()``
+        **含终态**，因此系统今天仍然不会自动重新提议（R55）。
+        这条断言说的是**存储层**允许它，不是"系统会这么做"。
+        """
+        first = _proposal(applicability=[_SIGNATURE])
+        await proposal_repository.add(first)
+        await proposal_repository.save(
+            first.bumped(status=ProposalStatus.REJECTED), expected_version=first.version
+        )
+
+        await proposal_repository.add(_proposal(applicability=[_SIGNATURE]))
+
+    async def test_a_different_signature_is_a_different_pattern(self, proposal_repository) -> None:
+        await proposal_repository.add(_proposal(applicability=["d1|with_evidence|h2"]))
+        await proposal_repository.add(_proposal(applicability=["d2|no_evidence|h1"]))
+
+    async def test_a_different_error_class_is_a_different_pattern(
+        self, proposal_repository
+    ) -> None:
+        await proposal_repository.add(_proposal(applicability=[_SIGNATURE]))
+        await proposal_repository.add(
+            _proposal(applicability=[_SIGNATURE], error_class=ErrorType.SCOPE_ERROR)
+        )
+
+    async def test_proposals_without_applicability_do_not_collide(
+        self, proposal_repository
+    ) -> None:
+        """🔴 **空 applicability 不参与唯一性。**
+
+        空数组下标越界得到 NULL，而 PostgreSQL 的唯一索引**允许多个
+        NULL**。若不把这类行排除在索引之外，就会留下一个"看起来唯一、
+        实际对它们毫无约束"的约束。这里的断言与部分谓词是同一件事的
+        两侧：谓词排除它们，本用例证明排除是对的（两条可以共存），
+        而方向与应用层一致——``_covered_keys()`` 同样跳过它们。
+        """
+        await proposal_repository.add(_proposal())
+        await proposal_repository.add(_proposal())
+
+    async def test_find_active_for_pattern_hits(self, proposal_repository) -> None:
+        proposal = _proposal(applicability=[_SIGNATURE])
+        await proposal_repository.add(proposal)
+        found = await proposal_repository.find_active_for_pattern(
+            error_class=ErrorType.REASONING_ERROR, situation_signature=_SIGNATURE
+        )
+        assert found is not None
+        assert found.id == proposal.id
+
+    async def test_find_active_for_pattern_ignores_terminal(self, proposal_repository) -> None:
+        first = _proposal(applicability=[_SIGNATURE])
+        await proposal_repository.add(first)
+        await proposal_repository.save(
+            first.bumped(status=ProposalStatus.REJECTED), expected_version=first.version
+        )
+        assert (
+            await proposal_repository.find_active_for_pattern(
+                error_class=ErrorType.REASONING_ERROR, situation_signature=_SIGNATURE
+            )
+            is None
+        )
+
+    async def test_find_active_for_pattern_unknown_returns_none(self, proposal_repository) -> None:
+        assert (
+            await proposal_repository.find_active_for_pattern(
+                error_class=ErrorType.REASONING_ERROR, situation_signature="d9|nope|h0"
+            )
+            is None
+        )
 
     async def test_save_bumps_version(self, proposal_repository) -> None:
         proposal = _proposal()

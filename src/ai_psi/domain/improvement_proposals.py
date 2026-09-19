@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from typing import Final
 from uuid import UUID
 
 from pydantic import Field, model_validator
@@ -26,9 +27,53 @@ from ai_psi.domain.exceptions import ConstitutionViolationError
 
 __all__ = [
     "PROPOSAL_ESCALATION_THRESHOLD",
+    "TERMINAL_PROPOSAL_STATUSES",
     "ImprovementProposal",
+    "active_pattern_key",
     "assert_status_is_a_member",
 ]
+
+#: 已到达终态的提案状态。
+#:
+#: 🔴 **由 :meth:`ProposalStatus.is_terminal` 派生，不是另写一份名单。**
+#: 两份名单迟早会分家，而分家的表现是"某个状态到底算不算终态"
+#: 在两个后端上答案不同——那正是 R72 这类缺陷的温床。
+#:
+#: 用途：阶段 7 · R72 的**活跃提案唯一性**要排除终态
+#: （``uq_improvement_proposals_active_pattern`` 的部分谓词、
+#: 两个后端的 ``find_active_for_pattern``）。
+TERMINAL_PROPOSAL_STATUSES: Final[frozenset[ProposalStatus]] = frozenset(
+    item for item in ProposalStatus if item.is_terminal
+)
+
+
+def active_pattern_key(proposal: ImprovementProposal) -> tuple[str, str] | None:
+    """提案的**业务模式键**：``(error_class, applicability[0])``。
+
+    🔴 **这是"同一个模式"在全仓库的唯一定义**（阶段 7 · R72）。
+
+    三个地方必须用同一个键，否则唯一性会在缝合处漏掉：
+
+    * ``LearningService._covered_keys()``（快速路径的读）；
+    * PostgreSQL 的 ``uq_improvement_proposals_active_pattern``
+      索引表达式 ``(applicability[1])``（**下标从 1 起**，见
+      :data:`~ai_psi.infrastructure.db.models.ACTIVE_PATTERN_INDEX_NAME`）；
+    * 内存 Store 的提交时复核。
+
+    ⚠️ 取的是 ``applicability[0]`` 而**不是整个数组**：整数组会把
+    ``['a','b']`` 与 ``['a']`` 判成两个键，而应用层认为它们是同一个。
+
+    Args:
+        proposal: 待取键的提案。
+
+    Returns:
+        业务键；``applicability`` 为空时返回 ``None``
+        ——这类提案**不覆盖任何模式**，因此不参与唯一性
+        （索引的部分谓词同样排除它们）。
+    """
+    if not proposal.applicability:
+        return None
+    return (proposal.error_class.value, proposal.applicability[0])
 
 
 def assert_status_is_a_member(proposal: ImprovementProposal) -> None:
