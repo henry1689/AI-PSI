@@ -30,11 +30,51 @@ from typing import Any, Final
 from ai_psi.evaluation.runner import CaseResult, RunResult
 
 __all__ = [
+    "REPORT_SUMMARY_FIELDS",
+    "REPORT_TOP_LEVEL_FIELDS",
+    "ReportFormatError",
     "canonical_payload",
     "dumps",
+    "parse_report",
     "raw_payload",
     "write_reports",
 ]
+
+#: 报告 payload 的顶层字段。
+#:
+#: 🔴 **产物形状的唯一真相来源**：写（:func:`raw_payload` /
+#: :func:`canonical_payload`）与读（:func:`parse_report`）用同一份常量。
+#: 分两份写，就会出现"加了字段但只有写的那边知道"——而那正是
+#: "读得进来但读漏了"这一类 bug 的温床。
+REPORT_TOP_LEVEL_FIELDS: Final[tuple[str, ...]] = (
+    "case_type",
+    "cases",
+    "execution_mode",
+    "manifest",
+    "metrics",
+    "provider",
+    "schema_version",
+    "storage_isolation",
+    "summary",
+)
+
+#: ``summary`` 子对象的字段。**报告把汇总嵌在这里**，而 ``RunResult``
+#: 上是扁平的——这层映射就是 :func:`parse_report` 存在的原因。
+REPORT_SUMMARY_FIELDS: Final[tuple[str, ...]] = (
+    "failed",
+    "passed",
+    "passed_overall",
+    "total",
+)
+
+
+class ReportFormatError(ValueError):
+    """报告 payload 的形状不符合本版本的产物格式。
+
+    ⚠️ 与"两份结果不可比较"无关：这个异常说明**这份文件不是本工具
+    产出的报告**，或者产自另一个结构版本。
+    """
+
 
 #: canonical 输出里 ``observation`` 保留的字段。
 #:
@@ -44,6 +84,11 @@ _CANONICAL_OBSERVATION_FIELDS: Final[tuple[str, ...]] = (
     "state",
     "depth",
     "stop_reason_present",
+    # 🔴 停止原因的**实际值**也进 canonical（阶段 7 · S5）：它来自回合结果的
+    # 结构化字段，不是措辞；而 S4 的 ``stop_reason_distribution`` 既然已经
+    # 进了 canonical，逐案例的那份就该一起进——只给聚合不给明细，
+    # 读者没法把分布上的一个数字对回具体是哪条案例。
+    "stop_reason",
     "response_present",
     "judgment_present",
     "model_calls_used",
@@ -75,6 +120,10 @@ def _case_payload(result: CaseResult, *, canonical: bool) -> dict[str, Any]:
             "expected": assertion.expected,
             "observed": assertion.observed,
             "passed": assertion.passed,
+            # 🔴 **观测是否成立**（阶段 7 · S5）：它把"没读到"与"读到了但
+            # 对不上"变成两个可被 schema 校验的值，而不是靠 ``observed is None``
+            # 反推。它**语义稳定**（不是措辞），因此原始与 canonical 都带它。
+            "observation_status": assertion.observation_status,
             # 判定原文含阈值比较的中间说明；原始输出保留它以便诊断，
             # canonical 丢弃它——它的措辞会随实现改写而变化。
             **({} if canonical else {"detail": assertion.detail}),
@@ -87,6 +136,10 @@ def _case_payload(result: CaseResult, *, canonical: bool) -> dict[str, Any]:
         "observation": _observation_payload(result, canonical=canonical),
         "assertions": assertions,
         "passed": result.passed,
+        # 🔴 **结构化的失败种类**（阶段 7 · S5）：``execution_error`` 与
+        # ``assertion_failure`` 的对策完全不同。S5 的案例转换靠它分类，
+        # **不**读 ``failure_reason`` 的文本——那是一句会随措辞变化的散文。
+        "failure_kind": result.failure_kind,
         "failure_reason": result.failure_reason,
     }
     if not canonical:
@@ -199,6 +252,84 @@ def raw_payload(result: RunResult) -> dict[str, Any]:
         },
         "cases": [_case_payload(case, canonical=False) for case in result.cases],
     }
+
+
+def parse_report(payload: dict[str, Any]) -> RunResult:
+    """把一份报告 payload 还原成 :class:`~ai_psi.evaluation.runner.RunResult`。
+
+    🔴 **不能直接 ``RunResult.model_validate(payload)``**：报告把汇总
+    （``total`` / ``passed`` / ``failed`` / ``passed_overall``）放在
+    ``summary`` 子对象里，而 ``RunResult`` 上是**扁平**的四个字段。
+    这层映射必须显式写出来，否则"字段对不上"会表现为一堆
+    ``missing`` 错误，读的人还得自己去猜哪一层错了。
+
+    严格性：
+
+    * 顶层字段必须是 :data:`REPORT_TOP_LEVEL_FIELDS` 的**恰好**那个集合——
+      多一个少一个都拒绝。多出来的字段意味着这份报告产自另一个结构版本，
+      而"忽略不认识的东西"正是让版本漂移静默发生的方式；
+    * ``summary`` 同理，对照 :data:`REPORT_SUMMARY_FIELDS`；
+    * 其余字段交给 pydantic 逐层校验（``RunResult`` 及其子模型全是
+      ``extra="forbid"``）。
+
+    Args:
+        payload: 已解析的 JSON 对象。
+
+    Returns:
+        还原后的运行结果。
+
+    Raises:
+        ReportFormatError: 字段集合不对，或清单是 canonical 的扁平子集。
+        pydantic.ValidationError: 字段值不合法（由调用方转换）。
+    """
+    unknown = sorted(set(payload) - set(REPORT_TOP_LEVEL_FIELDS))
+    missing = sorted(set(REPORT_TOP_LEVEL_FIELDS) - set(payload))
+    if unknown or missing:
+        msg = f"报告顶层字段不符合本版本的格式（多出：{unknown or '无'}；缺少：{missing or '无'}）"
+        raise ReportFormatError(msg)
+
+    manifest = payload["manifest"]
+    if isinstance(manifest, dict) and "code" not in manifest:
+        # 🔴 canonical 的清单是**扁平的稳定身份子集**，刻意去掉了
+        # ``working_tree_clean``（那是"能不能当基线"的判据，不是"结果是什么"）。
+        # 拿它来比较，会让"工作树是否干净"这条校验永远无从执行——
+        # 那种"校验通过"是假的，所以这里必须**明确拒绝**。
+        msg = (
+            "清单是扁平身份子集（没有 code 分组）——这看起来是 **canonical** 结果。"
+            "对比需要**原始**结果：canonical 刻意去掉了 working_tree_clean，"
+            "而它是「这份结果能不能当基线」的判据"
+        )
+        raise ReportFormatError(msg)
+
+    summary = payload["summary"]
+    if not isinstance(summary, dict):
+        msg = f"summary 必须是对象，实际是 {type(summary).__name__}"
+        raise ReportFormatError(msg)
+    unknown_summary = sorted(set(summary) - set(REPORT_SUMMARY_FIELDS))
+    missing_summary = sorted(set(REPORT_SUMMARY_FIELDS) - set(summary))
+    if unknown_summary or missing_summary:
+        msg = (
+            f"summary 字段不符合本版本的格式"
+            f"（多出：{unknown_summary or '无'}；缺少：{missing_summary or '无'}）"
+        )
+        raise ReportFormatError(msg)
+
+    return RunResult.model_validate(
+        {
+            "schema_version": payload["schema_version"],
+            "case_type": payload["case_type"],
+            "provider": payload["provider"],
+            "execution_mode": payload["execution_mode"],
+            "storage_isolation": payload["storage_isolation"],
+            "manifest": manifest,
+            "metrics": payload["metrics"],
+            "cases": payload["cases"],
+            "total": summary["total"],
+            "passed": summary["passed"],
+            "failed": summary["failed"],
+            "passed_overall": summary["passed_overall"],
+        }
+    )
 
 
 def dumps(payload: dict[str, Any]) -> str:

@@ -243,8 +243,215 @@ Candidate : 候选策略
 
 ### 尚未实现（属后续切片）
 
-Baseline/Candidate 对比、Markdown 报告、发布阈值、真实 Provider 评测。
+Markdown 报告、发布阈值、真实 Provider 评测。
 本文件 §5 与 §7 描述的是**目标形态**，不是当前实现状态。
+
+---
+
+## 10. Baseline / Candidate 结构化对比（阶段 7 · S5，**已实现**）
+
+实现位置：`src/ai_psi/evaluation/comparison.py`（引擎）与
+`src/ai_psi/evaluation/compare_cli.py`（命令行）。
+
+它回答的是：**在实验条件一致的前提下，两份评测结果之间发生了什么变化**。
+它**不**回答谁更好、能不能发布、质量有没有提高。
+
+### 方向：`candidate - baseline`
+
+🔴 **方向是固定的**，由命令行上参数的**位置**决定：
+
+```bash
+uv run python -m ai_psi.evaluation.compare_cli \
+  --baseline  evals/reports/run-a.json \
+  --candidate evals/reports/run-b.json \
+  --comparison-output evals/reports/comparison.json
+```
+
+* `--baseline` 与 `--candidate` **都必填**，两者传同一个文件是合法的；
+* 角色**不**按文件名里有没有 `baseline` / `candidate` 字样推断，
+  **不会**自动交换，也不会因为在后的参数看起来更"旧"就调换；
+* 所有计数与比率的差异一律是 `candidate - baseline`。
+
+**S5 有自己的命令行入口**，`ai_psi.evaluation.cli` 一行未改——
+S1a—S4 的命令保持完全兼容。
+
+### `comparison_schema_version` 与 `comparison_definition_digest`
+
+与 S4 的指标层同样的做法：一个版本号**加**一个语义摘要。
+摘要覆盖方向定义、允许差异、全部阻塞码、两个转换表、排序规则、
+Decimal 精度与舍入。🔴 改公式或改阻塞规则必须让摘要变——否则等于宣称
+"这两份差异是按同一套规则算出来的"，而它们不是。
+
+### S3 comparability 与 S5 eligibility 是两回事
+
+| 情形 | S3 `comparable` | S5 `comparison_eligible` |
+|---|---|---|
+| 只有代码 SHA 不同 | `False`（`code_revision_differs`） | **`True`** |
+| 数据集也不同 | `False` | `False`（`dataset_differs`） |
+| 完全相同 | `True` | `True` |
+
+S3 回答"两份结果是否具有**完全相同的版本身份**"，因此不同提交必然返回
+`False`——它**不得**宣称不同代码版本等价。S5 回答的是另一个问题：
+"这两份不同或相同代码版本的评测结果，是否具备进行**受控差异分析**的条件？"
+
+🔴 **S3 的语义一行未改**：S5 调用 `compare_manifests()` 并逐字保留它返回的
+每一个原因码，只是把 `code_revision_differs` 从"阻塞"改判为"允许但必须记录"。
+`manifest_identity_equal` 就是 S3 的 `comparable`，"不同 SHA"因此
+**不会**被伪装成"身份相同"。
+
+### `code_revision_differs` 为什么被允许
+
+**代码提交不同正是版本对比的主题。** 拒绝它等于拒绝做这件事。
+但它必须出现在 `allowed_differences` 里——"允许"不等于"没发生"。
+
+### 哪些身份差异会阻塞
+
+数据集、数据集案例数、断言注册表、Prompt 版本组合、Provider、模型、
+Provider 配置、执行模式、存储后端、Alembic 迁移版本、网络策略、
+包版本、Python **major/minor**、结果 schema 版本、指标 schema 版本、
+指标定义摘要——以及下面这几种"输入自身不完整"的情形。
+
+> **Python 补丁版本不阻塞**：`3.13.2` 与 `3.13.9` 是同一套语言行为。
+> 版本字符串**结构化解析**后比 major/minor，不按字符串前缀比较。
+
+> **存储只比后端与迁移版本**，**不比数据库名**——评测库每次运行都不同，
+> 拿它做判据等于说"两次运行永远不可比"。
+
+### `dirty_worktree` 为什么阻塞
+
+工作树脏意味着这份结果来自一个**无法从提交号重建**的代码状态。
+别人拿到那个 SHA 也复现不出它——那它就不是一个可引用的基线。
+
+同理，`commit_sha` 缺失或不是**完整 40 位十六进制**（短 SHA 也不行）
+一律阻塞：不可回答的身份不是身份。
+
+### CountDelta
+
+```json
+{ "baseline": 2, "candidate": 3, "delta": 1, "direction": "increased" }
+```
+
+* `delta` 必须恰好等于 `candidate - baseline`（构造时校验，不允许传错）；
+* 两侧都是非负整数，`delta` 可以为负；
+* 覆盖案例层与断言层的全部计数。
+
+### RatioDelta
+
+```json
+{
+  "baseline":  { "numerator": 8, "denominator": 10, "value": "0.800000" },
+  "candidate": { "numerator": 9, "denominator": 10, "value": "0.900000" },
+  "delta": "0.100000",
+  "direction": "increased"
+}
+```
+
+* **保留双方的完整比率**，不只给差值。只看 `0.100000` 无法回答
+  "这是分子涨了还是分母缩了"——而"10/10 变 9/9"与"9/10 变 9/9"
+  是完全不同的两件事；
+* 用 `Decimal` 计算，固定 6 位小数，`ROUND_HALF_UP`，与 S4 一致；
+* **不从百分比字符串解析，也不用二进制浮点**。
+
+#### `null` 差异
+
+任一侧的 `value` 为 `null`（分母为 0）时，**`delta` 也是 `null`**，
+`direction` 为 `unavailable`。
+
+🔴 **`null` 绝不写成 `"0.000000"`。** 一份"0/0"与一份"两边都是 0%"
+是两回事，把前者写成零差异正是本层要防的那种假指标。
+
+### 方向词只有四个
+
+`increased` / `decreased` / `unchanged` / `unavailable`——**纯描述**。
+
+🔴 这里**没有** `favorable` / `unfavorable` / `neutral`，也没有加权总分、
+`quality_score`、`risk_score`。不是"暂时没填"，是这些字段**根本不存在**于模型里
+（`extra="forbid"`，多写一个就是校验失败）。
+
+通过率上升是不是好事、某类分布变化是不是退化，都需要有标签的评测集与
+更多案例才能回答，而那两样现在都没有。
+
+### 案例转换
+
+| 转换 | 分类名 |
+|---|---|
+| 通过 → 通过 | `unchanged_pass` |
+| **通过 → 未通过** | `regression_transition` |
+| **未通过 → 通过** | `improvement_transition` |
+| 未通过 → 未通过 | `unchanged_fail` |
+
+⚠️ 这些名字**只描述判定转换**，不是发布结论。
+`regression_transition` 不等于"禁止发布"，`improvement_transition`
+也不等于"允许发布"。
+
+每条转换还带案例的类别、深度、终态与停止原因，以及本案例里
+**状态发生了变化**的断言键。🔴 不含 `response_text`、不含完整
+`failure_detail`、不含异常堆栈。
+
+### 断言转换
+
+断言是**三态**的（`passed` / `failed` / `unobservable`），因此有九种转移：
+
+| 转移 | 分类 |
+|---|---|
+| 通过→通过、失败→失败、不可观测→不可观测 | `unchanged` |
+| 通过→失败、**通过→不可观测** | `regression_transition` |
+| 失败→通过、不可观测→通过 | `improvement_transition` |
+| **失败→不可观测、不可观测→失败** | `changed_unresolved` |
+
+后两类单独成一档，是因为它们**不是**改善也不是退化：读到了与读不到
+是两回事，把它们塞进任何一边都是在编造一个不存在的方向。
+
+**断言身份**由 `(case_id, 声明索引)` 构成，名字与模式只用于可读性。
+不用名字当键：`analysis_module_ran` 与 `response_contains` 是**多值**断言，
+一个案例里"逻辑**和**因果都要跑"是完全正常的期望，用名字当键会静默覆盖。
+
+### 不可比较时的输出
+
+`comparison_eligible=false` 时：
+
+* **仍然写出**诊断 Comparison JSON：双方的完整身份、
+  `manifest_identity_equal`、`allowed_differences`、`blockers`；
+* 五组数值结构（指标差异、案例转换、断言转换、分布差异、失败索引差异）
+  **全部为 `null`**——这条约束由模型在构造时强制，不是靠"记得别填"；
+* 命令行返回专用非零（见下）。
+
+🔴 **无法解析的输入不写 Comparison JSON。** 一份基于未解析输入的
+"对比结果"无论长什么样都是误导，而"解析失败"尤其不能被当成"没有差异"。
+
+### 输入完整性：文件不得给自己作证
+
+对比之前，每一份输入都会被**独立复核**：由结构化案例结果**重新数一遍**
+各项计数，与文件里那份 `metrics` 逐项比对（含比率的**分子分母**）；
+重算不出就**如实记进 `integrity_notes`**，而不是假装查过。
+
+不一致一律 `input_metrics_mismatch` → 不可比较 → 不产生任何 delta。
+🔴 **绝不自动覆盖输入中的错误指标**——那等于把一次数据损坏变成一次静默修正。
+
+### 退出码
+
+| 码 | 含义 |
+|---|---|
+| `0` | 比较完成（**不代表任何一方更好**） |
+| `2` | 参数或输入文件错误（缺参数、文件不存在） |
+| `3` | 输入 Schema／完整性错误（JSON 损坏、字段不认识、清单或指标缺失） |
+| `4` | 比较条件不兼容（输入合法，但存在阻塞性身份差异） |
+| `5` | 输出写入失败 |
+
+### Comparison JSON 不代表发布决策
+
+产物里**没有** `release_allowed`、`gate_passed`、`quality_score`、
+`risk_score`、`recommendation`，没有时间戳、绝对路径、数据库名或 URL、
+secret、`response_text`、Prompt 正文。同样两份输入跑两次，产物**逐字节一致**。
+
+### 本层不做什么
+
+不设发布阈值；不输出单一"通过/失败"结论；不把 `changed` 自动解释为回归；
+不把 `unchanged` 自动解释为质量达标；不输出 Markdown/HTML/图表；
+**不调用真实 Provider**；不做历史重执行；不自动 checkout 任何提交。
+
+**10 个案例的差异不等于生产质量的变化。** 本层只保证：这些差异的算法
+是可复算的、分母是透明的、方向是固定的。
 
 ---
 
