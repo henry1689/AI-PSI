@@ -18,6 +18,7 @@ import pytest
 from ai_psi.evaluation.comparison import (
     ALLOWED_DIFFERENCE_CODES,
     BLOCKER_CODES,
+    BLOCKER_PARTIAL_RUN,
     COMPARISON_SCHEMA_VERSION,
     DELTA_PRECISION,
     AssertionStatus,
@@ -37,6 +38,7 @@ from ai_psi.evaluation.comparison import (
     load_run_result,
     write_comparison,
 )
+from ai_psi.evaluation.loader import GoldenDataset
 from ai_psi.evaluation.metrics import RatioMetric
 
 pytestmark = pytest.mark.unit
@@ -1016,6 +1018,109 @@ class TestComparisonModelGuards:
         assert "合成的回答文本" not in text
         assert "response_text" not in text
         assert "detail" not in text
+
+
+class TestPartialRuns:
+    """部分运行（S5 补丁）：合法但证据不全，必须阻塞，且**不得**被误诊。
+
+    🔴 它既不是"数据损坏"也不是"数据集变了"。把它报成
+    ``case_set_inconsistent`` 会把使用者引向"去查数据集是不是被改过"
+    这个错误方向；而要求类别集合相等，会让每一次部分运行都被误报成
+    "指标文件坏了"。
+    """
+
+    @staticmethod
+    def _partial(factory: Any, dataset: Any, full: Any, indices: Any) -> Any:
+        """取 ``full`` 的一个子集，并**重算指标**（保持输入自洽）。"""
+        return factory.revise(full, dataset, cases=tuple(full.cases[i] for i in indices))
+
+    def _fixture(self, comparison_factory: Any) -> tuple[Any, Any, Any]:
+        dataset = comparison_factory.dataset([f"case-{index:03d}" for index in range(1, 5)])
+        outcomes = {case.case_id: "pass" for case in dataset.cases}
+        full = comparison_factory.run(dataset, outcomes)
+        return dataset, full, self._partial(comparison_factory, dataset, full, range(0, 2))
+
+    def test_any_partial_run_blocks(self, comparison_factory: Any) -> None:
+        """🔴 四个场景全部阻塞：任一侧没跑完数据集就不做差异分析。"""
+        dataset, full, partial = self._fixture(comparison_factory)
+        other = self._partial(comparison_factory, dataset, full, range(2, 4))
+
+        scenarios = (
+            ("完整 vs 部分", full, partial),
+            ("部分 vs 完整", partial, full),
+            ("双方部分（同一子集）", partial, partial),
+            ("双方部分（不同子集）", partial, other),
+        )
+        for label, left, right in scenarios:
+            comparison = compare_run_results(left, right)
+            assert comparison.comparison_eligible is False, label
+            assert BLOCKER_PARTIAL_RUN in comparison.blockers, label
+            # 不可比较 ⇒ 一个数字都不出。
+            assert comparison.metrics_comparison is None, label
+            assert comparison.case_transitions is None, label
+            assert comparison.assertion_transitions is None, label
+            assert comparison.distribution_deltas is None, label
+            assert comparison.failure_index_delta is None, label
+
+    def test_both_partial_with_different_subsets_also_reports_the_set_problem(
+        self, comparison_factory: Any
+    ) -> None:
+        """执行集合确实不同时，两个原因都要报——它们是**两件事**。"""
+        dataset, full, partial = self._fixture(comparison_factory)
+        other = self._partial(comparison_factory, dataset, full, range(2, 4))
+        comparison = compare_run_results(partial, other)
+        assert BLOCKER_PARTIAL_RUN in comparison.blockers
+        assert "case_set_inconsistent" in comparison.blockers
+        assert "assertion_set_inconsistent" in comparison.blockers
+
+    def test_both_partial_with_the_same_subset_reports_only_partial_run(
+        self, comparison_factory: Any
+    ) -> None:
+        """两侧执行的是同一批案例：集合问题不存在，**只有**"没跑完"这件事。"""
+        _, _, partial = self._fixture(comparison_factory)
+        assert compare_run_results(partial, partial).blockers == (BLOCKER_PARTIAL_RUN,)
+
+    def test_partial_run_is_never_reported_as_corrupt_metrics(
+        self, comparison_factory: Any
+    ) -> None:
+        """🔴 **回归**：部分运行不得被报成 ``input_metrics_mismatch``。
+
+        存储的类别来自**数据集**，部分运行时它会包含"一条都没跑"的类别；
+        而重算的类别只能来自执行过的案例——那些类别在结果里根本不存在。
+        要求两者**相等**，就会把每一次部分运行都诬告成"指标文件坏了"。
+        这里用**两个类别**构造，正是为了让那个错误暴露出来。
+        """
+        split = comparison_factory.dataset(["case-001"], category="simple_fact")
+        other = comparison_factory.dataset(["case-002"], category="evidence_conflict")
+        dataset = GoldenDataset(root=split.root, cases=split.cases + other.cases)
+        full = comparison_factory.run(dataset, {"case-001": "pass", "case-002": "pass"})
+        # 只跑了 simple_fact 那一类：evidence_conflict 的 executed 为 0。
+        partial = comparison_factory.revise(full, dataset, cases=full.cases[:1])
+
+        comparison = compare_run_results(partial, partial)
+        assert comparison.blockers == (BLOCKER_PARTIAL_RUN,)
+        # 🔴 具体不一致项为空：没有任何一项指标与重算结果对不上。
+        assert comparison.integrity_mismatches == ()
+        assert comparison.comparison_eligible is False
+
+    def test_partial_run_still_reports_what_it_could_not_recheck(
+        self, comparison_factory: Any
+    ) -> None:
+        """``integrity_notes`` 的角色：它说"这一项我没能独立复核"，
+        **不是**阻塞原因。两者同时存在，各说各的事。"""
+        _, _, partial = self._fixture(comparison_factory)
+        comparison = compare_run_results(partial, partial)
+        assert comparison.integrity_notes
+        assert any("部分运行" in note for note in comparison.integrity_notes)
+        assert comparison.integrity_mismatches == ()
+
+    def test_complete_run_is_not_flagged_as_partial(self, comparison_factory: Any) -> None:
+        """反向：跑完了就不该出现这个码——否则它只是一个恒真的噪声。"""
+        dataset = comparison_factory.dataset(["case-001", "case-002"])
+        full = comparison_factory.run(dataset, {"case-001": "pass", "case-002": "pass"})
+        comparison = compare_run_results(full, full)
+        assert comparison.comparison_eligible is True
+        assert BLOCKER_PARTIAL_RUN not in comparison.blockers
 
 
 class TestInputHandling:

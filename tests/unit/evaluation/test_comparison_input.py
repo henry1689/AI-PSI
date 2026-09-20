@@ -24,6 +24,7 @@ from ai_psi.evaluation.comparison import (
     BLOCKER_DUPLICATE_CASE_ID,
     BLOCKER_IDENTITY_UNAVAILABLE,
     BLOCKER_INPUT_METRICS_MISMATCH,
+    BLOCKER_PARTIAL_RUN,
     ComparisonInputError,
     compare_run_results,
     evaluate_comparison_eligibility,
@@ -442,19 +443,23 @@ class TestInputIntegrity:
         assert eligibility.comparison_eligible is False
         assert "input_schema_invalid" in eligibility.blockers
 
-    def test_partial_run_is_reported_as_not_independently_checkable(
-        self, comparison_factory: Any
-    ) -> None:
-        """🔴 **如实报告查不了的部分**。
+    def test_partial_run_blocks_without_being_called_corrupt(self, comparison_factory: Any) -> None:
+        """🔴 部分运行：合法，但阻塞；**不得**被误报成"指标文件坏了"。
 
-        类别的 ``total`` 来自**数据集**（含未执行的案例），而结果文件里
-        只有执行过的案例。部分运行时它无从独立复核——此时记进 notes，
-        而不是假装查过。"""
+        两件事各有各的字段：
+
+        * ``partial_run``（blocker）—— 这份结果没跑完数据集，不该拿来做差异分析；
+        * ``integrity_notes``（说明）—— 类别的 ``total`` 来自**数据集**
+          （含未执行的案例），因此这一项没能被独立复核。
+
+        把前者的后果塞进后者，或把后者升级成 ``input_metrics_mismatch``，
+        都是在把"没跑完"说成"数据损坏"。"""
         dataset = comparison_factory.dataset(["case-001", "case-002"])
         full = comparison_factory.run(dataset, {"case-001": "pass", "case-002": "pass"})
         partial = comparison_factory.revise(full, dataset, cases=full.cases[:1])
         eligibility = evaluate_comparison_eligibility(partial, partial)
-        # 部分运行**本身**不是阻塞项：它是一份合法的结果。
-        assert eligibility.comparison_eligible is True
+        assert eligibility.comparison_eligible is False
+        assert eligibility.blockers == (BLOCKER_PARTIAL_RUN,)
         comparison = compare_run_results(partial, partial)
+        assert comparison.integrity_mismatches == ()
         assert any("部分运行" in note for note in comparison.integrity_notes)

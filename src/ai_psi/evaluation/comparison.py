@@ -175,6 +175,17 @@ BLOCKER_NETWORK_POLICY_DIFFERS: Final[str] = "network_policy_differs"
 BLOCKER_METRICS_SCHEMA_DIFFERS: Final[str] = "metrics_schema_differs"
 BLOCKER_METRICS_DEFINITION_DIFFERS: Final[str] = "metrics_definition_differs"
 
+#: 🔴 **部分运行**：这份结果没有跑完数据集（``not_executed_cases > 0``）。
+#:
+#: 它既不是"数据损坏"，也不是"数据集变了"——它是一份**合法但证据不全**的
+#: 结果。单独给它一个码，是因为把它报成 ``case_set_inconsistent`` 会把
+#: 使用者引向"去查数据集是不是被改过"这个**错误方向**。
+#:
+#: 任一侧部分运行即阻塞。理由是差异表会描述一个**不同的证据基础**：
+#: 完整运行的 ``10/10`` 与部分运行的 ``5/5`` 都是 ``1.000000``，
+#: ``case_pass_rate`` 的 delta 会是 0，而一半案例根本没跑。
+BLOCKER_PARTIAL_RUN: Final[str] = "partial_run"
+
 #: 输入**自身**的完整性问题——与"两份结果之间的差异"是两回事。
 BLOCKER_INPUT_SCHEMA_INVALID: Final[str] = "input_schema_invalid"
 BLOCKER_INPUT_METRICS_MISMATCH: Final[str] = "input_metrics_mismatch"
@@ -204,6 +215,7 @@ BLOCKER_CODES: Final[tuple[str, ...]] = (
     BLOCKER_MODEL_DIFFERS,
     BLOCKER_NETWORK_POLICY_DIFFERS,
     BLOCKER_PACKAGE_VERSION_DIFFERS,
+    BLOCKER_PARTIAL_RUN,
     BLOCKER_PROMPT_VERSIONS_DIFFER,
     BLOCKER_PROVIDER_CONFIGURATION_DIFFERS,
     BLOCKER_PROVIDER_DIFFERS,
@@ -254,6 +266,10 @@ COMPARISON_DEFINITION: Final[dict[str, object]] = {
     "ordering": (
         "案例按 case_id 字典序；断言按 (case_id, 声明索引)；类别与断言名按名字字典序；"
         "分布键按枚举正式顺序、其余按字典序；列表类字段去重后按字典序"
+    ),
+    "partial_run_policy": (
+        "任一侧 not_executed_cases > 0（未跑完数据集）即阻塞："
+        "差异表会描述一个不同的证据基础，而 case_pass_rate 可能毫无变化"
     ),
     "python_version_policy": "major/minor 不同阻塞；patch 不同不阻塞",
     "ratio_delta": "delta = Decimal(candidate.value) - Decimal(baseline.value)",
@@ -1221,6 +1237,14 @@ def _integrity_problems(
     if manifest is None or metrics is None:  # pragma: no cover - 加载器已保证
         return (BLOCKER_INPUT_SCHEMA_INVALID,), (), ()
 
+    # ---- 部分运行（S5 补丁）----
+    #
+    # 🔴 判据是 ``len(cases) != manifest.dataset_case_count``，**不读**
+    # ``metrics.cases.not_executed_cases``——用被检验的那份指标去决定
+    # "这份结果跑完了没有"，等于让被检验者给自己作证。
+    if not _complete_run(result):
+        problems.add(BLOCKER_PARTIAL_RUN)
+
     # ---- 身份可用性（§九 第 17、18 项）----
     sha = manifest.code.commit_sha
     if sha is None or not _FULL_SHA.match(sha):
@@ -1287,11 +1311,22 @@ def _integrity_problems(
     for case in result.cases:
         recomputed_categories[case.category] = recomputed_categories.get(case.category, 0) + 1
 
-    if sorted(recomputed_categories) != sorted(item.category for item in metrics.categories):
+    # 🔴 已执行案例的类别必须是存储类别的**子集**，而不是**相等**。
+    #
+    # 存储的类别来自**数据集**：部分运行时，它会包含"一条都没跑"的类别
+    # （``executed == 0``、``not_executed == 该类别全部``）。而重算的类别
+    # 只能来自执行过的案例——那些类别在结果里**根本不存在**。
+    #
+    # 要求两者相等，会让**每一次部分运行**都被报成 ``input_metrics_mismatch``：
+    # 那是**对合法输入的假阳性指控**，等于告诉使用者"你的指标文件坏了"，
+    # 而真正的问题只是这次没跑完（现在由 ``partial_run`` 单独报告）。
+    stored_categories = {item.category for item in metrics.categories}
+    unaccounted = sorted(set(recomputed_categories) - stored_categories)
+    if unaccounted:
         mismatches.add("categories")
     else:
         for item in metrics.categories:
-            executed = recomputed_categories[item.category]
+            executed = recomputed_categories.get(item.category, 0)
             in_category = [case for case in result.cases if case.category == item.category]
             _expect(mismatches, f"categories.{item.category}.executed", item.executed, executed)
             passed_in = sum(1 for case in in_category if case.passed)
