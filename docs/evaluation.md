@@ -772,3 +772,186 @@ execution_error_cases + assertion_failed_cases == failed_cases   # 互斥且完�
 
 **10 个案例全过不等于系统质量达标。** 那需要 50+ 个案例、真实 Provider、
 以及有标签的评测集。本层只保证：这些数字的算法是可复算的、分母是透明的。
+
+---
+
+## 12. 可验证评测证据包（阶段 7 · S7，**已实现**）
+
+实现位置：`src/ai_psi/evaluation/evidence.py` + `evidence_cli.py`。
+
+### 它回答什么
+
+> 给定一组**声称彼此关联**的运行结果、Comparison、Policy 与 GateDecision，
+> 能否通过**内容摘要**、**结构化身份**和**重新计算**，证明它们形成一条
+> 内部一致的评测证据链？
+
+### 🔴 它不回答什么
+
+谁创建了这些文件、来自哪台机器、是否由可信主体签署；Candidate 是否允许
+部署、合并或发布；当前 10 个案例是否代表生产质量；真实 Provider 是否通过；
+证据是否满足任何外部审计法规。
+
+### 四个必须分开的概念
+
+| 概念 | 由谁回答 |
+|---|---|
+| **内容完整性** | 当前文件的**字节**是否与 Bundle 记录的摘要一致 |
+| **结构完整性** | 输入是否通过正式 Schema、角色是否各自对上 |
+| **可重算一致性** | 用正式 S5／S6 引擎重算，结果是否与输入相等 |
+| **来源真实性** | **S7 不回答** |
+
+### 🔴 SHA-256 内容摘要不是数字签名
+
+`content_sha256` 与 `bundle_digest` 都是**内容摘要**：它们能说明"这份文件
+与构建 Bundle 时的那份逐字节相同"，**不能**说明它是谁产出的，也**不能**
+阻止任何人在改了文件之后顺手重算一次摘要。
+
+**`VERIFIED` 只表示"给定文件集合内部一致且可重算"**——不表示来源可信，
+更不表示允许发布。本层因此不使用 signed / signature / authenticated /
+trusted source / attested / tamper-proof 这类措辞；用 content digest、
+integrity check、internally consistent、recomputed、verified against
+supplied bundle。
+
+### 五个证据角色
+
+闭合集合，`ArtifactRole`：
+
+| 角色 | 输入 |
+|---|---|
+| `BASELINE_RUN` | 基线运行结果（**原始**，不是 canonical） |
+| `CANDIDATE_RUN` | 候选运行结果（**原始**，不是 canonical） |
+| `COMPARISON` | S5 对比产物 |
+| `POLICY` | 版本化 `GatePolicy` |
+| `GATE_DECISION` | S6 门禁结论 |
+
+🔴 角色由 **CLI 参数显式给出**：不按文件名推断、不按目录顺序推断、
+**不自动交换**基线／候选、不自动补齐缺失的输入。
+
+### 证据链
+
+```
+baseline_run + candidate_run  --(正式 S5 引擎重算)-->  comparison
+comparison + policy           --(正式 S6 引擎重算)-->  gate_decision
+五个输入的内容摘要 + 核心身份  -->  EvaluationEvidenceBundle
+```
+
+构建前必须完成两步重算，且与输入做**完整 canonical 结构比较**——不是
+只比 `outcome`、不是只比摘要、不是只比 commit SHA。任一处不一致就
+**不产出 Bundle**，也**不输出"修正后"的产物**。
+
+### EvidenceBundle Schema
+
+```json
+{
+  "evidence_bundle_schema_version": 1,
+  "evidence_bundle_definition_digest": "sha256:...",
+  "bundle_digest": "sha256:...",
+  "artifacts": [
+    {
+      "role": "BASELINE_RUN",
+      "content_sha256": "sha256:...",
+      "byte_length": 7789,
+      "schema_identity": {"schema_version": 1},
+      "semantic_identity": {"commit_sha": "...", "dataset_digest": "sha256:..."}
+    }
+  ],
+  "chain_identity": {"baseline_commit_sha": "...", "gate_outcome": "PASS"}
+}
+```
+
+| 字段 | 含义 |
+|---|---|
+| `evidence_bundle_definition_digest` | 证据包**定义**的语义摘要（角色集合与顺序、摘要口径、重算规则、聚合规则） |
+| `bundle_digest` | 对**除它自己以外**的完整 canonical payload 取 SHA-256；**自排除**，加载时重新计算并核对 |
+| `ArtifactDescriptor` | 只记四样：角色、内容摘要、字节长度、安全的结构／语义身份 |
+| `content_sha256` | 输入文件**原始字节**的 SHA-256（不是对解析后的对象取） |
+| `byte_length` | 输入文件**原始字节**的长度 |
+
+**不记**：文件路径、绝对路径、文件名、修改时间、inode、主机名、用户名、
+当前时间、CI Run URL、随机 UUID、数据库 URL；**不嵌入**五个输入文件的
+完整内容。
+
+语义身份是**闭合**的：每个角色只出现自己那一组字段。一份满是 `null`
+的身份记录读起来像"这些字段查过了、没有值"，而不是"这些字段不属于
+这个角色"。
+
+### 验证报告
+
+`EvidenceVerificationReport`，24 项固定顺序的检查：
+
+`bundle_schema_valid` → `bundle_digest_valid` → `artifact_roles_complete` →
+`artifact_order_valid` → 五个 `*_content_digest_valid` → 五个
+`*_byte_length_valid` → 五个 `*_schema_valid` → `chain_identity_valid` →
+`baseline_role_valid` / `candidate_role_valid` →
+`comparison_recomputed_equal` → `gate_decision_recomputed_equal`。
+
+| 结论 | 含义 |
+|---|---|
+| `VERIFIED` | 全部检查通过 |
+| `INVALID` | 至少一项**确定冲突**（摘要不符、长度不符、角色不一致、重算不等…） |
+| `NOT_VERIFIABLE` | 证据不足：缺文件、不可读、契约版本不受支持、必要重算无法完成 |
+
+🔴 **`FAIL` 优先于 `NOT_EVALUATED`**：只要有一项确定冲突，结论就是
+`INVALID`，不会被"还有几项没查"稀释掉。
+
+🔴 **未执行的检查一律 `NOT_EVALUATED`**，绝不标成 `PASS`；读不出来的
+输入也绝不标成冲突——"没法判断"不是"有问题"。
+
+### Gate 结论与证据结论是两个独立的维度
+
+`gate_outcome` 可以是 `PASS` / `FAIL` / `NOT_EVALUATED`，而
+`verification_outcome` 只回答"这条链是不是内部一致的"。因此
+
+```json
+{"verification_outcome": "VERIFIED", "gate_outcome": "FAIL"}
+```
+
+是一个**合法且必要**的结果：门禁说候选没通过，证据链说那份"没通过"
+是真的、没被改过。`gate_outcome` 不参与 verify 的退出码，也不影响
+Bundle 能否构建。
+
+### CLI
+
+```bash
+uv run python -m ai_psi.evaluation.evidence_cli build \
+    --baseline-run ... --candidate-run ... --comparison ... \
+    --policy ... --gate-decision ... --bundle-output ...
+
+uv run python -m ai_psi.evaluation.evidence_cli verify \
+    --bundle ... --baseline-run ... --candidate-run ... --comparison ... \
+    --policy ... --gate-decision ... --verification-output ...
+```
+
+| 退出码 | `build` | `verify` |
+|---|---|---|
+| `0` | 构建成功（与 `gate_outcome` 无关） | `VERIFIED` |
+| `1` | —— | `INVALID` |
+| `2` | 参数错误，或输入文件不存在 | 参数错误 |
+| `3` | 输入 Schema／完整性错误 | `NOT_VERIFIABLE`（连形状都读不出来） |
+| `4` | 证据链重算不一致 | `NOT_VERIFIABLE`（证据不足） |
+| `5` | 输出写入失败 | 输出写入失败 |
+
+**没有** `--force`、`--skip-recompute`、`--trust-digests`、`--ignore-role`、
+`--allow-unknown-version` 这类开关。原子写入：要么旧内容，要么完整的新内容。
+
+### 确定性
+
+同样五个输入构建两次 → Bundle 逐字节一致；同样 Bundle 与输入验证两次 →
+报告逐字节一致。输出里没有时间戳、随机 UUID、路径、主机信息或运行耗时。
+
+### 它不碰外部世界
+
+不运行评测、不调用 Provider、不连数据库、不读网络、**不通过子进程
+驱动 S5／S6 的 CLI**——只读五个文件、跑两个纯函数
+（`compare_run_results` 与 `decide`）、再写一份 JSON。
+
+### 证据包不是什么
+
+🔴 **它不是签名、不是发布许可、不是防篡改证明。**
+
+* 不实现数字签名、密钥管理、PKI、Sigstore 或 Artifact Attestation；
+* 不打包成 ZIP/TAR、不上传、不下载、不自动部署、不自动合并、不创建 Release；
+* 不创建或修改 Git 标签；
+* 不输出 Markdown/HTML；
+* **`VERIFIED` 与"能不能上生产"没有任何关系**——本层只保证：给定这组
+  文件，它们内部一致、可重算，且不一致的地方会被如实指出来。

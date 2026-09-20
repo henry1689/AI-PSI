@@ -6,17 +6,30 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, cast
 
 import pytest
 import yaml
 
 from ai_psi.evaluation.assertions import AssertionResult, CaseObservation
-from ai_psi.evaluation.comparison import EvaluationComparison, compare_run_results
-from ai_psi.evaluation.gate import GatePolicy, policy_digest
+from ai_psi.evaluation.comparison import (
+    EvaluationComparison,
+    compare_run_results,
+    write_comparison,
+)
+from ai_psi.evaluation.evidence import EvidenceInputs, bundle_digest
+from ai_psi.evaluation.gate import (
+    GatePolicy,
+    decide,
+    load_gate_policy,
+    policy_digest,
+    write_decision,
+)
 from ai_psi.evaluation.loader import GoldenDataset
 from ai_psi.evaluation.manifest import build_manifest, storage_identity
 from ai_psi.evaluation.metrics import compute_metrics
@@ -26,6 +39,7 @@ from ai_psi.evaluation.runner import (
     ExecutionMode,
     RunResult,
 )
+from ai_psi.evaluation.serialization import dumps, write_reports
 
 
 @pytest.fixture
@@ -489,3 +503,158 @@ class GateFactory:
 def gate_factory() -> GateFactory:
     """S6 门禁夹具。"""
     return GateFactory()
+
+
+# ---------------------------------------------------------------------------
+# 阶段 7 · S7：证据链夹具
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceChainPaths:
+    """一条**已经落在磁盘上**的五文件证据链。"""
+
+    baseline_run: Path
+    candidate_run: Path
+    comparison: Path
+    policy: Path
+    gate_decision: Path
+
+    def inputs(self) -> EvidenceInputs:
+        """交给 S7 的五个角色显式输入。"""
+        return EvidenceInputs(
+            baseline_run=self.baseline_run,
+            candidate_run=self.candidate_run,
+            comparison=self.comparison,
+            policy=self.policy,
+            gate_decision=self.gate_decision,
+        )
+
+    def as_map(self) -> dict[str, Path]:
+        """角色名 → 路径，供"改一个字节"这类专项使用。"""
+        return {
+            "BASELINE_RUN": self.baseline_run,
+            "CANDIDATE_RUN": self.candidate_run,
+            "COMPARISON": self.comparison,
+            "POLICY": self.policy,
+            "GATE_DECISION": self.gate_decision,
+        }
+
+    def refresh_descriptors(self, bundle_path: Path) -> None:
+        """把证据包里五个描述符的摘要与长度**按当前文件重算**，再重算
+        ``bundle_digest``。
+
+        🔴 用途是造出"**内容摘要全对、但在别处有问题**"的场景（例如契约
+        版本不受支持）。不这样做，任何一个"文件被改过"的用例都会先撞在
+        内容摘要上，测到的就不是它想测的那一件事了。
+        """
+        payload = json.loads(bundle_path.read_text(encoding="utf-8"))
+        for descriptor, (_, path) in zip(
+            payload["artifacts"], self.inputs().by_role(), strict=True
+        ):
+            data = path.read_bytes()
+            descriptor["content_sha256"] = f"sha256:{hashlib.sha256(data).hexdigest()}"
+            descriptor["byte_length"] = len(data)
+        payload["bundle_digest"] = bundle_digest(payload)
+        bundle_path.write_text(dumps(payload), encoding="utf-8", newline="\n")
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceChainFactory:
+    """把一条**自洽**的五文件证据链写到磁盘上。
+
+    🔴 纪律：五份产物全部由**正式模型**构造、由**正式写出函数**落盘，
+    不手拼 JSON 字符串——否则测的就成了"两份手写的 JSON 相不相等"，
+    与 S7 一点关系都没有。
+
+    🔴 策略与门禁结论是**真的算出来的**：策略先落盘再用
+    :func:`~ai_psi.evaluation.gate.load_gate_policy` 读回来（顺带证明
+    那份文件是一份合法策略），结论由 :func:`~ai_psi.evaluation.gate.decide`
+    产出。这样"重算一致"才有东西可测。
+    """
+
+    def write(
+        self,
+        directory: Path,
+        *,
+        baseline_outcomes: Mapping[str, Outcome] | None = None,
+        candidate_outcomes: Mapping[str, Outcome] | None = None,
+        same_commit: bool = False,
+        policy_scope: Mapping[str, object] | None = None,
+    ) -> EvidenceChainPaths:
+        """构造并落盘一条证据链。
+
+        Args:
+            directory: 输出目录。
+            baseline_outcomes: 基线一侧的案例处置。
+            candidate_outcomes: 候选一侧的案例处置；不给则与基线相同
+                （自比较，门禁判 ``PASS``）。
+            same_commit: 两侧是否使用**同一个**提交号。默认为否——用两个
+                可区分的合成 SHA，让"角色交换"真的能被测出来。
+            policy_scope: 覆盖策略 scope 的若干项（并重算 ``policy_digest``）。
+                用来造出"策略不适用 ⇒ 门禁 ``NOT_EVALUATED``"但仍**自洽**
+                的链——结论照旧由 ``decide`` 算出来，不是手填的。
+
+        Returns:
+            五个文件的路径。
+        """
+        runs = ComparisonFactory()
+        gate = GateFactory()
+        baseline_cases: Mapping[str, Outcome] = baseline_outcomes or {
+            "case-001": "pass",
+            "case-002": "pass",
+        }
+        candidate_cases: Mapping[str, Outcome] = candidate_outcomes or dict(baseline_cases)
+
+        dataset = runs.dataset(sorted(baseline_cases))
+        baseline = runs.run(dataset, baseline_cases, commit_sha=SHA_A)
+        candidate = runs.run(dataset, candidate_cases, commit_sha=SHA_A if same_commit else SHA_B)
+        comparison = compare_run_results(baseline, candidate)
+
+        directory.mkdir(parents=True, exist_ok=True)
+        baseline_path = directory / "baseline-run.json"
+        candidate_path = directory / "candidate-run.json"
+        write_reports(
+            baseline,
+            raw_path=baseline_path,
+            canonical_path=directory / "baseline-canonical.json",
+        )
+        write_reports(
+            candidate,
+            raw_path=candidate_path,
+            canonical_path=directory / "candidate-canonical.json",
+        )
+
+        comparison_path = directory / "comparison.json"
+        write_comparison(comparison, comparison_path)
+
+        policy_payload = gate.policy_payload(comparison)
+        if policy_scope is not None:
+            scope = dict(cast("dict[str, object]", policy_payload["scope"]))
+            scope.update(policy_scope)
+            policy_payload["scope"] = scope
+            policy_payload["policy_digest"] = policy_digest(policy_payload)
+
+        policy_path = directory / "policy.json"
+        policy_path.write_text(
+            json.dumps(policy_payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        decision_path = directory / "gate-decision.json"
+        write_decision(decide(comparison, load_gate_policy(policy_path)), decision_path)
+
+        return EvidenceChainPaths(
+            baseline_run=baseline_path,
+            candidate_run=candidate_path,
+            comparison=comparison_path,
+            policy=policy_path,
+            gate_decision=decision_path,
+        )
+
+
+@pytest.fixture
+def evidence_chain_factory() -> EvidenceChainFactory:
+    """S7 证据链夹具。"""
+    return EvidenceChainFactory()

@@ -66,6 +66,7 @@ __all__ = [
     "APPLICABILITY_REASONS",
     "EVIDENCE_KINDS",
     "GATE_DECISION_SCHEMA_VERSION",
+    "GATE_DECISION_TOP_LEVEL_FIELDS",
     "POLICY_SCHEMA_VERSION",
     "ApplicabilityReason",
     "EvidenceKey",
@@ -73,6 +74,7 @@ __all__ = [
     "ExpectedEvidence",
     "GateDecision",
     "GateDecisionIdentity",
+    "GateDecisionInputError",
     "GateOutcome",
     "GatePolicy",
     "ObservedEvidence",
@@ -92,7 +94,9 @@ __all__ = [
     "decide",
     "evaluate_policy_applicability",
     "gate_definition_digest",
+    "load_gate_decision",
     "load_gate_policy",
+    "parse_gate_decision",
     "policy_digest",
     "write_decision",
 ]
@@ -907,6 +911,116 @@ def _first_error(exc: ValidationError) -> str:
     # 模型级校验器的 ``loc`` 是空的，用 ``policy`` 占位免得显示成 ": ..."。
     location = ".".join(str(part) for part in first.get("loc", ())) or "policy"
     return f"{location}: {first.get('msg', 'unknown')}"
+
+
+#: ``GateDecision`` JSON 的顶层字段。**与模型一一对应**。
+GATE_DECISION_TOP_LEVEL_FIELDS: Final[tuple[str, ...]] = (
+    "applicability_reasons",
+    "failed_rule_ids",
+    "gate_decision_schema_version",
+    "gate_definition_digest",
+    "identity",
+    "not_evaluated_rule_ids",
+    "outcome",
+    "policy_applicable",
+    "rule_results",
+)
+
+
+class GateDecisionInputError(ValueError):
+    """一份门禁结论**读不出来**或结构不合法。
+
+    ⚠️ 它与 :class:`PolicyInputError` **分开**：读不出结论和读不出策略是
+    两件事，报告里要能说清是哪一份坏了。
+    """
+
+
+def parse_gate_decision(payload: dict[str, Any]) -> GateDecision:
+    """把一份门禁结论 payload 还原成 :class:`GateDecision`。
+
+    🔴 **顶层字段必须恰好是** :data:`GATE_DECISION_TOP_LEVEL_FIELDS` 那个集合：
+    多一个少一个都拒绝。多出来的字段意味着这份产物产自另一个结构版本，
+    而"忽略不认识的东西"正是让版本漂移静默发生的方式。
+
+    ⚠️ 这里**不重建**任何语义：``GateDecision`` 自身的不变量
+    （``failed_rule_ids`` 与规则结论一致、``PASS`` 要求全部规则通过、
+    不适用时不得评估任何质量规则……）由模型在构造时全部重跑一遍。
+
+    Args:
+        payload: 已解析的 JSON 对象。
+
+    Returns:
+        还原后的门禁结论。
+
+    Raises:
+        GateDecisionInputError: 字段集合不对。
+        pydantic.ValidationError: 字段值不合法，或违反模型不变量。
+    """
+    unknown = sorted(set(payload) - set(GATE_DECISION_TOP_LEVEL_FIELDS))
+    missing = sorted(set(GATE_DECISION_TOP_LEVEL_FIELDS) - set(payload))
+    if unknown or missing:
+        msg = (
+            f"门禁结论顶层字段不符合本版本的格式"
+            f"（多出：{unknown or '无'}；缺少：{missing or '无'}）"
+        )
+        raise GateDecisionInputError(msg)
+    return GateDecision.model_validate(payload)
+
+
+def load_gate_decision(path: Path) -> GateDecision:
+    """严格加载一份门禁结论。
+
+    与 :func:`load_gate_policy` 同一套纪律：UTF-8 → JSON（拒绝
+    NaN/Infinity 与重复的键）→ 顶层字段 → 逐层模型。
+
+    ⚠️ 它**不**重算结论，也**不**判断这份结论对不对——它只回答
+    "这份文件是不是一份结构合法的 GateDecision"。重算属于
+    :mod:`ai_psi.evaluation.evidence` 的职责。
+
+    Args:
+        path: 门禁结论路径。
+
+    Returns:
+        已通过结构校验的门禁结论。
+
+    Raises:
+        GateDecisionInputError: 读不了、不是 UTF-8、JSON 损坏、含
+            NaN/Infinity、有重复的键、顶层字段不对，或违反模型不变量。
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        msg = "不是合法的 UTF-8 文本"
+        raise GateDecisionInputError(msg) from exc
+    except OSError as exc:
+        msg = f"读取失败（{type(exc).__name__}）"
+        raise GateDecisionInputError(msg) from exc
+
+    try:
+        payload = json.loads(
+            text,
+            parse_constant=_reject_constant,
+            object_pairs_hook=_reject_duplicate_keys,
+        )
+    except json.JSONDecodeError as exc:
+        # 🔴 被截断的 JSON 走的就是这条路。
+        msg = f"JSON 解析失败（第 {exc.lineno} 行第 {exc.colno} 列）"
+        raise GateDecisionInputError(msg) from exc
+    except PolicyInputError as exc:
+        # 共用的两个 hook 抛的是策略侧的输入错误类型，这里换成结论侧的。
+        raise GateDecisionInputError(str(exc)) from exc
+
+    if not isinstance(payload, dict):
+        msg = f"顶层必须是对象，实际是 {type(payload).__name__}"
+        raise GateDecisionInputError(msg)
+
+    try:
+        return parse_gate_decision(payload)
+    except GateDecisionInputError:
+        raise
+    except ValidationError as exc:
+        msg = f"门禁结论结构校验失败：{exc.error_count()} 处（第一处：{_first_error(exc)}）"
+        raise GateDecisionInputError(msg) from exc
 
 
 # ---------------------------------------------------------------------------
