@@ -94,6 +94,7 @@ __all__ = [
     "ALLOWED_DIFFERENCE_CODES",
     "BLOCKER_CODES",
     "COMPARISON_SCHEMA_VERSION",
+    "COMPARISON_TOP_LEVEL_FIELDS",
     "DELTA_PRECISION",
     "AssertionGroupDelta",
     "AssertionNameDelta",
@@ -122,7 +123,9 @@ __all__ = [
     "compare_run_results",
     "comparison_definition_digest",
     "evaluate_comparison_eligibility",
+    "load_comparison",
     "load_run_result",
+    "parse_comparison",
     "write_comparison",
 ]
 
@@ -140,6 +143,32 @@ DELTA_DIRECTION: Final[str] = "candidate - baseline"
 
 #: 完整 Git SHA 的形状。40 位十六进制——**不接受短 SHA**。
 _FULL_SHA: Final[re.Pattern[str]] = re.compile(r"^[0-9a-fA-F]{40}$")
+
+#: 对比产物 payload 的顶层字段。**与 :func:`write_comparison` 同源**——
+#: 读写各写一份字段表，就会出现"加了字段但只有写的那边知道"。
+COMPARISON_TOP_LEVEL_FIELDS: Final[tuple[str, ...]] = (
+    "added_assertion_keys",
+    "added_case_ids",
+    "allowed_differences",
+    "assertion_transition_summary",
+    "assertion_transitions",
+    "baseline",
+    "blockers",
+    "candidate",
+    "case_transition_summary",
+    "case_transitions",
+    "comparison_definition_digest",
+    "comparison_eligible",
+    "comparison_schema_version",
+    "distribution_deltas",
+    "failure_index_delta",
+    "integrity_mismatches",
+    "integrity_notes",
+    "manifest_identity_equal",
+    "metrics_comparison",
+    "removed_assertion_keys",
+    "removed_case_ids",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -2097,6 +2126,85 @@ def compare_run_results(baseline: RunResult, candidate: RunResult) -> Evaluation
         assertion_transition_summary=_assertion_transition_summary(assertion_transitions),
         **kwargs,
     )
+
+
+def parse_comparison(payload: dict[str, Any]) -> EvaluationComparison:
+    """把一份对比产物 payload 还原成 :class:`EvaluationComparison`。
+
+    🔴 **顶层字段必须恰好是** :data:`COMPARISON_TOP_LEVEL_FIELDS` 那个集合：
+    多一个少一个都拒绝。多出来的字段意味着这份产物产自另一个结构版本，
+    而"忽略不认识的东西"正是让版本漂移静默发生的方式。
+
+    ⚠️ 这里**不重建**任何语义：``EvaluationComparison`` 自身的不变量
+    （``comparison_eligible`` ⇔ 五组差异结构是否为空、``blockers`` 是否排序、
+    转换类型与双方判定是否一致……）由模型在构造时全部重跑一遍。
+    读取端能做的最强保证就是"这份 payload 只有一种读法"，
+    再往前一步就成了替写入方猜它想说什么。
+
+    Args:
+        payload: 已解析的 JSON 对象。
+
+    Returns:
+        还原后的对比产物。
+
+    Raises:
+        ComparisonInputError: 字段集合不对。
+        pydantic.ValidationError: 字段值不合法，或违反模型不变量。
+    """
+    unknown = sorted(set(payload) - set(COMPARISON_TOP_LEVEL_FIELDS))
+    missing = sorted(set(COMPARISON_TOP_LEVEL_FIELDS) - set(payload))
+    if unknown or missing:
+        msg = (
+            f"对比产物顶层字段不符合本版本的格式"
+            f"（多出：{unknown or '无'}；缺少：{missing or '无'}）"
+        )
+        raise ComparisonInputError(msg)
+    return EvaluationComparison.model_validate(payload)
+
+
+def load_comparison(path: Path) -> EvaluationComparison:
+    """严格加载一份对比产物。
+
+    与 :func:`~ai_psi.evaluation.comparison.load_run_result` 同一套纪律：
+    UTF-8 → JSON（含 NaN/Infinity 拒绝）→ 顶层字段 → 逐层模型。
+
+    Args:
+        path: 对比产物路径。
+
+    Returns:
+        已通过结构校验的对比产物。
+
+    Raises:
+        ComparisonInputError: 读不了、不是 UTF-8、JSON 损坏、含 NaN/Infinity、
+            顶层字段不对、或违反模型不变量。
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        msg = "不是合法的 UTF-8 文本"
+        raise ComparisonInputError(msg) from exc
+    except OSError as exc:
+        msg = f"读取失败（{type(exc).__name__}）"
+        raise ComparisonInputError(msg) from exc
+
+    try:
+        payload = json.loads(text, parse_constant=_reject_constant)
+    except json.JSONDecodeError as exc:
+        # 🔴 被截断的 JSON 走的就是这条路。
+        msg = f"JSON 解析失败（第 {exc.lineno} 行第 {exc.colno} 列）"
+        raise ComparisonInputError(msg) from exc
+
+    if not isinstance(payload, dict):
+        msg = f"顶层必须是对象，实际是 {type(payload).__name__}"
+        raise ComparisonInputError(msg)
+
+    try:
+        return parse_comparison(payload)
+    except ComparisonInputError:
+        raise
+    except ValidationError as exc:
+        msg = f"对比产物结构校验失败：{exc.error_count()} 处（第一处：{_first_error(exc)}）"
+        raise ComparisonInputError(msg) from exc
 
 
 def write_comparison(comparison: EvaluationComparison, path: Path) -> None:

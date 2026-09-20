@@ -485,6 +485,170 @@ secret、`response_text`、Prompt 正文。同样两份输入跑两次，产物*
 
 ---
 
+## 11. 结构化质量门禁（阶段 7 · S6，**已实现**）
+
+实现位置：`src/ai_psi/evaluation/gate.py`（引擎）、
+`src/ai_psi/evaluation/gate_cli.py`（命令行）、
+`evals/policies/s6_mock_golden_v1.json`（首个策略，**进 Git**）。
+
+### 它是什么
+
+一份**评测门禁**，不是发布系统。它回答："对于一份合法、完整、可比较、
+且落在某个明确策略作用域内的 S5 对比，它是否满足该策略定义的规则？"
+
+### 三个必须分开的概念
+
+| 概念 | 由谁决定 | 回答什么 |
+|---|---|---|
+| `comparison_eligible` | **S5** | 两份结果能不能做受控结构化比较 |
+| `policy_applicable` | **S6** | 这份策略**管不管**这类评测 |
+| `outcome` | **S6** | **且只在前两者都成立之后**才判定 |
+
+把它们混起来会得到最糟的那种工具：一个"因为没法判断所以判失败"的门禁，
+或者一个"策略根本不管这个数据集却给了通过"的门禁。
+
+### `PASS` / `FAIL` / `NOT_EVALUATED`
+
+| 结论 | 含义 |
+|---|---|
+| `PASS` | 可比较、适用，且**全部**规则通过 |
+| `FAIL` | 可比较、适用，且**至少一条**规则明确失败 |
+| `NOT_EVALUATED` | 不可比较 / 策略不适用 / 证据缺失 / 无法完整评估 |
+
+🔴 **`PASS` 不是生产发布许可。** 它只表示"Candidate 没有违反当前这份策略
+对当前这个固定评测作用域定义的规则"。它**不**表示：可以部署、可以合并、
+可以创建 release、已通过安全或人工评审、模型总体质量已提高、
+10 个案例具有统计代表性。
+
+`GateDecision` 里**不存在** `release_allowed` / `deploy_allowed` /
+`merge_allowed` / `production_ready` / `recommendation` / `quality_score` /
+`risk_score` / `confidence_score` / `generated_at`——模型一律
+`extra="forbid"`，多写一个就是校验失败。
+
+### 契约身份
+
+| 项 | 值 |
+|---|---|
+| `gate_decision_schema_version` | `1` |
+| `gate_definition_digest` | SHA-256，覆盖聚合算法、适用性规则、规则类型表、缺失证据处置、Decimal 规则、排序规则 |
+| `policy_schema_version` | `1` |
+| `policy_digest` | 由**除它自己以外**的全部策略字段算出 |
+
+> 🔴 `policy_digest` **不是人工填的常量**：改一条规则、改一个 scope 字段、
+> 甚至改一句 `description` 都会让它变。加载时**重算并比对**，不符即拒绝。
+> 摘要排在字段校验之前——一份内容被改过、摘要却没跟上的策略，应当以
+> "这不是它自称的那份"被拒绝。
+
+### 作用域绑定（scope binding）
+
+策略通过 `scope` 与 `supported_comparison_contract` 把自己**钉死**在一类评测上：
+数据集摘要与案例数、断言注册表摘要、Prompt 摘要、Provider、模型、
+Provider 配置摘要、执行模式、存储后端、Alembic 修订、指标 schema 与定义摘要、
+对比 schema 与定义摘要。
+
+**任何一个字段对不上 → `policy_applicable=false` → `NOT_EVALUATED`**，
+并且**一条质量规则都不评估**。
+
+🔴 **不得判成 `FAIL`**：那是拿"规则不适用"去指控候选。
+
+首个策略 `s6_mock_golden_v1` 只适用于：固定的 10 案例 Mock Golden 数据集、
+当前断言注册表、当前 Prompt 身份、`mock` / `mock-model-v1`、
+当前 Provider 配置、`in_memory` 执行模式、`memory` 存储后端、
+当前 Metrics 与 Comparison 契约。它**不是**万能策略。
+
+### 首个策略的 14 条规则
+
+**相对回归证据**（6 条）：
+
+| rule_id | 证据 | 通过条件 |
+|---|---|---|
+| `no_case_regressions` | `case.regression_transition_count` | `= 0` |
+| `no_assertion_regressions` | `assertion.regression_transition_count` | `= 0` |
+| `no_unresolved_assertion_changes` | `assertion.changed_unresolved_count` | `= 0` |
+| `no_newly_failed_cases` | `failure.newly_failed_case_ids` | 集合为空 |
+| `no_new_execution_errors` | `failure.newly_execution_error_case_ids` | 集合为空 |
+| `no_new_unobservable_cases` | `failure.newly_unobservable_case_ids` | 集合为空 |
+
+**Candidate 绝对状态**（8 条）：
+
+| rule_id | 证据 | 通过条件 |
+|---|---|---|
+| `candidate_case_pass_rate_full` | `candidate.case_pass_rate` | `= 1.000000`，分子=分母，分母=`dataset_case_count` |
+| `candidate_execution_coverage_full` | `candidate.execution_coverage` | 同上 |
+| `candidate_assertion_pass_rate_full` | `candidate.assertion_pass_rate` | `= 1.000000`，分子=分母，分母=`expected_assertion_count` |
+| `candidate_observation_coverage_full` | `candidate.observation_coverage` | 同上 |
+| `candidate_execution_error_cases_zero` | `candidate.execution_error_cases` | `= 0` |
+| `candidate_not_executed_cases_zero` | `candidate.not_executed_cases` | `= 0` |
+| `candidate_failed_assertions_zero` | `candidate.failed_assertions` | `= 0` |
+| `candidate_unobservable_assertions_zero` | `candidate.unobservable_assertions` | `= 0` |
+
+🔴 **两类都必须有。** 只比相对差异，会把"Baseline 本来就很差、Candidate
+只是少差一点"判成通过；只比 Candidate 绝对值，又看不出它比基线退步了什么。
+
+**所有规则都是必需规则**：没有权重、没有投票、没有"通过 80% 即可"、
+没有动态阈值、没有 warning-only 绕过、没有规则可以被关闭。
+
+### Decimal 阈值
+
+比率阈值是**固定 6 位小数的字符串**（如 `"1.000000"`），比较走标准库
+`Decimal`。🔴 策略里写浮点数（`1.0`）会被**拒绝**，而且规则**不只比
+`value`**：还要求分子等于分母、分母大于 0、且分母对齐作用域里的具名计数。
+
+> `5/5` 与 `10/10` 的 `value` 都是 `1.000000`——只比 value 会漏掉
+> "分母悄悄缩小了"。
+
+### 缺失证据
+
+证据取不到时，该规则为 `NOT_EVALUATED`（原因 `evidence_unavailable`），
+整体结论为 `NOT_EVALUATED`。
+
+🔴 **绝不把缺失证据当成 0**——在一条期望值为 0 的规则上，那会让它**通过**。
+也**绝不把未评估的规则当成通过**。观测值本身是显式标记为
+`unavailable` 的，而不是"某个字段恰好是 `None`"。
+
+### GateDecision JSON
+
+确定：同一份对比 + 同一份策略跑两次，产物**逐字节一致**。UTF-8、键排序、
+缩进固定、结尾恰好一个换行；无时间戳、无随机 UUID、无绝对路径、无数据库
+名或 URL、无 secret、无 `response_text`、无 Prompt 正文、无异常堆栈。
+写入是**原子**的（先写临时文件再 `os.replace`）——半截的结论比没有结论更危险。
+
+产物里带一个 `comparison_fingerprint`（对比内容摘要）。⚠️ 它只是"同一份对比"
+的标识，**不是签名**，也不证明来源可信。
+
+### CLI
+
+```bash
+uv run python -m ai_psi.evaluation.gate_cli \
+  --comparison evals/reports/s5-comparison-1.json \
+  --policy evals/policies/s6_mock_golden_v1.json \
+  --decision-output evals/reports/s6-decision-1.json
+```
+
+三个参数**都必填**。不找"最新"的文件、不按文件名猜策略、不自动修改策略。
+
+| 码 | 含义 |
+|---|---|
+| `0` | `outcome=PASS` |
+| `1` | `outcome=FAIL`（**结论**，不是故障） |
+| `2` | 参数或输入文件错误 |
+| `3` | Comparison / Policy 的 Schema 或完整性错误——**不写** GateDecision |
+| `4` | `outcome=NOT_EVALUATED` |
+| `5` | 输出写入失败 |
+
+🔴 输入解析失败时**不产生伪 GateDecision**：把一份坏策略判成 `FAIL`，
+等于拿使用者的策略错误去指控候选。
+
+### 本层不做什么
+
+不调用真实 Provider；不运行评测；不运行 `compare`；不连数据库；不读网络；
+不部署、不合并、不发布、不打标签；不输出 Markdown/HTML；不做人工审批。
+
+**当前 10 个案例不代表生产质量。** 本层只保证：给定这份策略与这份对比，
+结论是可复算的、适用范围是写明的、缺失证据不会被当成通过。
+
+---
+
 ## 9. 指标层（阶段 7 · S4，**已实现**）
 
 > ⚠️ 本节说的指标与 §2 的**不是同一回事**。§2 列的是**系统质量指标**

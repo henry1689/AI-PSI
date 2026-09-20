@@ -15,6 +15,8 @@ import pytest
 import yaml
 
 from ai_psi.evaluation.assertions import AssertionResult, CaseObservation
+from ai_psi.evaluation.comparison import EvaluationComparison, compare_run_results
+from ai_psi.evaluation.gate import GatePolicy, policy_digest
 from ai_psi.evaluation.loader import GoldenDataset
 from ai_psi.evaluation.manifest import build_manifest, storage_identity
 from ai_psi.evaluation.metrics import compute_metrics
@@ -347,3 +349,143 @@ class ComparisonFactory:
 def comparison_factory() -> ComparisonFactory:
     """S5 对比夹具。"""
     return ComparisonFactory()
+
+
+# ---------------------------------------------------------------------------
+# 阶段 7 · S6：门禁夹具
+# ---------------------------------------------------------------------------
+
+
+def _rule_examples() -> list[dict[str, object]]:
+    """四种规则类型各一条，够测聚合与逐类判定。
+
+    ⚠️ 它与 ``evals/policies/s6_mock_golden_v1.json`` **不是同一份**：
+    那份是真实契约（测试里直接加载它），这份只是让单元测试不必重复
+    14 条规则的样板。
+    """
+    return [
+        {
+            "rule_id": "no_case_regressions",
+            "rule_type": "transition_count_equals",
+            "description": "no case may regress",
+            "evidence_key": "case.regression_transition_count",
+            "operator": "EQ",
+            "expected": 0,
+        },
+        {
+            "rule_id": "no_newly_failed_cases",
+            "rule_type": "id_set_empty",
+            "description": "no newly failed cases",
+            "evidence_key": "failure.newly_failed_case_ids",
+            "operator": "EMPTY",
+        },
+        {
+            "rule_id": "candidate_case_pass_rate_full",
+            "rule_type": "ratio_equals",
+            "description": "candidate passes every executed case",
+            "evidence_key": "candidate.case_pass_rate",
+            "operator": "EQ",
+            "expected": {
+                "value": "1.000000",
+                "numerator_equals_denominator": True,
+                "denominator_gt_zero": True,
+                "denominator_ref": "dataset_case_count",
+            },
+        },
+        {
+            "rule_id": "candidate_failed_assertions_zero",
+            "rule_type": "count_equals",
+            "description": "no failed assertions",
+            "evidence_key": "candidate.failed_assertions",
+            "operator": "EQ",
+            "expected": 0,
+        },
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class GateFactory:
+    """构造与某份对比**匹配**的策略。
+
+    🔴 scope 的值全部取自对比里**已验证的双方身份**，一个都不硬编码——
+    否则夹具会与真实契约漂移，测试就变成了在测自己写的那串常量。
+    """
+
+    def policy_payload(
+        self, comparison: EvaluationComparison, **overrides: object
+    ) -> dict[str, object]:
+        """构造策略 payload（``policy_digest`` 按内容算出）。
+
+        Args:
+            comparison: 用来对齐作用域的对比产物。
+            **overrides: 覆盖顶层字段（如 ``rules``、``policy_id``）。
+                要改 scope 就传 ``scope={...}``，**整块替换**。
+        """
+        side = comparison.baseline
+        metrics = comparison.metrics_comparison
+        assertion_count = 0 if metrics is None else metrics.assertions_overall.total.candidate
+        scope: dict[str, object] = {
+            "dataset_digest": side.dataset_digest,
+            "dataset_case_count": side.dataset_case_count,
+            "expected_assertion_count": max(assertion_count, 1),
+            "assertion_registry_digest": side.assertion_registry_digest,
+            "prompt_digest": side.prompt_versions_digest,
+            "provider": side.provider_name,
+            "model": side.model_id,
+            "provider_configuration_digest": side.provider_configuration_digest,
+            "execution_mode": side.result_execution_mode,
+            "storage_backend": side.storage_backend,
+            "migration_revision": side.alembic_revision,
+            "metrics_schema_version": side.metrics_schema_version,
+            "metrics_definition_digest": side.metrics_definition_digest,
+        }
+        contract: dict[str, object] = {
+            "comparison_schema_version": comparison.comparison_schema_version,
+            "comparison_definition_digest": comparison.comparison_definition_digest,
+        }
+        payload: dict[str, object] = {
+            "policy_schema_version": 1,
+            "policy_id": "test_gate",
+            "policy_revision": 1,
+            "display_name": "Test Gate",
+            "purpose": "Unit-test policy for the structured gate",
+            "scope": scope,
+            "supported_comparison_contract": contract,
+            "rules": _rule_examples(),
+        }
+        payload.update(overrides)
+        payload["policy_digest"] = policy_digest(payload)
+        return payload
+
+    def policy(self, comparison: EvaluationComparison, **overrides: object) -> GatePolicy:
+        """构造并校验一份策略（用于进程内测试）。"""
+        return GatePolicy.model_validate(self.policy_payload(comparison, **overrides))
+
+    def comparison(self, outcomes: Mapping[str, Outcome]) -> EvaluationComparison:
+        """由一组案例处置造出一份**可比较**的对比（两侧同一份结果）。"""
+        runs = ComparisonFactory()
+        dataset = runs.dataset(sorted(outcomes))
+        result = runs.run(dataset, outcomes)
+        return compare_run_results(result, result)
+
+    def comparison_between(
+        self,
+        baseline_outcomes: Mapping[str, Outcome],
+        candidate_outcomes: Mapping[str, Outcome],
+    ) -> EvaluationComparison:
+        """造一份**两侧不同**的对比（同一个数据集、两个不同提交）。
+
+        ⚠️ 两份结果必须共用同一个数据集，否则 ``dataset_digest`` 不同、
+        S5 会直接判不可比较，测的就不是门禁了。
+        """
+        runs = ComparisonFactory()
+        dataset = runs.dataset(sorted(baseline_outcomes))
+        baseline = runs.run(dataset, baseline_outcomes, commit_sha=SHA_A)
+        candidate = runs.run(dataset, candidate_outcomes, commit_sha=SHA_B)
+        return compare_run_results(baseline, candidate)
+
+
+@pytest.fixture
+def gate_factory() -> GateFactory:
+    """S6 门禁夹具。"""
+    return GateFactory()

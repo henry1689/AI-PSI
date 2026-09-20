@@ -1,0 +1,158 @@
+{
+  "display_name": "S6 Mock Golden Candidate Gate",
+  "policy_digest": "sha256:fbb5754cf37b8d1588e2ef447f397e96b2def4553a4d9072f91966a2e3475686",
+  "policy_id": "s6_mock_golden",
+  "policy_revision": 1,
+  "policy_schema_version": 1,
+  "purpose": "Evaluate candidate conformance against the fixed mock golden suite (evaluation gate, not a production release gate)",
+  "rules": [
+    {
+      "description": "No case may move from passing to failing.",
+      "evidence_key": "case.regression_transition_count",
+      "expected": 0,
+      "operator": "EQ",
+      "rule_id": "no_case_regressions",
+      "rule_type": "transition_count_equals"
+    },
+    {
+      "description": "No assertion may move from passing to failing or to unobservable.",
+      "evidence_key": "assertion.regression_transition_count",
+      "expected": 0,
+      "operator": "EQ",
+      "rule_id": "no_assertion_regressions",
+      "rule_type": "transition_count_equals"
+    },
+    {
+      "description": "No assertion may move between failed and unobservable.",
+      "evidence_key": "assertion.changed_unresolved_count",
+      "expected": 0,
+      "operator": "EQ",
+      "rule_id": "no_unresolved_assertion_changes",
+      "rule_type": "transition_count_equals"
+    },
+    {
+      "description": "The candidate must not introduce cases that fail.",
+      "evidence_key": "failure.newly_failed_case_ids",
+      "operator": "EMPTY",
+      "rule_id": "no_newly_failed_cases",
+      "rule_type": "id_set_empty"
+    },
+    {
+      "description": "The candidate must not introduce cases that fail to execute.",
+      "evidence_key": "failure.newly_execution_error_case_ids",
+      "operator": "EMPTY",
+      "rule_id": "no_new_execution_errors",
+      "rule_type": "id_set_empty"
+    },
+    {
+      "description": "The candidate must not introduce cases with unobservable assertions.",
+      "evidence_key": "failure.newly_unobservable_case_ids",
+      "operator": "EMPTY",
+      "rule_id": "no_new_unobservable_cases",
+      "rule_type": "id_set_empty"
+    },
+    {
+      "description": "Every executed case must pass, and all dataset cases must have executed.",
+      "evidence_key": "candidate.case_pass_rate",
+      "expected": {
+        "denominator_gt_zero": true,
+        "denominator_ref": "dataset_case_count",
+        "numerator_equals_denominator": true,
+        "value": "1.000000"
+      },
+      "operator": "EQ",
+      "rule_id": "candidate_case_pass_rate_full",
+      "rule_type": "ratio_equals"
+    },
+    {
+      "description": "All dataset cases must have been executed.",
+      "evidence_key": "candidate.execution_coverage",
+      "expected": {
+        "denominator_gt_zero": true,
+        "denominator_ref": "dataset_case_count",
+        "numerator_equals_denominator": true,
+        "value": "1.000000"
+      },
+      "operator": "EQ",
+      "rule_id": "candidate_execution_coverage_full",
+      "rule_type": "ratio_equals"
+    },
+    {
+      "description": "Every evaluated assertion must pass.",
+      "evidence_key": "candidate.assertion_pass_rate",
+      "expected": {
+        "denominator_gt_zero": true,
+        "denominator_ref": "expected_assertion_count",
+        "numerator_equals_denominator": true,
+        "value": "1.000000"
+      },
+      "operator": "EQ",
+      "rule_id": "candidate_assertion_pass_rate_full",
+      "rule_type": "ratio_equals"
+    },
+    {
+      "description": "Every assertion must be observable.",
+      "evidence_key": "candidate.observation_coverage",
+      "expected": {
+        "denominator_gt_zero": true,
+        "denominator_ref": "expected_assertion_count",
+        "numerator_equals_denominator": true,
+        "value": "1.000000"
+      },
+      "operator": "EQ",
+      "rule_id": "candidate_observation_coverage_full",
+      "rule_type": "ratio_equals"
+    },
+    {
+      "description": "No executed case may fail with an execution error.",
+      "evidence_key": "candidate.execution_error_cases",
+      "expected": 0,
+      "operator": "EQ",
+      "rule_id": "candidate_execution_error_cases_zero",
+      "rule_type": "count_equals"
+    },
+    {
+      "description": "No dataset case may be left unexecuted.",
+      "evidence_key": "candidate.not_executed_cases",
+      "expected": 0,
+      "operator": "EQ",
+      "rule_id": "candidate_not_executed_cases_zero",
+      "rule_type": "count_equals"
+    },
+    {
+      "description": "No evaluated assertion may fail.",
+      "evidence_key": "candidate.failed_assertions",
+      "expected": 0,
+      "operator": "EQ",
+      "rule_id": "candidate_failed_assertions_zero",
+      "rule_type": "count_equals"
+    },
+    {
+      "description": "No assertion may be unobservable.",
+      "evidence_key": "candidate.unobservable_assertions",
+      "expected": 0,
+      "operator": "EQ",
+      "rule_id": "candidate_unobservable_assertions_zero",
+      "rule_type": "count_equals"
+    }
+  ],
+  "scope": {
+    "assertion_registry_digest": "sha256:9b203c0c730fa10be6fdd145e756ac4c4ff2bf43c738ca95c3f39ffa8cb6ed51",
+    "dataset_case_count": 10,
+    "dataset_digest": "sha256:870d1f3209f9445fef301682d36b3ccac6e9cb59563049aa6e8d8c58f2cc516a",
+    "execution_mode": "in_memory",
+    "expected_assertion_count": 65,
+    "metrics_definition_digest": "sha256:be4bcdd8fb016529db2cb411a514670b6a88ebb8f2af0dd925b102d89ce43905",
+    "metrics_schema_version": 1,
+    "migration_revision": null,
+    "model": "mock-model-v1",
+    "prompt_digest": "sha256:26382e5e724d4da7e4d1bec497845cf4d19ad36fcce522039d158462ad2adb0b",
+    "provider": "mock",
+    "provider_configuration_digest": "sha256:d3b1101d8306e2ea9a5853b81631a84f6333e990de9edc8a8565edf8c9eae3c6",
+    "storage_backend": "memory"
+  },
+  "supported_comparison_contract": {
+    "comparison_definition_digest": "sha256:63b100d5615d9455538fc65b1ae6a8423231ac2141663a772e0fceaff14e1bcf",
+    "comparison_schema_version": 1
+  }
+}
