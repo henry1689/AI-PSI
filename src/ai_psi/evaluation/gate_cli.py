@@ -155,7 +155,13 @@ def _report(decision: GateDecision, comparison_path: str, policy_path: str) -> N
     print(f"结论    ：{outcome}")
     if outcome is GateOutcome.NOT_EVALUATED:
         # ⚠️ 这句话很重要：NOT_EVALUATED 既不是「没通过」，也不是「通过」。
-        print("  ⚠️ 这不是「没通过」，也不是「通过」——这次没能完整地判。")
+        #
+        # 🔴 终端输出**只用 GBK 可编码的字符**（中文、ASCII、全角标点），
+        # **不用 emoji**：在 Windows 的 GBK 控制台上打印一个 ``⚠`` 会抛
+        # ``UnicodeEncodeError``，而那个异常会把进程退出码变成 1 ——
+        # 于是一条 NOT_EVALUATED 的**结论**被一个**终端编码问题**顶成了
+        # 故障退出码。实测踩过：11 个不适用场景全部返回 1 而不是 4。
+        print("  这不是「没通过」，也不是「通过」——这次没能完整地判。")
 
     for result in decision.rule_results:
         print(

@@ -350,6 +350,53 @@ class TestCliOutput:
         assert code == EXIT_OK
         assert output.is_file()
 
+    def test_terminal_output_survives_a_legacy_codepage(
+        self, gate_factory: Any, tmp_path: Path, capsys: Any
+    ) -> None:
+        """🔴 终端输出必须能在 **GBK** 控制台上编码。
+
+        实测踩过：一句提示里的 emoji 在 Windows 的 GBK 控制台上抛
+        ``UnicodeEncodeError``，而那个异常把进程退出码变成了 ``1``——
+        于是**一条 NOT_EVALUATED 的结论被一个终端编码问题顶成了故障退出码**。
+        (11 个不适用场景全部返回 1 而不是 4，就是这么来的。)
+
+        这条对**三条分支**都测：英文与全角标点没问题，emoji 不行。
+        """
+        comparison = gate_factory.comparison({"case-001": "pass"})
+        scenarios = (
+            ("pass", comparison, gate_factory.policy_payload(comparison)),
+            (
+                "not_evaluated",
+                comparison,
+                _with_provider(gate_factory.policy_payload(comparison), "openai"),
+            ),
+        )
+        for label, current, payload in scenarios:
+            _run(
+                tmp_path,
+                _write_comparison(current, tmp_path, f"c-{label}.json"),
+                _write_policy(payload, tmp_path, f"p-{label}.json"),
+                f"d-{label}.json",
+            )
+            printed = capsys.readouterr().out
+            assert printed
+            # 不能编码就会抛 UnicodeEncodeError —— 那正是缺陷的形态。
+            printed.encode("gbk")
+
+    def test_fail_branch_output_survives_a_legacy_codepage(
+        self, gate_factory: Any, tmp_path: Path, capsys: Any
+    ) -> None:
+        comparison = gate_factory.comparison_between(
+            {"case-001": "pass", "case-002": "pass"},
+            {"case-001": "pass", "case-002": "fail"},
+        )
+        _run(
+            tmp_path,
+            _write_comparison(comparison, tmp_path, "comparison.json"),
+            _write_policy(gate_factory.policy_payload(comparison), tmp_path, "policy.json"),
+        )
+        capsys.readouterr().out.encode("gbk")
+
     def test_terminal_output_claims_no_release_decision(
         self, gate_factory: Any, tmp_path: Path, capsys: Any
     ) -> None:
@@ -364,3 +411,10 @@ class TestCliOutput:
         for forbidden in ("允许发布", "可以发布", "建议上线", "release_allowed", "质量分"):
             assert forbidden not in printed, forbidden
         assert "PASS" in printed
+
+
+def _with_provider(payload: dict[str, Any], provider: str) -> dict[str, Any]:
+    """把策略的 scope.provider 改掉并重算摘要。"""
+    payload["scope"]["provider"] = provider
+    payload["policy_digest"] = policy_digest(payload)
+    return payload
