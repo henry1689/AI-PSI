@@ -875,6 +875,55 @@ comparison + policy           --(正式 S6 引擎重算)-->  gate_decision
 的身份记录读起来像"这些字段查过了、没有值"，而不是"这些字段不属于
 这个角色"。
 
+### 🔴 正式 Bundle 是**严格**契约
+
+`EvaluationEvidenceBundle` 强制以下不变量，违反即**构造失败**：
+
+* 五个角色**全部存在**；
+* 每个角色**恰好一次**（不重复）；
+* `artifacts` 的顺序**严格等于**固定角色顺序；
+* `bundle_digest` 与**原始 payload** 重算出来的一致；
+* 顶层字段与 `ArtifactDescriptor` 字段合法。
+
+不是靠 set 比较（那会掩盖重复），也不是靠 dict 转换（那会静默覆盖重复），
+而是一次**序列整体比较**。模型**不**自动补齐角色、**不**去重、**不**重排
+——它只会拒绝。一份被"修好"的 Bundle 已经不是别人交回来的那一份了。
+
+### 双层解析：不可信 Envelope 与严格 Bundle
+
+```
+bytes → UTF-8 → 严格 JSON → EvidenceBundleEnvelope（只解析形状，允许角色异常）
+                                        │
+                    角色完整？唯一？有序？bundle_digest 正确？
+                                        │ 是
+                                        ▼
+                          EvaluationEvidenceBundle（严格正式契约）
+```
+
+| | `EvidenceBundleEnvelope` | `EvaluationEvidenceBundle` |
+|---|---|---|
+| 用途 | **验证器**读取不可信声明、输出精确诊断 | `build` 输出、正式加载、链路重算 |
+| 字段集 | 与严格 Bundle **逐字相同** | 同左 |
+| 角色缺失／重复／错序 | **允许** | **拒绝** |
+| `bundle_digest` | 不核对 | 必须正确 |
+| 能不能喂给 S5／S6 重算 | **不能** | 可以 |
+
+🔴 **Envelope 不是新的对外产物格式，也不得被当作正式 Bundle 使用。**
+它存在的唯一理由是：验证器必须能读进一份坏掉的 Bundle 并说清坏在哪——
+直接拿严格模型去读，"少了一个角色"会变成"读取失败"，而这两件事的处置
+完全不同。
+
+🔴 三种角色异常**都不会进入** Comparison／GateDecision 重算：
+
+| 异常 | `artifact_roles_complete` | `artifact_order_valid` | 后续检查 | 结论 | 退出码 |
+|---|---|---|---|---|---|
+| 缺失角色 | `FAIL`（`artifact_role_missing`） | `NOT_EVALUATED` | 全部 `NOT_EVALUATED` | `INVALID` | `1` |
+| 重复角色 | `FAIL`（`artifact_role_duplicated`） | `NOT_EVALUATED` | 全部 `NOT_EVALUATED` | `INVALID` | `1` |
+| 角色错序 | `PASS` | `FAIL`（`artifact_order_invalid`） | 全部 `NOT_EVALUATED` | `INVALID` | `1` |
+
+验证器**不**使用重复角色里的"第一个"或"最后一个"继续，**不**根据内容猜
+哪个角色才是真的，**不**自动排序后放行。
+
 ### 验证报告
 
 `EvidenceVerificationReport`，24 项固定顺序的检查：
@@ -925,11 +974,21 @@ uv run python -m ai_psi.evaluation.evidence_cli verify \
 | 退出码 | `build` | `verify` |
 |---|---|---|
 | `0` | 构建成功（与 `gate_outcome` 无关） | `VERIFIED` |
-| `1` | —— | `INVALID` |
-| `2` | 参数错误，或输入文件不存在 | 参数错误 |
-| `3` | 输入 Schema／完整性错误 | `NOT_VERIFIABLE`（连形状都读不出来） |
-| `4` | 证据链重算不一致 | `NOT_VERIFIABLE`（证据不足） |
+| `1` | —— | `INVALID`（含角色缺失／重复／错序） |
+| `2` | **CLI 参数错误**（缺参数、不认识的参数） | CLI 参数错误 |
+| `3` | **输入文件、JSON、Schema 或完整性错误** | **Bundle 根输入**无法基本解析 |
+| `4` | 五份输入都合法，但**链路重算不一致** | `NOT_VERIFIABLE`（证据不足） |
 | `5` | 输出写入失败 | 输出写入失败 |
+
+🔴 **`build`：参数齐了、文件不在，是 `3` 不是 `2`。** 少了 `--policy` 与
+`--policy` 指的那个文件不存在，是两种故障：前者改命令行就能解决，后者
+得先有那份产物。混成一个码，自动化里就分不清"我调用错了"与"上游没产出"。
+输入路径是目录、不可读、不是合法 UTF-8／JSON、Schema 不过，同样都走 `3`。
+
+🔴 **`verify`：Bundle 是根输入，它读不出来是 `3`；某个待核验的 Artifact
+读不出来是 `NOT_VERIFIABLE` `4`。** 前者是"没有可核对的基准"，后者是
+"基准在，但证据不全"——后者是一份**可以回答**的结论，所以要写出结构化
+报告。
 
 **没有** `--force`、`--skip-recompute`、`--trust-digests`、`--ignore-role`、
 `--allow-unknown-version` 这类开关。原子写入：要么旧内容，要么完整的新内容。

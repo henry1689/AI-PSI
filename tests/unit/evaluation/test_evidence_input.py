@@ -17,6 +17,7 @@ import pytest
 from pydantic import ValidationError
 
 import ai_psi.evaluation.evidence as evidence_module
+from ai_psi.evaluation.comparison import compare_run_results
 from ai_psi.evaluation.evidence import (
     VERIFICATION_CHECK_ORDER,
     EvidenceChainMismatchError,
@@ -33,7 +34,7 @@ from ai_psi.evaluation.evidence import (
     verify_evidence_bundle,
     write_bundle,
 )
-from ai_psi.evaluation.gate import policy_digest
+from ai_psi.evaluation.gate import decide, policy_digest
 from ai_psi.evaluation.serialization import dumps
 
 pytestmark = pytest.mark.unit
@@ -627,12 +628,35 @@ class TestRecompute:
         assert report.bundle_digest == bundle_digest(payload)
         assert report.verification_outcome is VerificationOutcome.INVALID
 
-    def test_chain_identity_is_recomputed_from_the_inputs(
+    def test_a_tampered_chain_identity_blocks_promotion(
         self, chain: Any, bundle_file: Path
     ) -> None:
+        """🔴 改了 ``chain_identity`` 却没重算摘要 ⇒ 这份东西**不再是**一份
+        严格的正式 Bundle，因此**不提提升**，后续检查一律 ``NOT_EVALUATED``。
+
+        ⚠️ 这正是"摘要自洽"被放进严格模型的代价，也是它的意义：一份连
+        自身摘要都对不上的记录，不该被当作"某几项恰好没问题"的正式 Bundle
+        继续往下走。它的冲突由 ``bundle_digest_valid`` 明确报出。
+        """
         payload = _read_json(bundle_file)
         payload["chain_identity"]["dataset_digest"] = "sha256:" + "7" * 64
         _write_json(bundle_file, payload)
+        report = _verify(chain, bundle_file)
+        assert report.verification_outcome is VerificationOutcome.INVALID
+        assert report.failed_check_ids == ("bundle_digest_valid",)
+        assert "chain_identity_valid" in report.not_evaluated_check_ids
+        assert "comparison_recomputed_equal" in report.not_evaluated_check_ids
+
+    def test_chain_identity_is_recomputed_from_the_inputs(
+        self, chain: Any, bundle_file: Path
+    ) -> None:
+        """角色与摘要都自洽，但链身份与五个输入对不上 ⇒ 重算仍会发现它。"""
+        payload = _read_json(bundle_file)
+        payload["chain_identity"]["dataset_digest"] = "sha256:" + "7" * 64
+        _write_json(bundle_file, payload)
+        chain.refresh_descriptors(bundle_file)
+        # refresh_descriptors 只按文件重算描述符摘要与 bundle_digest，
+        # 因此 chain_identity 的那处改动仍然是"自洽但不对"的。
         report = _verify(chain, bundle_file)
         assert "chain_identity_valid" in report.failed_check_ids
 
@@ -666,3 +690,192 @@ class TestRecompute:
             str(tmp_path),
         ):
             assert sentinel not in text, sentinel
+
+
+# ---------------------------------------------------------------------------
+# 补救 · D 组：角色异常 → INVALID，且**不进入** S5／S6 重算
+# ---------------------------------------------------------------------------
+
+
+def _drop(payload: dict[str, Any], index: int) -> None:
+    payload["artifacts"].pop(index)
+
+
+def _mutate_payload(bundle_path: Path, mutate: Any) -> dict[str, Any]:
+    """读一份 Bundle payload、改一处、**不重算摘要**。
+
+    ⚠️ 摘要故意留着不改：角色异常那一侧要看的正是"结构不对"本身，
+    而不是先撞在摘要上。
+    """
+    payload = _read_json(bundle_path)
+    mutate(payload)
+    return payload
+
+
+_ROLE_ANOMALIES: tuple[tuple[str, Any, str, bool], ...] = (
+    ("缺失 COMPARISON", lambda p: _drop(p, 2), "artifact_role_missing", True),
+    ("缺失 BASELINE_RUN", lambda p: _drop(p, 0), "artifact_role_missing", True),
+    (
+        "重复 BASELINE_RUN",
+        lambda p: p["artifacts"].append(dict(p["artifacts"][0])),
+        "artifact_role_duplicated",
+        True,
+    ),
+    (
+        "重复 GATE_DECISION",
+        lambda p: p["artifacts"].append(dict(p["artifacts"][4])),
+        "artifact_role_duplicated",
+        True,
+    ),
+    ("打乱顺序", lambda p: p["artifacts"].reverse(), "artifact_order_invalid", False),
+)
+
+
+@pytest.fixture
+def recompute_counter(monkeypatch: Any) -> dict[str, int]:
+    """数一数 S5／S6 的重算入口到底被调了几次。
+
+    🔴 只有一个计数器能证明"角色异常**没有**进入重算"——断言报告里
+    "那两项是 NOT_EVALUATED"只是从结论倒推，而结论恰好可能因为别的原因
+    长成那样。
+    """
+    counter = {"comparison": 0, "gate_decision": 0}
+
+    def counting_compare(*args: Any, **kwargs: Any) -> Any:
+        counter["comparison"] += 1
+        return compare_run_results(*args, **kwargs)
+
+    def counting_decide(*args: Any, **kwargs: Any) -> Any:
+        counter["gate_decision"] += 1
+        return decide(*args, **kwargs)
+
+    monkeypatch.setattr(evidence_module, "compare_run_results", counting_compare)
+    monkeypatch.setattr(evidence_module, "decide", counting_decide)
+    return counter
+
+
+class TestRoleAnomalies:
+    """D 组：缺失／重复／错序 → INVALID，且一次重算都不发生。"""
+
+    @pytest.mark.parametrize(
+        ("label", "mutate", "reason", "order_not_evaluated"),
+        _ROLE_ANOMALIES,
+        ids=[item[0] for item in _ROLE_ANOMALIES],
+    )
+    def test_role_anomaly_is_invalid_and_skips_recompute(
+        self,
+        chain: Any,
+        bundle_file: Path,
+        recompute_counter: dict[str, int],
+        label: str,
+        mutate: Any,
+        reason: str,
+        order_not_evaluated: bool,
+    ) -> None:
+        _write_json(bundle_file, _mutate_payload(bundle_file, mutate))
+        report = _verify(chain, bundle_file)
+
+        assert report.verification_outcome is VerificationOutcome.INVALID
+
+        by_id = {item.check_id: item for item in report.checks}
+        assert by_id["artifact_roles_complete"].outcome is (
+            VerificationCheckOutcome.PASS
+            if reason == "artifact_order_invalid"
+            else VerificationCheckOutcome.FAIL
+        )
+        if reason != "artifact_order_invalid":
+            assert by_id["artifact_roles_complete"].reason_code.value == reason
+        else:
+            assert by_id["artifact_order_valid"].reason_code.value == reason
+
+        if order_not_evaluated:
+            assert by_id["artifact_order_valid"].outcome is (VerificationCheckOutcome.NOT_EVALUATED)
+
+        # 🔴 后续所有依赖唯一角色映射的检查都是 NOT_EVALUATED。
+        for check_id in (
+            "baseline_content_digest_valid",
+            "comparison_schema_valid",
+            "chain_identity_valid",
+            "baseline_role_valid",
+            "comparison_recomputed_equal",
+            "gate_decision_recomputed_equal",
+        ):
+            assert by_id[check_id].outcome is VerificationCheckOutcome.NOT_EVALUATED, check_id
+
+        # 🔴 最关键的一条：重算入口**一次都没被调用**。
+        assert recompute_counter == {"comparison": 0, "gate_decision": 0}, label
+
+    def test_a_healthy_chain_does_call_both_recompute_entries(
+        self, chain: Any, bundle_file: Path, recompute_counter: dict[str, int]
+    ) -> None:
+        """反面对照：同一条链在健康时**确实**会调用它们。
+
+        没有这一条，"计数器是 0"也可能只是因为计数器本身坏了。
+        """
+        report = _verify(chain, bundle_file)
+        assert report.verification_outcome is VerificationOutcome.VERIFIED
+        assert recompute_counter == {"comparison": 1, "gate_decision": 1}
+
+    @pytest.mark.parametrize(
+        ("label", "mutate", "reason", "order_not_evaluated"),
+        _ROLE_ANOMALIES,
+        ids=[item[0] for item in _ROLE_ANOMALIES],
+    )
+    def test_role_anomaly_reports_are_byte_identical(
+        self,
+        chain: Any,
+        bundle_file: Path,
+        label: str,
+        mutate: Any,
+        reason: str,
+        order_not_evaluated: bool,
+    ) -> None:
+        """🔴 缺失／重复／错序三种报告的确定性各测一遍。"""
+        _write_json(bundle_file, _mutate_payload(bundle_file, mutate))
+        first = dumps(_verify(chain, bundle_file).model_dump(mode="json"))
+        second = dumps(_verify(chain, bundle_file).model_dump(mode="json"))
+        assert first == second, label
+
+    @pytest.mark.parametrize(
+        ("label", "mutate", "reason", "order_not_evaluated"),
+        _ROLE_ANOMALIES,
+        ids=[item[0] for item in _ROLE_ANOMALIES],
+    )
+    def test_role_anomaly_reports_leak_nothing(
+        self,
+        chain: Any,
+        bundle_file: Path,
+        label: str,
+        mutate: Any,
+        reason: str,
+        order_not_evaluated: bool,
+    ) -> None:
+        _write_json(bundle_file, _mutate_payload(bundle_file, mutate))
+        text = dumps(_verify(chain, bundle_file).model_dump(mode="json"))
+        for sentinel in (
+            "合成的回答文本",
+            "response_text",
+            "Traceback",
+            "postgresql://",
+            str(bundle_file.parent),
+        ):
+            assert sentinel not in text, (label, sentinel)
+
+    def test_a_duplicated_role_is_never_collapsed_into_one(
+        self, chain: Any, bundle_file: Path
+    ) -> None:
+        """🔴 重复角色不得被 dict 转换静默覆盖成"最后一个"。
+
+        观察值里必须**两个都在**——那才是"看见了重复"，而不是"挑了一个"。
+        """
+        payload = _mutate_payload(
+            bundle_file, lambda p: p["artifacts"].append(dict(p["artifacts"][0]))
+        )
+        _write_json(bundle_file, payload)
+        report = _verify(chain, bundle_file)
+        observed = next(
+            item.observed for item in report.checks if item.check_id == "artifact_roles_complete"
+        )
+        assert observed == (
+            "BASELINE_RUN,CANDIDATE_RUN,COMPARISON,POLICY,GATE_DECISION,BASELINE_RUN"
+        )

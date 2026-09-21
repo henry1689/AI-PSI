@@ -107,6 +107,8 @@ __all__ = [
     "ArtifactSchemaIdentity",
     "ArtifactSemanticIdentity",
     "EvaluationEvidenceBundle",
+    "EvidenceBundleEnvelope",
+    "EvidenceBundleInvariantError",
     "EvidenceChainIdentity",
     "EvidenceChainMismatchError",
     "EvidenceInputError",
@@ -125,6 +127,8 @@ __all__ = [
     "evidence_verification_definition_digest",
     "load_evidence_bundle",
     "parse_evidence_bundle",
+    "parse_evidence_bundle_envelope",
+    "promote_evidence_bundle",
     "verify_evidence_bundle",
     "write_bundle",
     "write_verification_report",
@@ -155,10 +159,14 @@ _FULL_SHA: Final[re.Pattern[str]] = re.compile(r"^[0-9a-fA-F]{40}$")
 #: 摘要覆盖哪些字节、重算不等时会怎么办。
 EVIDENCE_DEFINITION: Final[dict[str, object]] = {
     "artifact_order": (
-        "按 artifact_roles 列出的顺序，**固定**；顺序变化必须让 bundle_digest 变，"
-        "不得被静默接受或自动重排"
+        "artifacts 的顺序必须**严格等于** artifact_roles 列出的顺序；"
+        "顺序变化必须让 bundle_digest 变，不得被静默接受、自动重排或自动排序后放行"
     ),
     "artifact_roles": ["BASELINE_RUN", "CANDIDATE_RUN", "COMPARISON", "POLICY", "GATE_DECISION"],
+    "bundle_strictness": (
+        "正式 Bundle 必须**恰好**包含五个角色、每个恰好一次、且按固定顺序；"
+        "缺失、重复、错序三者都**不是**正式 Bundle——不是靠 set 比较或 dict 覆盖来容忍"
+    ),
     "baseline_candidate_policy": (
         "角色**只由调用方显式给出的参数**决定，绝不从文件名推断、绝不按目录顺序推断、"
         "绝不自动交换；两边内容相同时两个 ArtifactDescriptor 仍必须分别存在"
@@ -209,6 +217,11 @@ EVIDENCE_DEFINITION: Final[dict[str, object]] = {
     "strict_loading": (
         "UTF-8；严格 JSON；拒绝 NaN/Infinity；拒绝重复的键；"
         "顶层字段集合精确匹配；模型不变量在加载时全部重跑"
+    ),
+    "untrusted_envelope": (
+        "验证器先解析**不可信取证 Envelope**（允许角色缺失／重复／错序），"
+        "它只用于输出精确诊断、**不是**正式 Bundle、不得直接喂给重算；"
+        "只有角色完整＋唯一＋有序时才能提升为严格 Bundle"
     ),
 }
 
@@ -263,8 +276,16 @@ EVIDENCE_VERIFICATION_DEFINITION: Final[dict[str, object]] = {
         "all_checks_pass": "VERIFIED",
     },
     "rule": "FAIL 优先于 NOT_EVALUATED：只要有一项**确定冲突**，结论就是 INVALID",
+    "role_failure_policy": (
+        "角色缺失／重复／错序 ⇒ 结论 INVALID，且**不进入** S5 Comparison 重算与 "
+        "S6 GateDecision 重算；依赖唯一角色映射的检查一律 NOT_EVALUATED"
+    ),
     "schema_version": VERIFICATION_SCHEMA_VERSION,
     "stage": "S7",
+    "strictness_gate": (
+        "只有角色完整、唯一且有序时，Envelope 才被提升为严格 Bundle；"
+        "提升失败时不得把检查标为 VERIFIED，也不得自动补齐、去重或排序"
+    ),
 }
 
 
@@ -310,6 +331,18 @@ class EvidenceInputError(ValueError):
     ⚠️ 它**不是**"这条链对不上"。这个异常意味着**连读都没读成**：
     JSON 坏了、有重复的键、含 NaN、或者不是合法的 UTF-8。
     一条基于未解析输入的"证据链"无论长什么样都是误导。
+    """
+
+
+class EvidenceBundleInvariantError(EvidenceInputError):
+    """Envelope **读得出来**，但它不是一份**严格**的正式 Bundle。
+
+    🔴 与 :class:`EvidenceInputError` 的关系是刻意的：调用方（CLI、加载器）
+    不必区分"读不出来"与"读出来了但不是正式 Bundle"——两者都是"这份东西
+    不能当正式 Bundle 用"。而验证器需要区分，所以它单独捕获这个类型，
+    好把角色问题写成**结构化诊断**而不是一句"读不出来"。
+
+    ⚠️ 抛出它时**不做任何修复**：不补齐缺失角色、不去重、不重排。
     """
 
 
@@ -678,19 +711,55 @@ EVIDENCE_BUNDLE_TOP_LEVEL_FIELDS: Final[tuple[str, ...]] = (
 )
 
 
+class EvidenceBundleEnvelope(BaseModel):
+    """**不可信**证据包：只解析形状，不假定它是一份有效的正式 Bundle。
+
+    🔴 它存在的理由只有一个：**验证器必须能读进一份坏掉的 Bundle，并说清
+    坏在哪。** 直接拿严格模型去读，"少了一个角色"会变成一个"读取失败"，
+    而那两件事的处置完全不同——前者是一条可以定位的冲突结论，后者是一次
+    看不清的解析故障。
+
+    ⚠️ 它**不是**新的对外产物格式：字段集与
+    :class:`EvaluationEvidenceBundle` **逐字相同**，区别只在**不变量**——
+    这里允许角色缺失、重复、错序。
+
+    🔴 **它不得被当作正式 Bundle 使用**：不得由 ``build`` 输出、不得直接
+    喂给 Comparison／GateDecision 重算、不得绕过
+    :func:`promote_evidence_bundle` 的完整性检查。
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    evidence_bundle_schema_version: int = EVIDENCE_BUNDLE_SCHEMA_VERSION
+    evidence_bundle_definition_digest: str = Field(pattern=_DIGEST_PATTERN)
+    bundle_digest: str = Field(pattern=_DIGEST_PATTERN)
+    #: ⚠️ **没有** ``min_length``：一个角色都没有也是一份**可诊断**的
+    #: Envelope（结论是"五个角色全缺"），而不是"读不出来"。把这两种情形
+    #: 分开，是这一层存在的全部意义。
+    artifacts: tuple[ArtifactDescriptor, ...] = ()
+    chain_identity: EvidenceChainIdentity
+
+
 class EvaluationEvidenceBundle(BaseModel):
-    """一条评测证据链的**可机读记录**。
+    """一条评测证据链的**严格正式契约**。
+
+    🔴 **五个角色必须完整、唯一且按固定顺序**（见 :data:`ARTIFACT_ROLE_ORDER`）。
+    缺失、重复、错序都让构造失败——不是靠 set 比较（那会掩盖重复），
+    也不是靠 dict 转换（那会静默覆盖重复），而是一次**序列整体比较**：
+    ``roles != ARTIFACT_ROLE_ORDER`` 同时覆盖三种错误，且无法被任何一种
+    取巧写法规避。
+
+    🔴 ``bundle_digest`` 也必须自洽。校验放在 ``mode="before"`` 上，因为
+    摘要的定义域是**别人交给我们那份 bytes 解析出来的对象**，而模型自己
+    dump 出来的是**规范化之后**的形状——两者在"文件里多写了一个 null"
+    这类情形下并不相同。
+
+    ⚠️ 模型**不**自动补齐角色、**不**去重、**不**重排。它只会拒绝。
 
     🔴 它**不嵌入**五个输入文件的完整内容，也**不含**路径、时间戳、
     主机名、用户名、数据库 URL、``response_text``、Prompt 正文或异常堆栈。
     这不是靠"写的时候小心"，而是靠这个模型里**根本没有**承载这些内容的
     字段。
-
-    ⚠️ "五个角色各出现一次、且按固定顺序"由**验证器**判定（违反即
-    ``INVALID``），而不是由这里的构造器拒收。理由：S7 的职责正是
-    **发现**一份 Bundle 哪里不对并如实报告，在门口把文件拒掉会让
-    "这份 Bundle 少了一个角色"变成一个读不出来的错误，而它本该是一条
-    清晰的冲突结论。
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -702,17 +771,76 @@ class EvaluationEvidenceBundle(BaseModel):
     artifacts: tuple[ArtifactDescriptor, ...] = Field(min_length=1)
     chain_identity: EvidenceChainIdentity
 
+    @model_validator(mode="before")
+    @classmethod
+    def _require_a_correct_bundle_digest(cls, data: Any) -> Any:
+        """🔴 对**原始 payload** 重算摘要并比对。
+
+        摘要**自排除**，所以这里不算循环：被比较的那个字段不参与计算。
+        """
+        if not isinstance(data, dict):
+            return data
+        declared = data.get("bundle_digest")
+        if not isinstance(declared, str):
+            # 类型不对交给字段校验去报；这里只负责"值对不对得上"。
+            return data
+        recomputed = bundle_digest(data)
+        if declared != recomputed:
+            msg = f"bundle_digest 与证据包内容不符：写的是 {declared}，按内容算出的是 {recomputed}"
+            raise ValueError(msg)
+        return data
+
+    @model_validator(mode="after")
+    def _require_the_five_roles_in_order(self) -> Self:
+        """🔴 完整性、唯一性与顺序，一次序列比较全部覆盖。"""
+        roles = tuple(item.role for item in self.artifacts)
+        if roles != ARTIFACT_ROLE_ORDER:
+            msg = (
+                "artifacts 必须是 "
+                f"{[role.value for role in ARTIFACT_ROLE_ORDER]} 各一次、且按此顺序；"
+                f"实际是 {[role.value for role in roles]}"
+            )
+            raise ValueError(msg)
+        return self
+
+
+def _require_bundle_top_level_fields(payload: dict[str, Any]) -> None:
+    """🔴 顶层字段必须恰好是 :data:`EVIDENCE_BUNDLE_TOP_LEVEL_FIELDS` 那个集合。"""
+    unknown = sorted(set(payload) - set(EVIDENCE_BUNDLE_TOP_LEVEL_FIELDS))
+    missing = sorted(set(EVIDENCE_BUNDLE_TOP_LEVEL_FIELDS) - set(payload))
+    if unknown or missing:
+        msg = (
+            f"证据包顶层字段不符合本版本的格式（多出：{unknown or '无'}；缺少：{missing or '无'}）"
+        )
+        raise EvidenceInputError(msg)
+
+
+def parse_evidence_bundle_envelope(payload: dict[str, Any]) -> EvidenceBundleEnvelope:
+    """把一份 Bundle payload 读成**不可信取证 Envelope**。
+
+    只做形状解析：顶层字段集合、字段类型、Descriptor 自身的角色形状。
+    **不检查**角色是否完整、唯一或有序——那正是它要留给诊断的东西。
+
+    Args:
+        payload: 已解析的 JSON 对象。
+
+    Returns:
+        取证 Envelope。⚠️ **它不是正式 Bundle。**
+
+    Raises:
+        EvidenceInputError: 顶层字段集合不对。
+        pydantic.ValidationError: 字段值不合法。
+    """
+    _require_bundle_top_level_fields(payload)
+    return EvidenceBundleEnvelope.model_validate(payload)
+
 
 def parse_evidence_bundle(payload: dict[str, Any]) -> EvaluationEvidenceBundle:
-    """把一份 Bundle payload 还原成 :class:`EvaluationEvidenceBundle`。
+    """把一份 Bundle payload 还原成**严格**的 :class:`EvaluationEvidenceBundle`。
 
-    🔴 **顶层字段必须恰好是** :data:`EVIDENCE_BUNDLE_TOP_LEVEL_FIELDS` 那个
-    集合：多一个少一个都拒绝。
-
-    ⚠️ 这里**不核对** ``bundle_digest``。核对需要调用方明确知道"我在验一份
-    别人给的 Bundle"，而**报告**"摘要对不上"与**拒绝读取**是两种不同的
-    处置——前者是 :func:`verify_evidence_bundle` 的职责。只想拿一份可信
-    Bundle 的调用方请用 :func:`load_evidence_bundle`，它会顺带核对。
+    🔴 角色完整、唯一、固定顺序，且 ``bundle_digest`` 正确——任一不成立都
+    拒绝。这是**正式**读取路径；要诊断一份坏掉的 Bundle 请用
+    :func:`parse_evidence_bundle_envelope`。
 
     Args:
         payload: 已解析的 JSON 对象。
@@ -724,30 +852,26 @@ def parse_evidence_bundle(payload: dict[str, Any]) -> EvaluationEvidenceBundle:
         EvidenceInputError: 字段集合不对。
         pydantic.ValidationError: 字段值不合法，或违反模型不变量。
     """
-    unknown = sorted(set(payload) - set(EVIDENCE_BUNDLE_TOP_LEVEL_FIELDS))
-    missing = sorted(set(EVIDENCE_BUNDLE_TOP_LEVEL_FIELDS) - set(payload))
-    if unknown or missing:
-        msg = (
-            f"证据包顶层字段不符合本版本的格式（多出：{unknown or '无'}；缺少：{missing or '无'}）"
-        )
-        raise EvidenceInputError(msg)
+    _require_bundle_top_level_fields(payload)
     return EvaluationEvidenceBundle.model_validate(payload)
 
 
 def load_evidence_bundle(path: Path) -> EvaluationEvidenceBundle:
-    """严格加载一份证据包，**并核对它自身的摘要**。
+    """严格加载一份证据包：形状 → 提升 → 返回**严格**模型。
 
     校验顺序：UTF-8 → JSON（拒绝 NaN/Infinity 与重复的键）→ 顶层字段 →
-    逐层模型 → **重算 ``bundle_digest`` 并比对**。
+    取证 Envelope → **提升**（角色完整、唯一、有序，且 ``bundle_digest``
+    正确）。
 
     Args:
         path: 证据包路径。
 
     Returns:
-        已通过校验的证据包。
+        已通过校验的**严格**证据包。
 
     Raises:
         EvidenceInputError: 读不了、格式不对、字段集合不对，或摘要不符。
+        EvidenceBundleInvariantError: 读得出来，但不是一份严格的正式 Bundle。
     """
     try:
         data = path.read_bytes()
@@ -757,19 +881,71 @@ def load_evidence_bundle(path: Path) -> EvaluationEvidenceBundle:
 
     payload = _decode_json(data)
     try:
-        bundle = parse_evidence_bundle(payload)
+        envelope = parse_evidence_bundle_envelope(payload)
     except ValidationError as exc:
         msg = f"证据包结构校验失败：{exc.error_count()} 处"
         raise EvidenceInputError(msg) from exc
+    return promote_evidence_bundle(envelope)
 
+
+def promote_evidence_bundle(envelope: EvidenceBundleEnvelope) -> EvaluationEvidenceBundle:
+    """把取证 Envelope **提升**为严格正式 Bundle。
+
+    提升条件（全部成立才行）：
+
+    * 五个角色全部存在；
+    * 每个角色恰好一次；
+    * 顺序严格等于 :data:`ARTIFACT_ROLE_ORDER`；
+    * 顶层字段与 Descriptor 字段合法；
+    * Schema 受支持；
+    * ``bundle_digest`` 正确。
+
+    🔴 **提升不做任何修复**：不补齐缺失角色、不去重、不重排、不把错误摘要
+    换成正确摘要。它只会拒绝——一条被"修好"的 Bundle 已经不是别人交给我们
+    的那一份了。
+
+    ⚠️ 角色三项在前、模型校验在后：这样"少了哪个角色"与"摘要对不上"会给出
+    不同的错误话术，而不是被一句笼统的"结构校验失败"盖住。
+
+    Args:
+        envelope: 已通过形状解析的取证 Envelope。
+
+    Returns:
+        严格正式 Bundle。
+
+    Raises:
+        EvidenceBundleInvariantError: 任一不变量不成立。
+    """
+    roles = tuple(item.role for item in envelope.artifacts)
+    missing = [role for role in ARTIFACT_ROLE_ORDER if role not in roles]
+    if missing:
+        msg = f"证据包缺少这些角色：{[role.value for role in missing]}"
+        raise EvidenceBundleInvariantError(msg)
+    if len(set(roles)) != len(roles):
+        msg = f"证据包里有重复的角色：{[role.value for role in roles]}"
+        raise EvidenceBundleInvariantError(msg)
+    if roles != ARTIFACT_ROLE_ORDER:
+        msg = (
+            "证据包的 artifacts 顺序不对："
+            f"必须是 {[role.value for role in ARTIFACT_ROLE_ORDER]}，"
+            f"实际是 {[role.value for role in roles]}"
+        )
+        raise EvidenceBundleInvariantError(msg)
+
+    payload = envelope.model_dump(mode="json", exclude_none=True)
     recomputed = bundle_digest(payload)
-    if bundle.bundle_digest != recomputed:
+    if envelope.bundle_digest != recomputed:
         msg = (
             "bundle_digest 与证据包内容不符："
-            f"文件里写的是 {bundle.bundle_digest}，按内容算出的是 {recomputed}"
+            f"写的是 {envelope.bundle_digest}，按内容算出的是 {recomputed}"
         )
-        raise EvidenceInputError(msg)
-    return bundle
+        raise EvidenceBundleInvariantError(msg)
+
+    try:
+        return EvaluationEvidenceBundle.model_validate(payload)
+    except ValidationError as exc:
+        msg = f"证据包不满足正式契约（{exc.error_count()} 处）"
+        raise EvidenceBundleInvariantError(msg) from exc
 
 
 #: 原子写的临时文件前缀——以点开头，`evals/reports/*` 的忽略规则照样覆盖它。
@@ -1124,15 +1300,22 @@ def build_evidence_bundle(inputs: EvidenceInputs) -> EvaluationEvidenceBundle:
     chain = _load_chain(inputs)
     _require_recomputed_equal(chain)
 
-    draft = EvaluationEvidenceBundle(
+    # 🔴 摘要是**自排除**的，所以先造一份**不经校验**的草稿（``model_construct``
+    # 正是为"模型还没法被校验、但它得先存在"这种场合准备的），按它算出摘要
+    # 回填，再让**严格模型**把整份 payload 完整校验一遍。
+    #
+    # ⚠️ 不能用 ``model_copy`` 回填：它按设计**不重跑校验器**，那样写出来的
+    # 会是一份从未被严格模型检查过的产物——"build 只输出严格模型"就成了空话。
+    draft = EvaluationEvidenceBundle.model_construct(
         evidence_bundle_schema_version=EVIDENCE_BUNDLE_SCHEMA_VERSION,
         evidence_bundle_definition_digest=evidence_definition_digest(),
         bundle_digest=_DIGEST_PLACEHOLDER,
         artifacts=_descriptors(chain, raw),
         chain_identity=_chain_identity(chain),
     )
-    # 摘要对**除它自己以外**的全部内容取，因此先有 draft 再回填。
-    return draft.model_copy(update={"bundle_digest": bundle_digest(bundle_payload(draft))})
+    payload = bundle_payload(draft)
+    payload["bundle_digest"] = bundle_digest(payload)
+    return EvaluationEvidenceBundle.model_validate(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -1698,21 +1881,23 @@ def verify_evidence_bundle(inputs: EvidenceVerificationInputs) -> EvidenceVerifi
         except EvidenceInputError:
             bundle_reason = VerificationReason.BUNDLE_NOT_PARSABLE
 
-    bundle: EvaluationEvidenceBundle | None = None
+    # 🔴 先解析**不可信取证 Envelope**：验证器的职责是"读进一份坏掉的
+    # Bundle 并说清坏在哪"，所以在这一步**不**假定角色是完整的。
+    envelope: EvidenceBundleEnvelope | None = None
     if bundle_document is not None:
         try:
-            bundle = parse_evidence_bundle(bundle_document)
+            envelope = parse_evidence_bundle_envelope(bundle_document)
         except (EvidenceInputError, ValidationError):
             bundle_reason = VerificationReason.BUNDLE_NOT_PARSABLE
         else:
-            if bundle.evidence_bundle_schema_version != EVIDENCE_BUNDLE_SCHEMA_VERSION:
-                bundle = None
+            if envelope.evidence_bundle_schema_version != EVIDENCE_BUNDLE_SCHEMA_VERSION:
+                envelope = None
                 bundle_reason = VerificationReason.BUNDLE_UNSUPPORTED_VERSION
 
     # 🔴 读不出来的 Bundle 记作 **NOT_EVALUATED**，不是 FAIL：FAIL 的含义是
     # "确定冲突"，而"这份文件根本读不出来"是另一件事。它的原因码会把
     # 究竟是哪一种说清楚（缺失／不是 JSON／版本不认识）。
-    if bundle is None:
+    if envelope is None:
         schema_check = _not_evaluated(
             _CHECK_BUNDLE_SCHEMA_VALID,
             bundle_reason or VerificationReason.BUNDLE_NOT_PARSABLE,
@@ -1730,33 +1915,37 @@ def verify_evidence_bundle(inputs: EvidenceVerificationInputs) -> EvidenceVerifi
     checks.append(schema_check)
 
     recomputed_bundle_digest: str | None = None
-    if bundle is None or bundle_document is None:
+    if envelope is None or bundle_document is None:
         checks.append(_not_evaluated(_CHECK_BUNDLE_DIGEST_VALID, VerificationReason.NOT_REACHED))
     else:
         recomputed_bundle_digest = bundle_digest(bundle_document)
         checks.append(
             _verdict(
                 _CHECK_BUNDLE_DIGEST_VALID,
-                bundle.bundle_digest == recomputed_bundle_digest,
+                envelope.bundle_digest == recomputed_bundle_digest,
                 VerificationReason.BUNDLE_DIGEST_MISMATCH,
                 observed=recomputed_bundle_digest,
-                expected=bundle.bundle_digest,
+                expected=envelope.bundle_digest,
             )
         )
 
     # ---- 角色集合与顺序 ----
     roles: tuple[ArtifactRole, ...] = (
-        () if bundle is None else tuple(a.role for a in bundle.artifacts)
+        () if envelope is None else tuple(item.role for item in envelope.artifacts)
     )
-    if bundle is None:
+    roles_complete = False
+    roles_ordered = False
+    if envelope is None:
         checks.append(
             _not_evaluated(_CHECK_ARTIFACT_ROLES_COMPLETE, VerificationReason.NOT_REACHED)
         )
         checks.append(_not_evaluated(_CHECK_ARTIFACT_ORDER_VALID, VerificationReason.NOT_REACHED))
     else:
         missing = [role for role in ARTIFACT_ROLE_ORDER if role not in roles]
+        # ⚠️ 用**计数**而不是集合：集合会把"同一角色出现两次"悄悄抹平，
+        # 而那正是这里要抓的东西之一。
         duplicated = sorted({role for role in roles if roles.count(role) > 1})
-        complete = not missing and not duplicated
+        roles_complete = not missing and not duplicated
         if missing:
             roles_reason = VerificationReason.ARTIFACT_ROLE_MISSING
         elif duplicated:
@@ -1766,32 +1955,46 @@ def verify_evidence_bundle(inputs: EvidenceVerificationInputs) -> EvidenceVerifi
         checks.append(
             _verdict(
                 _CHECK_ARTIFACT_ROLES_COMPLETE,
-                complete,
+                roles_complete,
                 roles_reason,
                 observed=",".join(role.value for role in roles),
                 expected=",".join(role.value for role in ARTIFACT_ROLE_ORDER),
             )
         )
-        if not complete:
+        if not roles_complete:
             checks.append(
                 _not_evaluated(_CHECK_ARTIFACT_ORDER_VALID, VerificationReason.NOT_REACHED)
             )
         else:
+            roles_ordered = roles == ARTIFACT_ROLE_ORDER
             checks.append(
                 _verdict(
                     _CHECK_ARTIFACT_ORDER_VALID,
-                    roles == ARTIFACT_ROLE_ORDER,
+                    roles_ordered,
                     VerificationReason.ARTIFACT_ORDER_INVALID,
                     observed=",".join(role.value for role in roles),
                     expected=",".join(role.value for role in ARTIFACT_ROLE_ORDER),
                 )
             )
 
+    # ---- 提升：只有角色完整、唯一、有序时才把它当正式 Bundle ----
+    #
+    # 🔴 提升失败（角色不对，或 ``bundle_digest`` 对不上）时**绝不继续**：
+    # 不去重、不重排、不补齐，也不拿重复角色里的"第一个"或"最后一个"凑合。
+    # 后续所有依赖唯一角色映射的检查一律 NOT_EVALUATED——包括 S5 与 S6 的
+    # 重算入口，那两处**一次都不会被调用**。
+    bundle: EvaluationEvidenceBundle | None = None
+    if envelope is not None and roles_complete and roles_ordered:
+        try:
+            bundle = promote_evidence_bundle(envelope)
+        except EvidenceBundleInvariantError:
+            bundle = None
+
     descriptors: dict[ArtifactRole, ArtifactDescriptor] = (
         {} if bundle is None else {item.role: item for item in bundle.artifacts}
     )
 
-    # ---- 读五个输入 ----
+    # ---- 读五个输入（只有拿到严格 Bundle 才读）----
     read: dict[ArtifactRole, bytes | None] = {}
     if bundle is not None:
         for role, path in inputs.artifacts.by_role():

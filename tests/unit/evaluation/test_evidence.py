@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from ai_psi.evaluation.evidence import (
     ARTIFACT_ROLE_ORDER,
@@ -26,6 +27,8 @@ from ai_psi.evaluation.evidence import (
     ArtifactDescriptor,
     ArtifactRole,
     EvaluationEvidenceBundle,
+    EvidenceBundleEnvelope,
+    EvidenceBundleInvariantError,
     EvidenceInputError,
     VerificationOutcome,
     build_evidence_bundle,
@@ -34,6 +37,8 @@ from ai_psi.evaluation.evidence import (
     evidence_definition_digest,
     load_evidence_bundle,
     parse_evidence_bundle,
+    parse_evidence_bundle_envelope,
+    promote_evidence_bundle,
     verify_evidence_bundle,
     write_bundle,
 )
@@ -319,6 +324,8 @@ class TestArtifactRoles:
     ) -> None:
         payload = bundle_payload(bundle)
         payload["artifacts"][0]["role"] = "SOMETHING_ELSE"
+        # 摘要同步重算，好让**角色**这一处错误浮上来（而不是先撞在摘要上）。
+        payload["bundle_digest"] = bundle_digest(payload)
         with pytest.raises(ValueError, match="role"):
             parse_evidence_bundle(payload)
 
@@ -483,3 +490,221 @@ class TestBundleSecurity:
     ) -> None:
         assert bundle.evidence_bundle_definition_digest == evidence_definition_digest()
         assert bundle.evidence_bundle_schema_version == EVIDENCE_BUNDLE_SCHEMA_VERSION
+
+
+# ---------------------------------------------------------------------------
+# 补救：严格模型 / 取证 Envelope / 提升
+# ---------------------------------------------------------------------------
+
+
+def _sealed(
+    bundle: EvaluationEvidenceBundle, mutate: Callable[[dict[str, Any]], None]
+) -> dict[str, Any]:
+    """改一份 Bundle payload，**并重算 ``bundle_digest``**。
+
+    🔴 不重算的话，被测到的永远是"摘要对不上"——那是另一条不变量，
+    会把角色不变量那几条用例全部盖住。
+    """
+    payload = bundle_payload(bundle)
+    mutate(payload)
+    payload["bundle_digest"] = bundle_digest(payload)
+    return payload
+
+
+def _drop_role(payload: dict[str, Any], role: ArtifactRole) -> None:
+    del payload["artifacts"][
+        next(i for i, item in enumerate(payload["artifacts"]) if item["role"] == role.value)
+    ]
+
+
+class TestStrictBundleModel:
+    """A 组：正式模型强制五角色**完整、唯一、固定顺序**。"""
+
+    def test_a_canonical_bundle_is_accepted(self, bundle: EvaluationEvidenceBundle) -> None:
+        assert tuple(item.role for item in bundle.artifacts) == ARTIFACT_ROLE_ORDER
+        assert len(bundle.artifacts) == 5
+
+    @pytest.mark.parametrize("role", list(ArtifactRole))
+    def test_missing_any_role_is_rejected(
+        self, bundle: EvaluationEvidenceBundle, role: ArtifactRole
+    ) -> None:
+        payload = _sealed(bundle, lambda p: _drop_role(p, role))
+        with pytest.raises(ValidationError, match="各一次、且按此顺序"):
+            EvaluationEvidenceBundle.model_validate(payload)
+
+    @pytest.mark.parametrize("role", list(ArtifactRole))
+    def test_duplicated_any_role_is_rejected(
+        self, bundle: EvaluationEvidenceBundle, role: ArtifactRole
+    ) -> None:
+        def duplicate(payload: dict[str, Any]) -> None:
+            original = next(item for item in payload["artifacts"] if item["role"] == role.value)
+            payload["artifacts"].append(dict(original))
+
+        payload = _sealed(bundle, duplicate)
+        with pytest.raises(ValidationError, match="各一次、且按此顺序"):
+            EvaluationEvidenceBundle.model_validate(payload)
+
+    def test_a_reordered_bundle_is_rejected(self, bundle: EvaluationEvidenceBundle) -> None:
+        """🔴 顺序是契约的一部分：不排序、不规范化，直接拒绝。"""
+        payload = _sealed(bundle, lambda p: p["artifacts"].reverse())
+        with pytest.raises(ValidationError, match="各一次、且按此顺序"):
+            EvaluationEvidenceBundle.model_validate(payload)
+
+    def test_a_pairwise_swap_is_rejected(self, bundle: EvaluationEvidenceBundle) -> None:
+        def swap(payload: dict[str, Any]) -> None:
+            payload["artifacts"][0], payload["artifacts"][1] = (
+                payload["artifacts"][1],
+                payload["artifacts"][0],
+            )
+
+        with pytest.raises(ValidationError, match="各一次、且按此顺序"):
+            EvaluationEvidenceBundle.model_validate(_sealed(bundle, swap))
+
+    def test_the_model_never_repairs_anything(self, bundle: EvaluationEvidenceBundle) -> None:
+        """🔴 被拒绝就是被拒绝：不会返回"补齐了／去重了／排好序了"的模型。"""
+        for mutate in (
+            lambda p: p["artifacts"].pop(0),
+            lambda p: p["artifacts"].reverse(),
+            lambda p: p["artifacts"].append(dict(p["artifacts"][0])),
+        ):
+            with pytest.raises(ValidationError):
+                EvaluationEvidenceBundle.model_validate(_sealed(bundle, mutate))
+
+    def test_a_wrong_bundle_digest_is_rejected(self, bundle: EvaluationEvidenceBundle) -> None:
+        payload = bundle_payload(bundle)
+        payload["bundle_digest"] = "sha256:" + "0" * 64
+        with pytest.raises(ValidationError, match="bundle_digest 与证据包内容不符"):
+            EvaluationEvidenceBundle.model_validate(payload)
+
+    def test_a_tampered_descriptor_is_rejected(self, bundle: EvaluationEvidenceBundle) -> None:
+        """改一个描述符却不重算摘要 → 拒绝（**不**自动把摘要换成对的）。"""
+        payload = bundle_payload(bundle)
+        payload["artifacts"][0]["byte_length"] = 1
+        with pytest.raises(ValidationError, match="bundle_digest 与证据包内容不符"):
+            EvaluationEvidenceBundle.model_validate(payload)
+
+
+class TestEvidenceBundleEnvelope:
+    """B 组：取证 Envelope 只解析形状，不假定它有效。"""
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            lambda p: p["artifacts"].pop(2),
+            lambda p: p["artifacts"].pop(),
+            lambda p: p["artifacts"].append(dict(p["artifacts"][0])),
+            lambda p: p["artifacts"].reverse(),
+            lambda p: p.__setitem__("artifacts", []),
+        ],
+    )
+    def test_role_anomalies_are_parsable(
+        self, bundle: EvaluationEvidenceBundle, mutate: Callable[[dict[str, Any]], None]
+    ) -> None:
+        """🔴 这一层存在的**全部理由**：坏掉的 Bundle 也读得进来。"""
+        envelope = parse_evidence_bundle_envelope(_sealed(bundle, mutate))
+        assert isinstance(envelope, EvidenceBundleEnvelope)
+
+    def test_a_missing_role_envelope_keeps_the_raw_role_sequence(
+        self, bundle: EvaluationEvidenceBundle
+    ) -> None:
+        """诊断信息不得被抹平：缺了哪个、重复了哪个，都要原样看得见。"""
+        envelope = parse_evidence_bundle_envelope(
+            _sealed(bundle, lambda p: _drop_role(p, ArtifactRole.COMPARISON))
+        )
+        assert [item.role.value for item in envelope.artifacts] == [
+            "BASELINE_RUN",
+            "CANDIDATE_RUN",
+            "POLICY",
+            "GATE_DECISION",
+        ]
+
+    def test_unknown_top_level_field_is_rejected(self, bundle: EvaluationEvidenceBundle) -> None:
+        payload = bundle_payload(bundle)
+        payload["release_allowed"] = True
+        with pytest.raises(EvidenceInputError, match="顶层字段"):
+            parse_evidence_bundle_envelope(payload)
+
+    def test_an_illegal_digest_shape_is_rejected(self, bundle: EvaluationEvidenceBundle) -> None:
+        # ⚠️ **不能**走 _sealed：它会把摘要重算成合法值，正好抹掉要测的东西。
+        payload = bundle_payload(bundle)
+        payload["bundle_digest"] = "not-a-digest"
+        with pytest.raises(ValidationError):
+            parse_evidence_bundle_envelope(payload)
+
+    def test_the_envelope_is_not_a_strict_bundle(self, bundle: EvaluationEvidenceBundle) -> None:
+        """🔴 类型不同、不变量不同——Envelope **不是**正式 Bundle。"""
+        payload = _sealed(bundle, lambda p: p["artifacts"].reverse())
+        envelope = parse_evidence_bundle_envelope(payload)
+        # ⚠️ 用 ``type(...) is`` 而不是 ``isinstance``：我要断言的正是
+        # "它是 Envelope 这一类、**不是**正式 Bundle"，而不是"它是不是
+        # 某个基类的实例"。
+        assert type(envelope) is EvidenceBundleEnvelope
+        with pytest.raises(ValidationError):
+            EvaluationEvidenceBundle.model_validate(payload)
+
+    def test_build_never_returns_an_envelope(self, chain: Any) -> None:
+        """🔴 ``build`` 的成功产物只能是**严格**模型。"""
+        assert type(build_evidence_bundle(chain.inputs())) is EvaluationEvidenceBundle
+
+
+class TestBundlePromotion:
+    """C 组：Envelope → 严格 Bundle 的显式提升。"""
+
+    def test_a_valid_envelope_promotes(self, bundle: EvaluationEvidenceBundle) -> None:
+        promoted = promote_evidence_bundle(parse_evidence_bundle_envelope(bundle_payload(bundle)))
+        assert promoted == bundle
+        assert tuple(item.role for item in promoted.artifacts) == ARTIFACT_ROLE_ORDER
+
+    def test_a_missing_role_does_not_promote(self, bundle: EvaluationEvidenceBundle) -> None:
+        envelope = parse_evidence_bundle_envelope(
+            _sealed(bundle, lambda p: _drop_role(p, ArtifactRole.COMPARISON))
+        )
+        with pytest.raises(EvidenceBundleInvariantError, match="缺少这些角色"):
+            promote_evidence_bundle(envelope)
+
+    def test_a_duplicated_role_does_not_promote(self, bundle: EvaluationEvidenceBundle) -> None:
+        envelope = parse_evidence_bundle_envelope(
+            _sealed(bundle, lambda p: p["artifacts"].append(dict(p["artifacts"][0])))
+        )
+        with pytest.raises(EvidenceBundleInvariantError, match="重复的角色"):
+            promote_evidence_bundle(envelope)
+
+    def test_a_reordered_envelope_does_not_promote(self, bundle: EvaluationEvidenceBundle) -> None:
+        envelope = parse_evidence_bundle_envelope(
+            _sealed(bundle, lambda p: p["artifacts"].reverse())
+        )
+        with pytest.raises(EvidenceBundleInvariantError, match="顺序不对"):
+            promote_evidence_bundle(envelope)
+
+    def test_a_wrong_digest_does_not_promote(self, bundle: EvaluationEvidenceBundle) -> None:
+        payload = bundle_payload(bundle)
+        payload["bundle_digest"] = "sha256:" + "0" * 64
+        with pytest.raises(EvidenceBundleInvariantError, match="bundle_digest 与证据包内容不符"):
+            promote_evidence_bundle(parse_evidence_bundle_envelope(payload))
+
+    def test_promotion_does_not_touch_the_artifacts(self, bundle: EvaluationEvidenceBundle) -> None:
+        """🔴 提升是**只读**的：它不改角色、不改顺序、不改摘要。"""
+        payload = bundle_payload(bundle)
+        before = json.loads(json.dumps(payload))
+        promoted = promote_evidence_bundle(parse_evidence_bundle_envelope(payload))
+        assert payload == before
+        assert [item["role"] for item in payload["artifacts"]] == [
+            item.role.value for item in promoted.artifacts
+        ]
+
+    def test_a_reordered_envelope_is_never_silently_sorted(
+        self, bundle: EvaluationEvidenceBundle
+    ) -> None:
+        """🔴 错序不会被"顺手排好"：要么拒绝，要么……没有第三条路。"""
+        payload = _sealed(bundle, lambda p: p["artifacts"].reverse())
+        envelope = parse_evidence_bundle_envelope(payload)
+        with pytest.raises(EvidenceBundleInvariantError):
+            promote_evidence_bundle(envelope)
+        # 拒绝之后 Envelope 仍是原样——不存在"修好之后再返回"这条路。
+        assert [item.role.value for item in envelope.artifacts] == [
+            "GATE_DECISION",
+            "POLICY",
+            "COMPARISON",
+            "CANDIDATE_RUN",
+            "BASELINE_RUN",
+        ]

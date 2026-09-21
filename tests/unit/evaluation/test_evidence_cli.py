@@ -17,7 +17,12 @@ from typing import Any
 import pytest
 
 import ai_psi.evaluation.evidence_cli as cli_module
-from ai_psi.evaluation.evidence import build_evidence_bundle, write_bundle
+from ai_psi.evaluation.evidence import (
+    ARTIFACT_ROLE_ORDER,
+    build_evidence_bundle,
+    load_evidence_bundle,
+    write_bundle,
+)
 from ai_psi.evaluation.evidence_cli import (
     EXIT_CHAIN_MISMATCH,
     EXIT_INPUT_ERROR,
@@ -136,12 +141,16 @@ class TestBuildCli:
             main([])
         assert info.value.code == EXIT_USAGE_ERROR
 
-    def test_missing_input_file_returns_usage_code(self, chain: Any, tmp_path: Path) -> None:
-        """🔴 对 ``build`` 而言，"某个路径指不到文件"是**用法**问题（2），
-        不是"这条链不成立"——它要问的正是"按你给的这五份，能不能立一条链"。"""
+    def test_missing_input_file_returns_input_error(self, chain: Any, tmp_path: Path) -> None:
+        """🔴 **参数齐了、文件不在**是**输入**问题（3），不是参数问题（2）。
+
+        少了 `--policy` 与 `--policy` 指的那个文件不存在，是两种故障：前者
+        改命令行就能解决，后者得先有那份产物。混成一个码，自动化里就分不清
+        "我调用错了"与"上游没产出"。
+        """
         chain.policy.unlink()
         output = tmp_path / "bundle.json"
-        assert main(_build_args(chain, output)) == EXIT_USAGE_ERROR
+        assert main(_build_args(chain, output)) == EXIT_INPUT_ERROR
         assert not output.exists()
 
     def test_broken_input_returns_input_error_and_writes_nothing(
@@ -477,3 +486,162 @@ class TestCliSurface:
     def test_module_has_a_main_guard(self) -> None:
         source = Path(cli_module.__file__).read_text(encoding="utf-8")
         assert 'if __name__ == "__main__"' in source
+
+
+# ---------------------------------------------------------------------------
+# 补救 · E/F/G 组：退出码校准与角色异常
+# ---------------------------------------------------------------------------
+
+
+def _drop_descriptor(bundle_path: Path, index: int) -> None:
+    _mutate(bundle_path, lambda p: p["artifacts"].pop(index))
+
+
+def _duplicate_descriptor(bundle_path: Path, index: int) -> None:
+    _mutate(
+        bundle_path,
+        lambda p: p["artifacts"].append(dict(p["artifacts"][index])),
+    )
+
+
+class TestBuildCliExitCodes:
+    """E 组：``build`` 的五种退出码逐条钉住。"""
+
+    def test_success_returns_zero_and_loads_back_strictly(self, chain: Any, tmp_path: Path) -> None:
+        """🔴 ``build`` 的成功产物**必须**能被**严格** loader 读回来。
+
+        "写出去了一份自己都不认的东西"是这类产物最坏的失败形态：它看起来
+        成功了，直到别人拿它去用。
+        """
+        output = tmp_path / "bundle.json"
+        assert main(_build_args(chain, output)) == EXIT_OK
+        reloaded = load_evidence_bundle(output)
+        assert tuple(item.role for item in reloaded.artifacts) == ARTIFACT_ROLE_ORDER
+
+    def test_missing_cli_argument_returns_two(self, chain: Any, tmp_path: Path) -> None:
+        with pytest.raises(SystemExit) as info:
+            main(["build", "--baseline-run", str(chain.baseline_run)])
+        assert info.value.code == EXIT_USAGE_ERROR
+
+    def test_an_unreadable_input_path_returns_three(self, chain: Any, tmp_path: Path) -> None:
+        """把输入换成**目录**：参数没问题，文件读不出来 → 3。"""
+        chain.comparison.unlink()
+        chain.comparison.mkdir()
+        output = tmp_path / "bundle.json"
+        assert main(_build_args(chain, output)) == EXIT_INPUT_ERROR
+        assert not output.exists()
+
+    def test_a_non_utf8_input_returns_three(self, chain: Any, tmp_path: Path) -> None:
+        chain.policy.write_bytes(b"\xff\xfe\x00\x00 not utf-8")
+        output = tmp_path / "bundle.json"
+        assert main(_build_args(chain, output)) == EXIT_INPUT_ERROR
+        assert not output.exists()
+
+    def test_a_schema_error_returns_three(self, chain: Any, tmp_path: Path) -> None:
+        """合法 JSON、错误形状 → 3（不是 4：链路根本没走到重算那一步）。"""
+        chain.gate_decision.write_text('{"hello": 1}\n', encoding="utf-8", newline="\n")
+        output = tmp_path / "bundle.json"
+        assert main(_build_args(chain, output)) == EXIT_INPUT_ERROR
+        assert not output.exists()
+
+    def test_a_gate_decision_mismatch_returns_four(self, chain: Any, tmp_path: Path) -> None:
+        """五份输入**都合法**，只有重算对不上 → 4。"""
+        _mutate(chain.gate_decision, lambda p: p["identity"].__setitem__("policy_revision", 9))
+        output = tmp_path / "bundle.json"
+        assert main(_build_args(chain, output)) == EXIT_CHAIN_MISMATCH
+        assert not output.exists()
+
+    def test_a_comparison_mismatch_returns_four(self, chain: Any, tmp_path: Path) -> None:
+        _mutate(chain.comparison, lambda p: p.__setitem__("allowed_differences", []))
+        output = tmp_path / "bundle.json"
+        assert main(_build_args(chain, output)) == EXIT_CHAIN_MISMATCH
+        assert not output.exists()
+
+
+class TestVerifyCliRoleAnomalies:
+    """F 组（角色部分）：缺失／重复／错序都返回 1 + INVALID。"""
+
+    @pytest.mark.parametrize(
+        ("label", "mutate"),
+        [
+            ("缺失 COMPARISON", lambda p: p["artifacts"].pop(2)),
+            ("重复 BASELINE_RUN", lambda p: p["artifacts"].append(dict(p["artifacts"][0]))),
+            ("打乱顺序", lambda p: p["artifacts"].reverse()),
+        ],
+    )
+    def test_role_anomaly_returns_one_and_invalid(
+        self, chain: Any, bundle_file: Path, tmp_path: Path, label: str, mutate: Any
+    ) -> None:
+        _mutate(bundle_file, mutate)
+        output = tmp_path / "v.json"
+        assert main(_verify_args(chain, bundle_file, output)) == EXIT_INVALID
+        payload = _read(output)
+        assert payload["verification_outcome"] == "INVALID"
+        assert payload["failed_check_ids"]
+        assert (
+            "artifact_roles_complete" in payload["failed_check_ids"]
+            or "artifact_order_valid" in payload["failed_check_ids"]
+        )
+        # 🔴 依赖唯一角色映射的检查一项都不许"通过"。
+        assert "comparison_recomputed_equal" in payload["not_evaluated_check_ids"]
+        assert "gate_decision_recomputed_equal" in payload["not_evaluated_check_ids"]
+
+    @pytest.mark.parametrize(
+        ("label", "mutate"),
+        [
+            ("缺失 COMPARISON", lambda p: p["artifacts"].pop(2)),
+            ("重复 BASELINE_RUN", lambda p: p["artifacts"].append(dict(p["artifacts"][0]))),
+            ("打乱顺序", lambda p: p["artifacts"].reverse()),
+        ],
+    )
+    def test_role_anomaly_reports_are_byte_identical(
+        self, chain: Any, bundle_file: Path, tmp_path: Path, label: str, mutate: Any
+    ) -> None:
+        """🔴 三种角色异常的报告确定性各测一遍（走真实的 CLI 写盘）。"""
+        _mutate(bundle_file, mutate)
+        first = tmp_path / "v1.json"
+        second = tmp_path / "v2.json"
+        assert main(_verify_args(chain, bundle_file, first)) == EXIT_INVALID
+        assert main(_verify_args(chain, bundle_file, second)) == EXIT_INVALID
+        assert first.read_bytes() == second.read_bytes(), label
+
+    def test_a_missing_bundle_file_returns_three(self, chain: Any, tmp_path: Path) -> None:
+        """🔴 Bundle 是**根输入**：它没了就什么都验不了 → 3（不是 4）。"""
+        output = tmp_path / "v.json"
+        assert main(_verify_args(chain, tmp_path / "nope.json", output)) == EXIT_INPUT_ERROR
+        payload = _read(output)
+        assert payload["verification_outcome"] == "NOT_VERIFIABLE"
+        assert payload["bundle_digest"] is None
+
+    def test_an_unreadable_artifact_returns_four(
+        self, chain: Any, bundle_file: Path, tmp_path: Path
+    ) -> None:
+        """Bundle 好好的，某个**待核验的输入**读不出来 → 证据不足 4。"""
+        chain.policy.unlink()
+        chain.policy.mkdir()
+        output = tmp_path / "v.json"
+        assert main(_verify_args(chain, bundle_file, output)) == EXIT_NOT_VERIFIABLE
+        payload = _read(output)
+        assert payload["verification_outcome"] == "NOT_VERIFIABLE"
+        assert payload["failed_check_ids"] == []
+
+
+class TestVerifyCliDeterminismAfterRemediation:
+    """G 组：合法链的确定性不受这次改动影响。"""
+
+    def test_a_healthy_chain_is_still_byte_identical(
+        self, chain: Any, bundle_file: Path, tmp_path: Path
+    ) -> None:
+        first = tmp_path / "v1.json"
+        second = tmp_path / "v2.json"
+        assert main(_verify_args(chain, bundle_file, first)) == EXIT_OK
+        assert main(_verify_args(chain, bundle_file, second)) == EXIT_OK
+        assert first.read_bytes() == second.read_bytes()
+        assert _read(first)["verification_outcome"] == "VERIFIED"
+
+    def test_two_builds_are_still_byte_identical(self, chain: Any, tmp_path: Path) -> None:
+        first = tmp_path / "b1.json"
+        second = tmp_path / "b2.json"
+        assert main(_build_args(chain, first)) == EXIT_OK
+        assert main(_build_args(chain, second)) == EXIT_OK
+        assert first.read_bytes() == second.read_bytes()

@@ -39,11 +39,15 @@
 
 ===== ==================================================================
 ``0`` 证据包构建成功（**与 GateDecision 的 outcome 无关**）
-``2`` 参数错误，或某个输入文件不存在
-``3`` 输入 Schema／完整性错误——**不写**证据包
-``4`` 证据链重算不一致——**不写**证据包
+``2`` CLI 参数错误（缺参数、不认识的参数）
+``3`` 输入文件、JSON、Schema 或输入完整性错误——**不写**证据包
+``4`` 五份输入都能合法加载，但端到端链路重算不一致——**不写**证据包
 ``5`` 输出写入失败
 ===== ==================================================================
+
+🔴 **"参数齐了但文件不在"是 ``3``，不是 ``2``。** 少了 `--policy` 与
+`--policy` 指的那个文件不存在，是两种故障：前者改命令行就能解决，后者
+得先有那份产物。混成一个码，自动化里就分不清"我调用错了"与"上游没产出"。
 
 ``verify``：
 
@@ -179,23 +183,12 @@ def _inputs(arguments: argparse.Namespace) -> EvidenceInputs:
     )
 
 
-def _missing_inputs(inputs: EvidenceInputs) -> tuple[tuple[str, Path], ...]:
-    """**按固定角色顺序**列出不存在的输入文件。"""
-    return tuple((role.value, path) for role, path in inputs.by_role() if not path.is_file())
-
-
 def _run_build(arguments: argparse.Namespace) -> int:
     inputs = _inputs(arguments)
-    missing = _missing_inputs(inputs)
-    if missing:
-        # 🔴 对 build 而言，"某个路径指不到文件"是**用法**问题：它要问的是
-        # "按你给的这五份，能不能立一条链"。少给一份是没给全，不是
-        # "这条链不成立"。（verify 不同：缺文件是**可以回答的**结论——
-        # 证据不足，因此那边返回 NOT_VERIFIABLE。）
-        for role, path in missing:
-            print(f"{role} 的输入文件不存在：{path}", file=sys.stderr)
-        return EXIT_USAGE_ERROR
-
+    # 🔴 **参数齐了、文件不在**是**输入**问题（3），不是**参数**问题（2）。
+    # "少了 `--policy`"与"`--policy` 指的那个文件不存在"是两种故障：
+    # 前者调用者改命令行就能解决，后者得先有那份产物。把它们混成一个码，
+    # 自动化里就分不清"我调用错了"与"上游没产出"。
     try:
         bundle = build_evidence_bundle(inputs)
     except EvidenceInputError as exc:
