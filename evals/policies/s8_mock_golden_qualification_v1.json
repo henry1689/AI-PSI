@@ -1,0 +1,35 @@
+{
+  "allowed_outcomes": {
+    "gate_outcomes": [
+      "PASS"
+    ],
+    "verification_outcomes": [
+      "VERIFIED"
+    ]
+  },
+  "display_name": "Mock Golden Evaluation Qualification",
+  "purpose": "在已封存的 Mock Golden 实验作用域内，判定一条**已被重新验证**的评测证据链是否具备被后续人工审查或 CI 质量流程消费的资格。**不构成任何发布授权。**",
+  "qualification_policy_digest": "sha256:4229195a7e1db844fe0dd3ac8fecaec57f2dfc2766e978e9ffdf7da0a202ccc1",
+  "qualification_policy_id": "s8_mock_golden_qualification",
+  "qualification_policy_revision": 1,
+  "qualification_policy_schema_version": 1,
+  "scope": {
+    "assertion_registry_digest": "sha256:9b203c0c730fa10be6fdd145e756ac4c4ff2bf43c738ca95c3f39ffa8cb6ed51",
+    "comparison_definition_digest": "sha256:63b100d5615d9455538fc65b1ae6a8423231ac2141663a772e0fceaff14e1bcf",
+    "comparison_schema_version": 1,
+    "dataset_digest": "sha256:870d1f3209f9445fef301682d36b3ccac6e9cb59563049aa6e8d8c58f2cc516a",
+    "evidence_bundle_definition_digest": "sha256:e003d98d5907225c959feb1bae63855ea75ea0a49616f05795cbd95fde9760bf",
+    "evidence_bundle_schema_version": 1,
+    "execution_mode": "in_memory",
+    "gate_decision_schema_version": 1,
+    "gate_definition_digest": "sha256:c084f264b3a0db5bc2864e6e69d1e739980472883b8c4d7540aaddf24a79cdc6",
+    "gate_policy_digest": "sha256:fbb5754cf37b8d1588e2ef447f397e96b2def4553a4d9072f91966a2e3475686",
+    "gate_policy_id": "s6_mock_golden",
+    "gate_policy_revision": 1,
+    "gate_policy_schema_version": 1,
+    "model": "mock-model-v1",
+    "provider": "mock",
+    "storage_backend": "memory",
+    "verification_definition_digest": "sha256:6ca82823a1a7a6f14583024f61efd9de05fce615a6973c488aff035a0771eea5"
+  }
+}

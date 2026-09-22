@@ -1014,3 +1014,203 @@ uv run python -m ai_psi.evaluation.evidence_cli verify \
 * 不输出 Markdown/HTML；
 * **`VERIFIED` 与"能不能上生产"没有任何关系**——本层只保证：给定这组
   文件，它们内部一致、可重算，且不一致的地方会被如实指出来。
+
+---
+
+## 13. 评测资格判定（阶段 8 · S8，**已实现**）
+
+实现位置：`src/ai_psi/evaluation/qualification.py` + `qualification_cli.py`。
+首个策略：`evals/policies/s8_mock_golden_qualification_v1.json`。
+
+### 它回答什么
+
+> 在指定的 `EvaluationQualificationPolicy` 下，这条**已经被重新验证过**的
+> 评测证据链，是否具备被后续人工审查或 CI 质量流程消费的资格？
+
+### 🔴 它不回答什么
+
+是否允许合并、是否允许部署、是否允许生产发布、是否满足法规审计、文件是否
+来自可信主体、是否有数字签名、分支是否受保护、Candidate 是否具备生产质量、
+真实 Provider 是否通过、是否应覆盖人工审批。
+
+`EvaluationQualificationDecision` 里**没有** `release_allowed` /
+`deploy_allowed` / `merge_allowed` / `production_ready` / `auto_merge` /
+`auto_deploy` / `approved_for_release` / `release_recommendation` /
+`quality_score` / `risk_score` / `trust_score` 这些字段——不是"暂时没填"，
+是模型一律 `extra="forbid"`，多写一个就是校验失败。
+
+**`QUALIFIED` 不是发布许可。** 它只表示"在当前策略的作用域内，这条链已被
+重新验证，且它的门禁结论满足该策略规定的最低资格条件"。
+
+### 四个必须分开的维度
+
+| 维度 | 由谁决定，回答什么 |
+|---|---|
+| `gate_outcome` | **S6**——质量门禁规则过不过（`PASS`/`FAIL`/`NOT_EVALUATED`） |
+| `verification_outcome` | **S7**——证据链一不一致、能不能重算（`VERIFIED`/`INVALID`/`NOT_VERIFIABLE`） |
+| `qualification_outcome` | **S8**——前两者 + 作用域聚合出的资格（`QUALIFIED`/`DISQUALIFIED`/`NOT_EVALUATED`） |
+| release authorization | **S8 不提供** |
+
+把前三者混成一个，就会得到一个"因为证据坏了所以候选不合格"的工具，或者
+一个"证据根本读不出来却给了合格"的工具。
+
+### 🔴 S8 一定重新执行 S7 验证
+
+它**自己调用** S7 的纯函数 `verify_evidence_bundle`，只用**本次调用返回**的
+报告。CLI 没有 `--verification-report` 参数，没有 `--trust-verification`，
+没有 `--skip-verification`——**这些入口不存在**，不是"不推荐用"。
+
+为什么：磁盘上那份 `VerificationReport` 要么是本次刚算出来的，要么就没人
+知道它对应的是哪个版本的输入。把一份旧报告当权威，等于把"这条链现在是好的"
+偷换成"这条链**曾经**是好的"。
+
+七个输入路径全部显式给出，**不按文件名猜角色、不自动交换基线／候选**。
+
+### QualificationPolicy
+
+```json
+{
+  "qualification_policy_schema_version": 1,
+  "qualification_policy_id": "s8_mock_golden_qualification",
+  "qualification_policy_revision": 1,
+  "qualification_policy_digest": "sha256:...",
+  "scope": {
+    "evidence_bundle_schema_version": 1,
+    "evidence_bundle_definition_digest": "sha256:...",
+    "verification_definition_digest": "sha256:...",
+    "comparison_schema_version": 1,
+    "comparison_definition_digest": "sha256:...",
+    "gate_decision_schema_version": 1,
+    "gate_definition_digest": "sha256:...",
+    "gate_policy_schema_version": 1,
+    "gate_policy_id": "s6_mock_golden",
+    "gate_policy_revision": 1,
+    "gate_policy_digest": "sha256:...",
+    "dataset_digest": "sha256:...",
+    "assertion_registry_digest": "sha256:...",
+    "provider": "mock",
+    "model": "mock-model-v1",
+    "execution_mode": "in_memory",
+    "storage_backend": "memory"
+  },
+  "allowed_outcomes": {
+    "verification_outcomes": ["VERIFIED"],
+    "gate_outcomes": ["PASS"]
+  }
+}
+```
+
+`qualification_policy_digest` **自排除**（由除它自己以外的全部字段算出），
+加载时重算并核对。它是**声明式**的：没有表达式、没有 include、没有插件、
+没有网络、没有发布许可字段。
+
+首个策略固定绑定已封存的 S6 `s6_mock_golden` revision 1 与 Mock Golden 实验
+身份：不接受真实 Provider、未知 Provider、未知模型、partial_run 或未验证证据。
+
+### Policy applicability
+
+`APPLICABLE` / `NOT_APPLICABLE` / **`NOT_EVALUATED`**。
+
+第三个取值不是随手加的：**"这次判不了它管不管得着"** 与"它不归我管"是两件
+事。前者被强行写成 `NOT_APPLICABLE` 就是一句无法支撑的断言，被写成
+`APPLICABLE` 则会让不可信证据溜进作用域判定。
+
+逐项对照：S7 Schema 与定义摘要、验证定义摘要、S5 对比 Schema 与定义、
+S6 门禁 Schema 与定义、S6 GatePolicy 身份（id/revision/digest）、dataset、
+assertion registry、Provider、model、execution mode、storage backend、
+partial_run。
+
+🔴 **策略不适用时结论是 `NOT_EVALUATED`，不是 `DISQUALIFIED`，也不会自动
+换一份策略、放宽作用域或只凭 `policy_id` 判定适用。**
+
+🔴 **证据本身 `INVALID` 时，不得从不可信证据推导出 `APPLICABLE`：**适用性只在
+S7 判定 `VERIFIED`、策略 Schema 受支持、三组身份都读得出来时才安全计算。
+
+### EvaluationQualificationDecision
+
+13 项**固定顺序**的检查：
+
+`evidence_verification_completed` → `evidence_verification_verified` →
+`qualification_policy_schema_supported` → `qualification_policy_digest_valid` →
+`qualification_policy_applicable` → `evidence_bundle_definition_allowed` →
+`verification_definition_allowed` → `comparison_definition_allowed` →
+`gate_definition_allowed` → `gate_policy_identity_allowed` →
+`experiment_identity_allowed` → `partial_run_absent` →
+`gate_outcome_eligible`。
+
+结论里只有三组**身份**（策略／证据／门禁）与检查明细，**不嵌入**完整的
+`VerificationReport`、`EvidenceBundle` 或五个输入 Artifact，也不含
+`response_text`、`failure_detail`、Prompt 正文、绝对路径、时间戳、UUID、
+主机信息、CI URL 或任何发布许可字段。
+
+### 聚合矩阵
+
+| S7 证据 | 策略适用 | S6 门禁 | 资格结论 |
+|---|---|---|---|
+| `VERIFIED` | 是 | `PASS` | **`QUALIFIED`** |
+| `VERIFIED` | 是 | `FAIL` | **`DISQUALIFIED`** |
+| `VERIFIED` | 是 | `NOT_EVALUATED` | **`NOT_EVALUATED`** |
+| `VERIFIED` | 否 | `PASS` | **`NOT_EVALUATED`** |
+| `VERIFIED` | 否 | `FAIL` | **`NOT_EVALUATED`** |
+| `INVALID` | 未安全计算 | 任意 | **`DISQUALIFIED`** |
+| `NOT_VERIFIABLE` | 未完成 | 任意 | **`NOT_EVALUATED`** |
+
+**不得出现其他隐式结果。**
+
+🔴 **`FAIL` 优先于 `NOT_EVALUATED`**：只要有一项确定冲突，结论就是
+`DISQUALIFIED`；没有任何冲突但也没查全时，绝不升格成 `QUALIFIED`。
+
+🔴 **作用域不匹配记作 `NOT_EVALUATED` 而不是 `FAIL`**：那是"这份策略管不着
+这类评测"，不是"这条链有问题"——拿规则不适用去指控候选，正是本层拒绝的工具。
+
+🔴 门禁自己判了 `NOT_EVALUATED` 时，`gate_outcome_eligible` 也是
+`NOT_EVALUATED` 而不是 `FAIL`：「这次没判成」推不出「候选不合格」。
+
+### CLI
+
+```bash
+uv run python -m ai_psi.evaluation.qualification_cli \
+    --bundle ... --baseline-run ... --candidate-run ... --comparison ... \
+    --gate-policy ... --gate-decision ... --qualification-policy ... --output ...
+```
+
+| 退出码 | 含义 |
+|---|---|
+| `0` | `QUALIFIED` |
+| `1` | `DISQUALIFIED`（含证据 `INVALID`、门禁结论不在允许集合内） |
+| `2` | CLI 参数错误 |
+| `3` | 根输入 JSON／Schema／完整性错误，**无法形成结论**——不写产物 |
+| `4` | `NOT_EVALUATED`（证据不可验证、策略不适用、门禁没判成） |
+| `5` | 输出写入失败 |
+
+🔴 **`3` 与 `4` 是两件事。** `3` 是"连读都没读成"（资格策略坏了、证据包连
+安全 Envelope 都形不成），**不产生结论**；`4` 是"读成了，但这次没能完整地
+判"，**产生结构化结论**。
+
+🔴 **`1` 是结论而不是故障**：证据链有确定冲突、或门禁结论不在允许集合内，
+都是这个工具的正常输出。
+
+**没有** `--force`／`--trust-verification`／`--skip-verification`／
+`--ignore-policy-scope`／`--allow-invalid-evidence`／`--release`／`--deploy`，
+也没有 `--verification-report`。
+
+### 确定性
+
+同样七个输入跑两次 → 结论逐字节一致。输出恰好一个 LF 结尾、无 CRLF、无
+时间戳、无 UUID、无路径、无主机信息、无运行耗时。
+
+### 它不碰外部世界
+
+不运行评测、不调用 Provider、不连数据库、不读网络、**不通过子进程驱动任何
+CLI**、不生成 S5／S6／S7 的产物——只读七个文件、跑纯函数、写一份 JSON。
+
+### 资格结论不是什么
+
+🔴 **它不是发布许可，不是签名，也不证明来源真实性。**
+
+* 不实现数字签名、密钥管理、PKI、Sigstore 或 Artifact Attestation；
+* 不配置 branch protection、不调用 GitHub API 执行业务操作；
+* 不自动合并、不自动部署、不自动发布、不创建 Release、不创建或修改标签；
+* 不输出 Markdown／HTML，不输出自由文本 recommendation；
+* **`QUALIFIED` 与"能不能上生产"没有任何关系**——它只保证：在这份策略的
+  作用域内，这条链已被重新验证，且它的门禁结论达到了策略规定的最低条件。

@@ -20,12 +20,23 @@ from ai_psi.evaluation.assertions import AssertionResult, CaseObservation
 from ai_psi.evaluation.comparison import (
     EvaluationComparison,
     compare_run_results,
+    load_comparison,
     write_comparison,
 )
-from ai_psi.evaluation.evidence import EvidenceInputs, bundle_digest
+from ai_psi.evaluation.evidence import (
+    EVIDENCE_BUNDLE_SCHEMA_VERSION,
+    EvidenceInputs,
+    build_evidence_bundle,
+    bundle_digest,
+    evidence_definition_digest,
+    evidence_verification_definition_digest,
+    write_bundle,
+)
 from ai_psi.evaluation.gate import (
+    GATE_DECISION_SCHEMA_VERSION,
     GatePolicy,
     decide,
+    gate_definition_digest,
     load_gate_policy,
     policy_digest,
     write_decision,
@@ -34,6 +45,10 @@ from ai_psi.evaluation.loader import GoldenDataset
 from ai_psi.evaluation.manifest import build_manifest, storage_identity
 from ai_psi.evaluation.metrics import compute_metrics
 from ai_psi.evaluation.models import GoldenCase
+from ai_psi.evaluation.qualification import (
+    QualificationInputs,
+    qualification_policy_digest,
+)
 from ai_psi.evaluation.runner import (
     CaseResult,
     ExecutionMode,
@@ -658,3 +673,147 @@ class EvidenceChainFactory:
 def evidence_chain_factory() -> EvidenceChainFactory:
     """S7 证据链夹具。"""
     return EvidenceChainFactory()
+
+
+# ---------------------------------------------------------------------------
+# 阶段 8 · S8：资格判定夹具
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class QualificationChainPaths:
+    """一条**已经落在磁盘上**的七文件资格链。
+
+    ``artifacts`` 是 S7 那份五文件证据链；这里再加两样：S7 的**证据包**，
+    以及一份与它**作用域对得上**的 S8 资格策略。
+    """
+
+    artifacts: EvidenceChainPaths
+    bundle: Path
+    qualification_policy: Path
+
+    def inputs(self) -> QualificationInputs:
+        """交给 S8 的七个角色显式输入。"""
+        return QualificationInputs(
+            bundle=self.bundle,
+            baseline_run=self.artifacts.baseline_run,
+            candidate_run=self.artifacts.candidate_run,
+            comparison=self.artifacts.comparison,
+            gate_policy=self.artifacts.policy,
+            gate_decision=self.artifacts.gate_decision,
+            qualification_policy=self.qualification_policy,
+        )
+
+    def by_role(self) -> dict[str, Path]:
+        """角色名 → 路径，供"改一处"这类专项使用。"""
+        return {
+            "BUNDLE": self.bundle,
+            "BASELINE_RUN": self.artifacts.baseline_run,
+            "CANDIDATE_RUN": self.artifacts.candidate_run,
+            "COMPARISON": self.artifacts.comparison,
+            "GATE_POLICY": self.artifacts.policy,
+            "GATE_DECISION": self.artifacts.gate_decision,
+            "QUALIFICATION_POLICY": self.qualification_policy,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class QualificationFactory:
+    """把一条自洽的**七文件**资格链写到磁盘上。
+
+    🔴 纪律与 S5／S7 的夹具一致：七份产物全部由**正式模型**构造、由**正式
+    写出函数**落盘，不手拼 JSON。资格策略的 scope **从实际产物里取值**，
+    一个都不硬编码——否则夹具会与真实契约漂移，测试就变成在测自己写的常量。
+    """
+
+    def chain(
+        self,
+        directory: Path,
+        *,
+        baseline_outcomes: Mapping[str, Outcome] | None = None,
+        candidate_outcomes: Mapping[str, Outcome] | None = None,
+        policy_scope: Mapping[str, object] | None = None,
+        qualification_scope: Mapping[str, object] | None = None,
+        allowed_gate_outcomes: Sequence[str] | None = None,
+        allowed_verification_outcomes: Sequence[str] | None = None,
+        build_bundle: bool = True,
+    ) -> QualificationChainPaths:
+        """构造并落盘一条资格链。
+
+        Args:
+            directory: 输出目录。
+            baseline_outcomes / candidate_outcomes: 两侧的案例处置。
+            policy_scope: 覆盖 **S6 GatePolicy** 的 scope 若干项。
+            qualification_scope: 覆盖 **S8 资格策略**的 scope 若干项
+                （用来造出 NOT_APPLICABLE 的专项）。
+            allowed_gate_outcomes / allowed_verification_outcomes: 覆盖
+                资格策略的允许集合。
+            build_bundle: 是否构建证据包（False 时 ``bundle`` 路径不存在）。
+        """
+        artifacts = EvidenceChainFactory().write(
+            directory / "chain",
+            baseline_outcomes=baseline_outcomes,
+            candidate_outcomes=candidate_outcomes,
+            policy_scope=policy_scope,
+        )
+
+        bundle_path = directory / "bundle.json"
+        if build_bundle:
+            write_bundle(build_evidence_bundle(artifacts.inputs()), bundle_path)
+
+        gate_policy = load_gate_policy(artifacts.policy)
+        comparison = load_comparison(artifacts.comparison)
+        scope: dict[str, object] = {
+            "evidence_bundle_schema_version": EVIDENCE_BUNDLE_SCHEMA_VERSION,
+            "evidence_bundle_definition_digest": evidence_definition_digest(),
+            "verification_definition_digest": evidence_verification_definition_digest(),
+            "comparison_schema_version": comparison.comparison_schema_version,
+            "comparison_definition_digest": comparison.comparison_definition_digest,
+            "gate_decision_schema_version": GATE_DECISION_SCHEMA_VERSION,
+            "gate_definition_digest": gate_definition_digest(),
+            "gate_policy_schema_version": gate_policy.policy_schema_version,
+            "gate_policy_id": gate_policy.policy_id,
+            "gate_policy_revision": gate_policy.policy_revision,
+            "gate_policy_digest": gate_policy.policy_digest,
+            "dataset_digest": comparison.baseline.dataset_digest,
+            "assertion_registry_digest": comparison.baseline.assertion_registry_digest,
+            "provider": comparison.baseline.provider_name,
+            "model": comparison.baseline.model_id,
+            "execution_mode": comparison.baseline.manifest_execution_mode,
+            "storage_backend": comparison.baseline.storage_backend,
+        }
+        if qualification_scope is not None:
+            scope.update(qualification_scope)
+
+        payload: dict[str, object] = {
+            "qualification_policy_schema_version": 1,
+            "qualification_policy_id": "test_qualification",
+            "qualification_policy_revision": 1,
+            "display_name": "Test Qualification",
+            "purpose": "Unit-test qualification policy",
+            "scope": scope,
+            "allowed_outcomes": {
+                "verification_outcomes": list(allowed_verification_outcomes or ["VERIFIED"]),
+                "gate_outcomes": list(allowed_gate_outcomes or ["PASS"]),
+            },
+        }
+        payload["qualification_policy_digest"] = qualification_policy_digest(payload)
+
+        policy_path = directory / "qualification-policy.json"
+        policy_path.write_text(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        return QualificationChainPaths(
+            artifacts=artifacts,
+            bundle=bundle_path,
+            qualification_policy=policy_path,
+        )
+
+
+@pytest.fixture
+def qualification_chain_factory() -> QualificationFactory:
+    """S8 资格链夹具。"""
+    return QualificationFactory()
